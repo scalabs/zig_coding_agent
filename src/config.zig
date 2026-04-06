@@ -1,13 +1,23 @@
 const std = @import("std");
+const types = @import("types.zig");
 
 pub const Config = struct {
     listen_host: []const u8,
     listen_port: u16,
     debug_logging: bool,
+    default_provider: []const u8,
     ollama_base_url: []const u8,
     ollama_model: []const u8,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
+        const default_provider = try getEnvOrDefault(
+            allocator,
+            "LLM_ROUTER_PROVIDER",
+            "ollama",
+        );
+        errdefer allocator.free(default_provider);
+        try validateProviderName(default_provider);
+
         return Config{
             .listen_host = try getEnvOrDefault(
                 allocator,
@@ -16,6 +26,7 @@ pub const Config = struct {
             ),
             .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081),
             .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG"),
+            .default_provider = default_provider,
             .ollama_base_url = try getEnvOrDefault(
                 allocator,
                 "OLLAMA_BASE_URL",
@@ -31,10 +42,27 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
+        allocator.free(self.default_provider);
         allocator.free(self.ollama_base_url);
         allocator.free(self.ollama_model);
     }
+
+    pub fn setDefaultProvider(
+        self: *Config,
+        allocator: std.mem.Allocator,
+        provider: []const u8,
+    ) !void {
+        try validateProviderName(provider);
+
+        const next_provider = try allocator.dupe(u8, provider);
+        allocator.free(self.default_provider);
+        self.default_provider = next_provider;
+    }
 };
+
+fn validateProviderName(provider: []const u8) !void {
+    _ = types.normalizeProviderName(provider) orelse return error.InvalidProvider;
+}
 
 fn getEnvOrDefault(
     allocator: std.mem.Allocator,

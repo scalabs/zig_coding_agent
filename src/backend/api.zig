@@ -231,7 +231,10 @@ pub fn callProvider(
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const provider = request.provider orelse "ollama_qwen";
+    const requested_provider = request.provider orelse app_config.default_provider;
+    const provider = types.normalizeProviderName(requested_provider) orelse {
+        return error.UnknownProvider;
+    };
 
     if (std.mem.eql(u8, provider, "ollama_qwen")) {
         const ollama_qwen = @import("../providers/ollama_qwen.zig");

@@ -23,7 +23,8 @@ pub fn run(
         "Server running at http://{s}:{d}",
         .{ app_config.listen_host, app_config.listen_port },
     );
-    logInfo("Provider: local Ollama Qwen only", .{});
+    logInfo("Default provider: {s}", .{app_config.default_provider});
+    logInfo("Available providers: ollama (aliases: qwen, ollama_qwen)", .{});
     if (app_config.debug_logging) {
         logInfo("Debug logging enabled", .{});
     }
@@ -133,7 +134,7 @@ fn handleConnection(
         app_config,
         "request provider={s} model={s} prompt_len={d} messages={d}",
         .{
-            parsed_req.provider orelse "ollama_qwen",
+            parsed_req.provider orelse app_config.default_provider,
             parsed_req.model orelse "(default)",
             parsed_req.prompt.len,
             parsed_req.messages.len,
