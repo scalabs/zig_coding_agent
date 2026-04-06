@@ -1,23 +1,30 @@
-//! By convention, root.zig is the root source file when making a library.
+//! Zig Coding Agent - LLM routing and chat completion service
+//! 
+//! Public API for the agent. Use this library by importing root and accessing
+//! the public modules: backend, core, and config.
 const std = @import("std");
 
-pub fn bufferedPrint() !void {
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
+// Re-export public modules
+pub const backend = @import("backend/api.zig");
+pub const core = @import("core/server.zig");
+pub const config = @import("config.zig");
+pub const types = @import("types.zig");
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+// Re-export error types
+pub const ApiError = backend.errors.ApiError;
 
-    try stdout.flush(); // Don't forget to flush!
+test "backend: chat request parsing" {
+    _ = @import("backend/api.zig");
 }
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
+test "core: HTTP request parsing" {
+    _ = @import("core/request.zig");
 }
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test "core: routing" {
+    _ = @import("core/router.zig");
+}
+
+test "types: normalization" {
+    _ = @import("types.zig");
 }
