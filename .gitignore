@@ -1,6 +1,8 @@
 .zig-cache
 zig-out
 .ollama-qwen-env.example
+.env
+
 # General
 .DS_Store
 __MACOSX/
