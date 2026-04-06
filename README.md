@@ -25,17 +25,41 @@ Use `.ollama-qwen-env.example` as a template.
 ## Build And Run
 
 ```bash
-cd /Users/amudeeshans/llm-router-zig/ollama-qwen-demo
-source .ollama-qwen-env.example
 zig build check
 zig build test
 zig build run
 ```
 
-Run the direct Ollama smoke test:
+## Testing
+
+Run unit tests:
 
 ```bash
-zig build ollama-test
+zig build test
+```
+
+Manual integration test against the local router:
+
+1. Start the router:
+
+```bash
+zig build run
+```
+
+2. In another terminal, call the OpenAI-compatible endpoint:
+
+```bash
+curl -s http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+```
+
+Optional direct Ollama check (bypasses this router):
+
+```bash
+curl -s http://127.0.0.1:11434/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen:7b","messages":[{"role":"user","content":"Say hello from Zig"}],"stream":false}'
 ```
 
 ## Demo Request
