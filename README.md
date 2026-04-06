@@ -36,6 +36,23 @@ zig build run -- --provider ollama
 
 Supported provider values are `ollama`, `qwen`, and `ollama_qwen`.
 
+You can run an in-project prompt loop (no external shell loop required):
+
+```bash
+zig build run -- --prompt "Draft a short API summary and end with DONE" --provider ollama
+```
+
+Optional loop controls:
+
+- `--until <marker>`: completion marker to stop on (default `DONE`)
+- `--max-turns <n>`: hard stop to prevent infinite loops (default `8`)
+
+Example with explicit controls:
+
+```bash
+zig build run -- --prompt "Plan a migration and end with FINISHED" --provider ollama --until FINISHED --max-turns 12
+```
+
 ## Build And Run
 
 ```bash
@@ -87,25 +104,78 @@ Manual integration check against the local router:
 
 1. Start the server:
 
-```bash
-zig build run
-```
+   ```bash
+   zig build run
+   ```
 
-2. In another terminal, send an OpenAI-compatible request:
+2. In another terminal, send an OpenAI-compatible request without a `provider`
+   field. This verifies the router, request parsing, default provider lookup,
+   and the Ollama round-trip:
 
-```bash
-curl -s http://127.0.0.1:8081/v1/chat/completions \
-	-H 'Content-Type: application/json' \
-	-d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
-```
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+   ```
 
-Optional direct Ollama check:
+3. If you want to confirm provider selection explicitly, repeat the request
+   with `provider` set to one of the supported aliases:
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"provider":"ollama","messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+   ```
+
+Optional dependency sanity check for Ollama itself:
 
 ```bash
 curl -s http://127.0.0.1:11434/api/chat \
-	-H 'Content-Type: application/json' \
-	-d '{"model":"qwen:7b","messages":[{"role":"user","content":"Say hello from Zig"}],"stream":false}'
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen:7b","messages":[{"role":"user","content":"Say hello from Zig"}],"stream":false}'
 ```
+
+## Prompt Loop
+
+The server returns one completion per request. If you want to keep iterating on
+the same task until the model says it is finished, do that from the client.
+
+Bash example that keeps the conversation going until the assistant says
+`DONE` or the model finishes normally:
+
+```bash
+messages='[{"role":"user","content":"Work through this task one step at a time. End with DONE when finished: <your prompt>"}]'
+
+while true; do
+  body=$(printf '{"messages":%s}' "$messages")
+  response=$(curl -s http://127.0.0.1:8081/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "$body")
+
+  assistant=$(printf '%s' "$response" | jq -r '.choices[0].message.content')
+  finish_reason=$(printf '%s' "$response" | jq -r '.choices[0].finish_reason')
+
+  printf '%s\n' "$assistant"
+
+  messages=$(printf '%s' "$messages" | jq --arg content "$assistant" \
+    '. + [{role:"assistant", content:$content}]')
+
+  if printf '%s' "$assistant" | grep -Eq '(^|[[:space:]])DONE([[:space:]]|$)' || [ "$finish_reason" = "stop" ]; then
+    break
+  fi
+
+  messages=$(printf '%s' "$messages" | jq '. + [{role:"user", content:"Continue."}]')
+done
+```
+
+If you only want the model to generate a single complete response, the normal
+`POST /v1/chat/completions` call with `stream: false` is already enough.
+
+## External Prompt Looping (Bash Example)
+
+If you prefer to implement looping outside the agent (for example, in a bash
+script or Python client), the above bash example shows a pattern you can follow.
+The built-in `--prompt` feature is recommended for simplicity.
 
 ## Request Shape
 
@@ -117,8 +187,8 @@ Example request:
 
 ```bash
 curl -s http://127.0.0.1:8081/v1/chat/completions \
-	-H 'Content-Type: application/json' \
-	-d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+ -H 'Content-Type: application/json' \
+ -d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
 ```
 
 Legacy provider values are still accepted: `ollama`, `qwen`, and
