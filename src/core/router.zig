@@ -1,6 +1,13 @@
+//! Minimal route matcher for the HTTP request line.
 const std = @import("std");
 
-/// Check if request is for POST /v1/chat/completions route
+/// Matches only `POST /v1/chat/completions` and validates request-line shape.
+///
+/// Args:
+/// - request_raw: full raw HTTP request bytes.
+///
+/// Errors:
+/// - returns `error.InvalidHttpRequest` when request line cannot be parsed.
 pub fn matchChatCompletionsRoute(request_raw: []const u8) !bool {
     const request_line_end = std.mem.indexOf(u8, request_raw, "\r\n") orelse {
         return error.InvalidHttpRequest;

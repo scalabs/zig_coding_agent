@@ -1,3 +1,4 @@
+//! TCP server loop and request lifecycle orchestration.
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -6,7 +7,14 @@ const response = @import("response.zig");
 const router = @import("router.zig");
 const backend = @import("../backend/api.zig");
 
-/// Run the server and handle incoming connections
+/// Starts the TCP listener and serves requests indefinitely.
+///
+/// Args:
+/// - allocator: allocator used by request parsing and response serialization.
+/// - app_config: immutable runtime configuration for listen address and defaults.
+///
+/// Errors:
+/// - propagates listener setup and accept-loop errors.
 pub fn run(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -39,12 +47,12 @@ pub fn run(
     }
 }
 
-/// Handle a single client connection
 fn handleConnection(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     connection: std.net.Server.Connection,
 ) !void {
+    // Translate transport-level parsing failures into OpenAI-style API errors.
     const request_raw = request.readHttpRequest(allocator, connection) catch |err| switch (err) {
         error.RequestTooLarge => {
             try response.sendApiError(connection, allocator, backend.errors.payloadTooLargeError());
@@ -141,6 +149,7 @@ fn handleConnection(
         },
     );
 
+    // Provider transport errors are mapped to a stable 502 shape for clients.
     const result = backend.callProvider(allocator, app_config, parsed_req) catch |err| {
         logError("Provider request error: {}", .{err});
         try response.sendApiError(connection, allocator, backend.errors.providerError(

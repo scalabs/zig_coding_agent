@@ -1,5 +1,6 @@
 .zig-cache
 zig-out
+.agents/
 .ollama-qwen-env.example
 .env
 

@@ -3,17 +3,33 @@ const config = @import("../config.zig");
 const types = @import("../types.zig");
 pub const errors = @import("errors.zig");
 
-/// Result of parsing a chat completion request
+/// Result of parsing a chat completion request.
+///
+/// Variants:
+/// - ok: fully parsed and owned request ready for provider dispatch.
+/// - err: API-shaped validation error suitable for client responses.
 pub const ParseChatRequestResult = union(enum) {
     ok: types.Request,
     err: errors.ApiError,
 };
 
-/// Parse incoming chat completion request from JSON body
+/// Parses an OpenAI-style chat completion request from raw JSON bytes.
+///
+/// Args:
+/// - allocator: allocator used for all owned strings and message copies.
+/// - body: raw HTTP body bytes expected to contain a JSON object.
+///
+/// Returns:
+/// - !ParseChatRequestResult: `.ok` with owned request or `.err` with validation details.
+///
+/// Errors:
+/// - returns `error.OutOfMemory` on allocation failure.
+/// - may return parse-library errors that are explicitly propagated.
 pub fn parseChatRequest(
     allocator: std.mem.Allocator,
     body: []const u8,
 ) !ParseChatRequestResult {
+    // Keep parse errors client-safe by mapping malformed JSON to validation errors.
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{ .err = errors.validationError(
@@ -33,6 +49,7 @@ pub fn parseChatRequest(
         ) },
     };
 
+    // Normalize aliases early so downstream code only sees canonical provider IDs.
     const provider = if (obj.get("provider")) |provider_value|
         switch (provider_value) {
             .string => |value| blk: {
@@ -56,6 +73,7 @@ pub fn parseChatRequest(
         null;
     errdefer if (provider) |value| allocator.free(value);
 
+    // `model: "auto"` explicitly means "use provider default".
     const model_source = if (obj.get("model")) |model_value|
         switch (model_value) {
             .string => |value| blk: {
@@ -82,6 +100,7 @@ pub fn parseChatRequest(
     else
         null;
 
+    // Accept either `messages` (primary) or legacy single `prompt`.
     const parsed_messages = if (obj.get("messages")) |messages_value|
         switch (messages_value) {
             .array => |messages| blk: {
@@ -225,7 +244,19 @@ pub fn parseChatRequest(
     } };
 }
 
-/// Call the appropriate provider based on request configuration
+/// Dispatches a parsed request to the configured provider implementation.
+///
+/// Args:
+/// - allocator: allocator used by provider implementations.
+/// - app_config: runtime config containing defaults and provider endpoints.
+/// - request: normalized request that has already passed validation.
+///
+/// Returns:
+/// - !types.Response: normalized completion response from provider.
+///
+/// Errors:
+/// - returns `error.UnknownProvider` when provider alias cannot be resolved.
+/// - propagates provider transport and parsing failures.
 pub fn callProvider(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,

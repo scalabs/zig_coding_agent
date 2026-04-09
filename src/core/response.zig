@@ -1,8 +1,16 @@
+//! HTTP response builders for OpenAI-compatible success and error payloads.
 const std = @import("std");
 const types = @import("../types.zig");
 const errors = @import("../backend/errors.zig");
 
-/// Escape special characters for JSON strings
+/// Escapes a UTF-8 byte slice for safe JSON string embedding.
+///
+/// Args:
+/// - allocator: allocator used for escaped output buffer.
+/// - input: unescaped string bytes.
+///
+/// Returns:
+/// - ![]u8: owned escaped string without surrounding quotes.
 pub fn escapeJsonStringAlloc(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -24,7 +32,6 @@ pub fn escapeJsonStringAlloc(
     return try out.toOwnedSlice(allocator);
 }
 
-/// Convert optional string to JSON null or quoted string
 fn optionalJsonStringAlloc(
     allocator: std.mem.Allocator,
     value: ?[]const u8,
@@ -39,7 +46,6 @@ fn optionalJsonStringAlloc(
     return try allocator.dupe(u8, "null");
 }
 
-/// Send HTTP response with JSON body
 fn sendJson(
     connection: std.net.Server.Connection,
     status_code: u16,
@@ -55,6 +61,7 @@ fn sendJson(
         else => "Internal Server Error",
     };
 
+    // The server handles one request per connection.
     const response = try std.fmt.allocPrint(
         std.heap.page_allocator,
         "HTTP/1.1 {d} {s}\r\n" ++
@@ -70,7 +77,15 @@ fn sendJson(
     try connection.stream.writeAll(response);
 }
 
-/// Send API error response
+/// Serializes and sends OpenAI-style API error JSON.
+///
+/// Args:
+/// - connection: destination client connection.
+/// - allocator: allocator used for temporary escaped fields and payload.
+/// - api_error: normalized error shape to serialize.
+///
+/// Returns:
+/// - !void: success when error response is written.
 pub fn sendApiError(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
@@ -98,7 +113,6 @@ pub fn sendApiError(
     try sendJson(connection, api_error.status_code, response_json);
 }
 
-/// Generate completion ID from current timestamp
 fn makeCompletionIdAlloc(allocator: std.mem.Allocator) ![]u8 {
     return try std.fmt.allocPrint(
         allocator,
@@ -107,7 +121,15 @@ fn makeCompletionIdAlloc(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
-/// Send chat completion response
+/// Serializes and sends OpenAI-compatible chat completion payload.
+///
+/// Args:
+/// - connection: destination client connection.
+/// - allocator: allocator used for temporary JSON assembly buffers.
+/// - result: normalized provider response.
+///
+/// Returns:
+/// - !void: success when completion payload is written.
 pub fn sendChatCompletion(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
@@ -116,6 +138,7 @@ pub fn sendChatCompletion(
     var generated_id: ?[]u8 = null;
     defer if (generated_id) |id| allocator.free(id);
 
+    // Preserve provider-supplied IDs, otherwise generate one.
     const completion_id = if (result.id) |id|
         id
     else blk: {

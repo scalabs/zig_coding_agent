@@ -1,7 +1,17 @@
+//! Ollama-backed provider adapter for chat completion requests.
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 
+/// Sends a chat request to Ollama /api/chat and normalizes the response.
+///
+/// Args:
+/// - allocator: allocator used for HTTP payloads and returned response ownership.
+/// - app_config: runtime config containing Ollama base URL and default model.
+/// - request: validated normalized request with conversation messages.
+///
+/// Errors:
+/// - propagates allocation, URI parsing, HTTP fetch, and JSON parse failures.
 pub fn callQwen(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -99,6 +109,7 @@ pub fn callQwen(
         ),
     };
 
+    // Ollama may omit done_reason; default to `stop` for OpenAI compatibility.
     const finish_reason = if (root.get("done_reason")) |done_reason|
         switch (done_reason) {
             .string => |value| value,

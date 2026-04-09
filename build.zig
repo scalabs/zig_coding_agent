@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     }
     run_step.dependOn(&run_cmd.step);
 
-    // Tests from the public package module.
+    // Tests from the package root module.
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_module = app.root_module,
     });
 
-    // Focused tests for an explicitly selected source file.
+    // Focused tests for the frequently-edited shared types module.
     const types_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/types.zig"),

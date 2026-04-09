@@ -1,14 +1,30 @@
+//! Runtime configuration loaded from environment variables.
 const std = @import("std");
 const types = @import("types.zig");
 
+/// Application configuration with owned string fields.
+///
+/// Ownership:
+/// - all string fields are owned and must be released with `deinit`.
 pub const Config = struct {
-    listen_host: []const u8,
-    listen_port: u16,
-    debug_logging: bool,
-    default_provider: []const u8,
-    ollama_base_url: []const u8,
-    ollama_model: []const u8,
+    listen_host: []const u8, // Bind host for server listen socket.
+    listen_port: u16, // Bind port for server listen socket.
+    debug_logging: bool, // Enables verbose request/response diagnostics.
+    default_provider: []const u8, // Canonical provider ID or accepted alias.
+    ollama_base_url: []const u8, // Base URL for Ollama HTTP API.
+    ollama_model: []const u8, // Default Ollama model when request model is absent.
 
+    /// Loads configuration from environment variables with project defaults.
+    ///
+    /// Args:
+    /// - allocator: allocator used for owned string values.
+    ///
+    /// Returns:
+    /// - !Config: configuration with owned strings and validated default provider.
+    ///
+    /// Errors:
+    /// - `error.InvalidProvider` when provider is not recognized.
+    /// - allocation and environment access failures.
     pub fn load(allocator: std.mem.Allocator) !Config {
         const default_provider = try getEnvOrDefault(
             allocator,
@@ -40,6 +56,11 @@ pub const Config = struct {
         };
     }
 
+    /// Releases all heap-allocated config strings.
+    ///
+    /// Args:
+    /// - self: config instance containing owned strings.
+    /// - allocator: allocator that allocated the config strings.
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
         allocator.free(self.default_provider);
@@ -47,6 +68,16 @@ pub const Config = struct {
         allocator.free(self.ollama_model);
     }
 
+    /// Replaces the default provider after validating supported aliases.
+    ///
+    /// Args:
+    /// - self: mutable config to update.
+    /// - allocator: allocator used to duplicate the new provider value.
+    /// - provider: provider alias or canonical name.
+    ///
+    /// Errors:
+    /// - `error.InvalidProvider` when provider is unknown.
+    /// - allocation failures.
     pub fn setDefaultProvider(
         self: *Config,
         allocator: std.mem.Allocator,
@@ -82,6 +113,7 @@ fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
     };
 }
 
+// Empty, 0, false, and no are treated as false; everything else is true.
 fn getEnvFlag(
     allocator: std.mem.Allocator,
     key: []const u8,

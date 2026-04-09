@@ -1,7 +1,19 @@
+//! Manual HTTP request parsing helpers and framed body reader.
 const std = @import("std");
 const errors = @import("../backend/errors.zig");
 
-/// Parse HTTP Content-Length header from raw request
+/// Parses the Content-Length value from a raw HTTP header block.
+///
+/// Args:
+/// - headers: raw request bytes containing request line and headers only.
+///
+/// Returns:
+/// - !usize: parsed body byte length.
+///
+/// Errors:
+/// - returns `error.InvalidHttpRequest` when request line is missing.
+/// - returns `error.MissingContentLength` when header is absent.
+/// - returns `error.InvalidContentLength` for non-numeric values.
 pub fn parseContentLength(headers: []const u8) !usize {
     var lines = std.mem.splitScalar(u8, headers, '\n');
     _ = lines.next() orelse return error.InvalidHttpRequest;
@@ -24,14 +36,26 @@ pub fn parseContentLength(headers: []const u8) !usize {
     return error.MissingContentLength;
 }
 
-/// Find message body in HTTP request (after headers)
+/// Returns a slice to the message body portion after the CRLF header separator.
+///
+/// Args:
+/// - request_raw: full raw HTTP request bytes.
+///
+/// Returns:
+/// - ?[]const u8: body slice when separator is present, null otherwise.
 pub fn findBody(request_raw: []const u8) ?[]const u8 {
     const separator = "\r\n\r\n";
     const index = std.mem.indexOf(u8, request_raw, separator) orelse return null;
     return request_raw[index + separator.len ..];
 }
 
-/// Extract the first line of an HTTP request
+/// Returns the first request line for logging and route parsing.
+///
+/// Args:
+/// - request_raw: full raw HTTP request bytes.
+///
+/// Returns:
+/// - []const u8: slice from start through first CRLF or full buffer if absent.
 pub fn firstRequestLine(request_raw: []const u8) []const u8 {
     const request_line_end = std.mem.indexOf(u8, request_raw, "\r\n") orelse request_raw.len;
     return request_raw[0..request_line_end];
@@ -46,7 +70,18 @@ pub const ReadHttpRequestError = error{
     IncompleteRequestBody,
 };
 
-/// Read complete HTTP request from connection
+/// Reads one complete HTTP request from a connection into an owned buffer.
+///
+/// Args:
+/// - allocator: allocator used for the returned request bytes.
+/// - connection: accepted server connection stream.
+///
+/// Returns:
+/// - ![]u8: owned full request bytes trimmed to header + exact body length.
+///
+/// Errors:
+/// - framing/size errors from `ReadHttpRequestError`.
+/// - stream read and allocation failures.
 pub fn readHttpRequest(
     allocator: std.mem.Allocator,
     connection: std.net.Server.Connection,
@@ -61,6 +96,7 @@ pub fn readHttpRequest(
     var header_end: ?usize = null;
     var total_length: ?usize = null;
 
+    // Read until header parsing reveals the exact required request length.
     while (true) {
         const bytes_read = try connection.stream.read(&chunk);
         if (bytes_read == 0) break;
@@ -100,6 +136,7 @@ pub fn readHttpRequest(
         return error.InvalidHttpRequest;
     }
 
+    // Reject truncated bodies rather than passing partial payloads downstream.
     if (request.items.len < total_length.?) {
         return error.IncompleteRequestBody;
     }
