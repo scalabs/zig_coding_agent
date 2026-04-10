@@ -6,8 +6,19 @@ pub const Config = struct {
     listen_port: u16,
     debug_logging: bool,
     default_provider: []const u8,
+    instance_id: []const u8,
+    auth_api_key: []const u8,
     ollama_base_url: []const u8,
     ollama_model: []const u8,
+    openai_base_url: []const u8,
+    openai_api_key: []const u8,
+    openai_model: []const u8,
+    claude_base_url: []const u8,
+    claude_api_key: []const u8,
+    claude_model: []const u8,
+    llama_cpp_base_url: []const u8,
+    llama_cpp_api_key: []const u8,
+    llama_cpp_model: []const u8,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         const default_provider = try getEnvOrDefault(
@@ -27,6 +38,16 @@ pub const Config = struct {
             .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081),
             .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG"),
             .default_provider = default_provider,
+            .instance_id = try getEnvOrDefault(
+                allocator,
+                "LLM_ROUTER_INSTANCE_ID",
+                "local-instance",
+            ),
+            .auth_api_key = try getEnvOrDefault(
+                allocator,
+                "LLM_ROUTER_API_KEY",
+                "",
+            ),
             .ollama_base_url = try getEnvOrDefault(
                 allocator,
                 "OLLAMA_BASE_URL",
@@ -37,14 +58,70 @@ pub const Config = struct {
                 "OLLAMA_MODEL",
                 "qwen:7b",
             ),
+            .openai_base_url = try getEnvOrDefault(
+                allocator,
+                "OPENAI_BASE_URL",
+                "https://api.openai.com/v1",
+            ),
+            .openai_api_key = try getEnvOrDefault(
+                allocator,
+                "OPENAI_API_KEY",
+                "",
+            ),
+            .openai_model = try getEnvOrDefault(
+                allocator,
+                "OPENAI_MODEL",
+                "gpt-4.1-mini",
+            ),
+            .claude_base_url = try getEnvOrDefault(
+                allocator,
+                "CLAUDE_BASE_URL",
+                "https://api.anthropic.com/v1",
+            ),
+            .claude_api_key = try getEnvOrDefault(
+                allocator,
+                "CLAUDE_API_KEY",
+                "",
+            ),
+            .claude_model = try getEnvOrDefault(
+                allocator,
+                "CLAUDE_MODEL",
+                "claude-3-5-sonnet-latest",
+            ),
+            .llama_cpp_base_url = try getEnvOrDefault(
+                allocator,
+                "LLAMA_CPP_BASE_URL",
+                "http://127.0.0.1:8080",
+            ),
+            .llama_cpp_api_key = try getEnvOrDefault(
+                allocator,
+                "LLAMA_CPP_API_KEY",
+                "",
+            ),
+            .llama_cpp_model = try getEnvOrDefault(
+                allocator,
+                "LLAMA_CPP_MODEL",
+                "local-model",
+            ),
         };
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
         allocator.free(self.default_provider);
+        allocator.free(self.instance_id);
+        allocator.free(self.auth_api_key);
         allocator.free(self.ollama_base_url);
         allocator.free(self.ollama_model);
+        allocator.free(self.openai_base_url);
+        allocator.free(self.openai_api_key);
+        allocator.free(self.openai_model);
+        allocator.free(self.claude_base_url);
+        allocator.free(self.claude_api_key);
+        allocator.free(self.claude_model);
+        allocator.free(self.llama_cpp_base_url);
+        allocator.free(self.llama_cpp_api_key);
+        allocator.free(self.llama_cpp_model);
     }
 
     pub fn setDefaultProvider(

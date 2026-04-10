@@ -38,7 +38,7 @@ pub fn parseChatRequest(
             .string => |value| blk: {
                 const normalized = types.normalizeProviderName(value) orelse {
                     return .{ .err = errors.validationError(
-                        "provider must be one of: ollama_qwen, ollama, qwen",
+                        "provider must be one of: ollama_qwen, ollama, qwen, openai, claude, anthropic, llama_cpp",
                         "provider",
                         "invalid_provider",
                     ) };
@@ -217,11 +217,182 @@ pub fn parseChatRequest(
     const model = if (model_source) |value| try allocator.dupe(u8, value) else null;
     errdefer if (model) |value| allocator.free(value);
 
+    const session_id = if (obj.get("session_id")) |session_id_value|
+        switch (session_id_value) {
+            .string => |value| blk: {
+                if (value.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "session_id must not be empty",
+                        "session_id",
+                        "invalid_session_id",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, value);
+            },
+            else => return .{ .err = errors.validationError(
+                "session_id must be a string",
+                "session_id",
+                "invalid_session_id",
+            ) },
+        }
+    else
+        null;
+    errdefer if (session_id) |value| allocator.free(value);
+
+    const tenant_id = if (obj.get("tenant_id")) |tenant_id_value|
+        switch (tenant_id_value) {
+            .string => |value| blk: {
+                if (value.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "tenant_id must not be empty",
+                        "tenant_id",
+                        "invalid_tenant_id",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, value);
+            },
+            else => return .{ .err = errors.validationError(
+                "tenant_id must be a string",
+                "tenant_id",
+                "invalid_tenant_id",
+            ) },
+        }
+    else
+        null;
+    errdefer if (tenant_id) |value| allocator.free(value);
+
+    const max_context_tokens = if (obj.get("max_context_tokens")) |tokens_value|
+        switch (tokens_value) {
+            .integer => |value| blk: {
+                if (value <= 0) {
+                    return .{ .err = errors.validationError(
+                        "max_context_tokens must be a positive integer",
+                        "max_context_tokens",
+                        "invalid_max_context_tokens",
+                    ) };
+                }
+                break :blk @as(usize, @intCast(value));
+            },
+            else => return .{ .err = errors.validationError(
+                "max_context_tokens must be a positive integer",
+                "max_context_tokens",
+                "invalid_max_context_tokens",
+            ) },
+        }
+    else
+        null;
+
+    const parsed_tools = if (obj.get("tools")) |tools_value|
+        switch (tools_value) {
+            .array => |tool_array| blk: {
+                var tools = std.ArrayList(types.Tool){};
+                errdefer {
+                    for (tools.items) |tool| {
+                        tool.deinit(allocator);
+                    }
+                    tools.deinit(allocator);
+                }
+
+                for (tool_array.items) |tool_value| {
+                    const tool_obj = switch (tool_value) {
+                        .object => |value| value,
+                        else => return .{ .err = errors.validationError(
+                            "Each tool must be a JSON object",
+                            "tools",
+                            "invalid_tools",
+                        ) },
+                    };
+
+                    const name = switch (tool_obj.get("name") orelse {
+                        return .{ .err = errors.validationError(
+                            "Each tool must include a name",
+                            "tools",
+                            "invalid_tools",
+                        ) };
+                    }) {
+                        .string => |value| value,
+                        else => return .{ .err = errors.validationError(
+                            "tool.name must be a string",
+                            "tools",
+                            "invalid_tools",
+                        ) },
+                    };
+
+                    if (name.len == 0) {
+                        return .{ .err = errors.validationError(
+                            "tool.name must not be empty",
+                            "tools",
+                            "invalid_tools",
+                        ) };
+                    }
+
+                    const description = if (tool_obj.get("description")) |description_value|
+                        switch (description_value) {
+                            .string => |value| value,
+                            else => return .{ .err = errors.validationError(
+                                "tool.description must be a string",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        }
+                    else
+                        "";
+
+                    try tools.append(allocator, .{
+                        .name = try allocator.dupe(u8, name),
+                        .description = try allocator.dupe(u8, description),
+                    });
+                }
+
+                break :blk try tools.toOwnedSlice(allocator);
+            },
+            else => return .{ .err = errors.validationError(
+                "tools must be an array",
+                "tools",
+                "invalid_tools",
+            ) },
+        }
+    else
+        try allocator.alloc(types.Tool, 0);
+    errdefer {
+        for (parsed_tools) |tool| {
+            tool.deinit(allocator);
+        }
+        allocator.free(parsed_tools);
+    }
+
+    const tool_choice = if (obj.get("tool_choice")) |tool_choice_value|
+        switch (tool_choice_value) {
+            .string => |value| blk: {
+                if (value.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "tool_choice must not be empty",
+                        "tool_choice",
+                        "invalid_tool_choice",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, value);
+            },
+            else => return .{ .err = errors.validationError(
+                "tool_choice must be a string",
+                "tool_choice",
+                "invalid_tool_choice",
+            ) },
+        }
+    else
+        null;
+    errdefer if (tool_choice) |value| allocator.free(value);
+
     return .{ .ok = types.Request{
         .prompt = prompt,
         .messages = parsed_messages,
         .provider = provider,
         .model = model,
+        .session_id = session_id,
+        .tenant_id = tenant_id,
+        .max_context_tokens = max_context_tokens,
+        .tools = parsed_tools,
+        .tool_choice = tool_choice,
     } };
 }
 
@@ -239,6 +410,21 @@ pub fn callProvider(
     if (std.mem.eql(u8, provider, "ollama_qwen")) {
         const ollama_qwen = @import("../providers/ollama_qwen.zig");
         return try ollama_qwen.callQwen(allocator, app_config, request);
+    }
+
+    if (std.mem.eql(u8, provider, "openai")) {
+        const openai = @import("../providers/openai.zig");
+        return try openai.callOpenAI(allocator, app_config, request);
+    }
+
+    if (std.mem.eql(u8, provider, "claude")) {
+        const claude = @import("../providers/claude.zig");
+        return try claude.callClaude(allocator, app_config, request);
+    }
+
+    if (std.mem.eql(u8, provider, "llama_cpp")) {
+        const llama_cpp = @import("../providers/llama_cpp.zig");
+        return try llama_cpp.callLlamaCpp(allocator, app_config, request);
     }
 
     return error.UnknownProvider;
@@ -318,6 +504,7 @@ test "parseChatRequest treats model auto as default" {
     try std.testing.expectEqualStrings("ollama_qwen", request.provider.?);
     try std.testing.expect(request.model == null);
     try std.testing.expectEqualStrings("Hello", request.prompt);
+    try std.testing.expectEqual(@as(usize, 0), request.tools.len);
 }
 
 test "parseChatRequest rejects invalid provider" {

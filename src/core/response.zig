@@ -48,6 +48,8 @@ fn sendJson(
     const status_text = switch (status_code) {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
@@ -68,6 +70,14 @@ fn sendJson(
     defer std.heap.page_allocator.free(response);
 
     try connection.stream.writeAll(response);
+}
+
+pub fn sendJsonText(
+    connection: std.net.Server.Connection,
+    status_code: u16,
+    body: []const u8,
+) !void {
+    try sendJson(connection, status_code, body);
 }
 
 /// Send API error response

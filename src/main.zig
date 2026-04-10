@@ -154,6 +154,11 @@ fn runPromptLoop(
             .messages = messages_copy,
             .provider = try allocator.dupe(u8, app_config.default_provider),
             .model = null,
+            .session_id = null,
+            .tenant_id = null,
+            .max_context_tokens = null,
+            .tools = try allocator.alloc(root.types.Tool, 0),
+            .tool_choice = null,
         };
         defer request.deinit(allocator);
 
@@ -190,4 +195,3 @@ fn appendConversationMessage(
         .content = try allocator.dupe(u8, content),
     });
 }
-
