@@ -6,6 +6,7 @@ pub const Route = enum {
     metrics,
     diagnostics_clients,
     diagnostics_requests,
+    diagnostics_providers,
 };
 
 pub fn parseRoute(request_raw: []const u8) !?Route {
@@ -38,6 +39,9 @@ pub fn parseRoute(request_raw: []const u8) !?Route {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/diagnostics/requests")) {
         return .diagnostics_requests;
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, target, "/diagnostics/providers")) {
+        return .diagnostics_providers;
+    }
 
     return null;
 }
@@ -65,4 +69,5 @@ test "parseRoute supports diagnostics endpoints" {
     try std.testing.expectEqual(Route.metrics, (try parseRoute("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")).?);
     try std.testing.expectEqual(Route.diagnostics_clients, (try parseRoute("GET /diagnostics/clients HTTP/1.1\r\nHost: localhost\r\n\r\n")).?);
     try std.testing.expectEqual(Route.diagnostics_requests, (try parseRoute("GET /diagnostics/requests HTTP/1.1\r\nHost: localhost\r\n\r\n")).?);
+    try std.testing.expectEqual(Route.diagnostics_providers, (try parseRoute("GET /diagnostics/providers HTTP/1.1\r\nHost: localhost\r\n\r\n")).?);
 }

@@ -44,12 +44,13 @@ pub const ReadHttpRequestError = error{
     MissingContentLength,
     InvalidContentLength,
     IncompleteRequestBody,
+    ClientDisconnected,
 };
 
 /// Read complete HTTP request from connection
 pub fn readHttpRequest(
     allocator: std.mem.Allocator,
-    connection: std.net.Server.Connection,
+    connection: *std.net.Server.Connection,
 ) ![]u8 {
     const max_request_size = 1024 * 1024;
     const max_header_size = 16 * 1024;
@@ -62,7 +63,10 @@ pub fn readHttpRequest(
     var total_length: ?usize = null;
 
     while (true) {
-        const bytes_read = try connection.stream.read(&chunk);
+        const bytes_read = std.posix.recv(connection.stream.handle, chunk[0..], 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return error.ClientDisconnected,
+        };
         if (bytes_read == 0) break;
 
         if (request.items.len + bytes_read > max_request_size) {
@@ -75,7 +79,10 @@ pub fn readHttpRequest(
             if (std.mem.indexOf(u8, request.items, "\r\n\r\n")) |index| {
                 header_end = index + 4;
 
-                const content_length = try parseContentLength(request.items[0..index]);
+                const content_length = parseContentLength(request.items[0..index]) catch |err| switch (err) {
+                    error.MissingContentLength => 0,
+                    else => return err,
+                };
                 const required_length = header_end.? + content_length;
                 if (required_length > max_request_size) {
                     return error.RequestTooLarge;

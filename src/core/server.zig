@@ -55,6 +55,28 @@ pub fn run(
     );
     logInfo("Default provider: {s}", .{app_config.default_provider});
     logInfo("Available providers: ollama (aliases: qwen, ollama_qwen)", .{});
+    logInfo(
+        "Ollama speed settings: think={} num_predict={d} temperature={d:.2} repeat_penalty={d:.2}",
+        .{
+            app_config.ollama_think,
+            app_config.ollama_num_predict,
+            app_config.ollama_temperature,
+            app_config.ollama_repeat_penalty,
+        },
+    );
+
+    const default_provider = types.normalizeProviderName(app_config.default_provider) orelse app_config.default_provider;
+    if (std.mem.eql(u8, default_provider, "ollama_qwen")) {
+        const provider_status = backend.buildProviderStatusJson(allocator, app_config) catch |err| blk: {
+            logError("Provider status detection failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (provider_status) |status| {
+            defer allocator.free(status);
+            logInfo("Provider status: {s}", .{status});
+        }
+    }
+
     if (app_config.debug_logging) {
         logInfo("Debug logging enabled", .{});
     }
@@ -74,14 +96,11 @@ pub fn run(
         server_state.active_connections += 1;
         defer server_state.active_connections -= 1;
 
-        const client_label = std.fmt.allocPrint(allocator, "{any}", .{connection.address}) catch "unknown";
-        if (!std.mem.eql(u8, client_label, "unknown")) {
-            defer allocator.free(client_label);
-            server_state.noteClient(allocator, client_label) catch {};
-        }
+        // Client tracking is intentionally disabled in the hot path on Windows
+        // until socket stability issues are fully resolved.
 
-        handleConnection(allocator, app_config, connection, &server_state, &tool_registry) catch |err| {
-            logError("Request handling error: {}", .{err});
+        handleConnection(allocator, app_config, &connection, &server_state, &tool_registry) catch |err| {
+            logError("Request handling error: {s}", .{@errorName(err)});
             server_state.failed_requests += 1;
         };
     }
@@ -91,51 +110,58 @@ pub fn run(
 fn handleConnection(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
-    connection: std.net.Server.Connection,
+    connection: *std.net.Server.Connection,
     server_state: *ServerState,
     tool_registry: *tooling.ToolRegistry,
 ) !void {
     const request_raw = request.readHttpRequest(allocator, connection) catch |err| switch (err) {
+        error.ClientDisconnected => {
+            debugLog(app_config, "client disconnected before full request", .{});
+            return;
+        },
         error.RequestTooLarge => {
-            try response.sendApiError(connection, allocator, backend.errors.payloadTooLargeError());
+            sendApiErrorSafe(connection.*, allocator, backend.errors.payloadTooLargeError(), app_config);
             return;
         },
         error.HeadersTooLarge => {
-            try response.sendApiError(connection, allocator, backend.errors.httpError(
+            sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "HTTP headers are too large",
                 "headers_too_large",
-            ));
+            ), app_config);
             return;
         },
         error.InvalidHttpRequest => {
-            try response.sendApiError(connection, allocator, backend.errors.httpError(
+            sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Malformed HTTP request",
                 "invalid_http_request",
-            ));
+            ), app_config);
             return;
         },
         error.MissingContentLength => {
-            try response.sendApiError(connection, allocator, backend.errors.httpError(
+            sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Missing Content-Length header",
                 "missing_content_length",
-            ));
+            ), app_config);
             return;
         },
         error.InvalidContentLength => {
-            try response.sendApiError(connection, allocator, backend.errors.httpError(
+            sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Invalid Content-Length header",
                 "invalid_content_length",
-            ));
+            ), app_config);
             return;
         },
         error.IncompleteRequestBody => {
-            try response.sendApiError(connection, allocator, backend.errors.httpError(
+            sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Incomplete request body",
                 "incomplete_body",
-            ));
+            ), app_config);
             return;
         },
-        else => return err,
+        else => {
+            debugLog(app_config, "unhandled socket read error: {s}", .{@errorName(err)});
+            return;
+        },
     };
     defer allocator.free(request_raw);
 
@@ -149,22 +175,22 @@ fn handleConnection(
     );
 
     const route = router.parseRoute(request_raw) catch {
-        try response.sendApiError(connection, allocator, backend.errors.httpError(
+        sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
             "Malformed HTTP request",
             "invalid_http_request",
-        ));
+        ), app_config);
         server_state.failed_requests += 1;
         return;
     };
 
     if (route == null) {
-        try response.sendApiError(connection, allocator, backend.errors.notFoundError());
+        sendApiErrorSafe(connection.*, allocator, backend.errors.notFoundError(), app_config);
         server_state.failed_requests += 1;
         return;
     }
 
     if (requiresAuth(route.?) and auth.authorizeRequest(app_config.auth_api_key, request_raw) == .denied) {
-        try response.sendJsonText(connection, 401, "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth_error\",\"param\":null,\"code\":\"unauthorized\"}}");
+        sendJsonSafe(connection.*, 401, "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth_error\",\"param\":null,\"code\":\"unauthorized\"}}", app_config);
         server_state.failed_requests += 1;
         return;
     }
@@ -177,7 +203,7 @@ fn handleConnection(
                 .{app_config.instance_id},
             );
             defer allocator.free(health_json);
-            try response.sendJsonText(connection, 200, health_json);
+            sendJsonSafe(connection.*, 200, health_json, app_config);
             server_state.successful_requests += 1;
             return;
         },
@@ -194,7 +220,7 @@ fn handleConnection(
                 },
             );
             defer allocator.free(metrics_json);
-            try response.sendJsonText(connection, 200, metrics_json);
+            sendJsonSafe(connection.*, 200, metrics_json, app_config);
             server_state.successful_requests += 1;
             return;
         },
@@ -216,7 +242,7 @@ fn handleConnection(
                 .{ app_config.instance_id, server_state.active_connections, clients_json.items },
             );
             defer allocator.free(payload);
-            try response.sendJsonText(connection, 200, payload);
+            sendJsonSafe(connection.*, 200, payload, app_config);
             server_state.successful_requests += 1;
             return;
         },
@@ -232,7 +258,22 @@ fn handleConnection(
                 },
             );
             defer allocator.free(payload);
-            try response.sendJsonText(connection, 200, payload);
+            sendJsonSafe(connection.*, 200, payload, app_config);
+            server_state.successful_requests += 1;
+            return;
+        },
+        .diagnostics_providers => {
+            const provider_status = try backend.buildProviderStatusJson(allocator, app_config);
+            defer allocator.free(provider_status);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"instance_id\":\"{s}\",\"providers\":{s}}}",
+                .{ app_config.instance_id, provider_status },
+            );
+            defer allocator.free(payload);
+
+            sendJsonSafe(connection.*, 200, payload, app_config);
             server_state.successful_requests += 1;
             return;
         },
@@ -240,10 +281,10 @@ fn handleConnection(
     }
 
     const body = request.findBody(request_raw) orelse {
-        try response.sendApiError(connection, allocator, backend.errors.httpError(
+        sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
             "Missing request body",
             "missing_body",
-        ));
+        ), app_config);
         server_state.failed_requests += 1;
         return;
     };
@@ -254,7 +295,7 @@ fn handleConnection(
     const parsed_req = switch (parse_result) {
         .ok => |parsed_request| parsed_request,
         .err => |api_error| {
-            try response.sendApiError(connection, allocator, api_error);
+            sendApiErrorSafe(connection.*, allocator, api_error, app_config);
             server_state.failed_requests += 1;
             return;
         },
@@ -262,11 +303,11 @@ fn handleConnection(
     defer parsed_req.deinit(allocator);
 
     if (!tooling.validateRequestedTools(tool_registry, parsed_req.tools)) {
-        try response.sendApiError(connection, allocator, backend.errors.validationError(
+        sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
             "One or more requested tools are not registered",
             "tools",
             "unknown_tool",
-        ));
+        ), app_config);
         server_state.failed_requests += 1;
         return;
     }
@@ -293,12 +334,50 @@ fn handleConnection(
         },
     );
 
+    if (parsed_req.stream) {
+        const requested_provider = parsed_req.provider orelse app_config.default_provider;
+        const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
+
+        if (!std.mem.eql(u8, normalized_provider, "ollama_qwen")) {
+            sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
+                "stream=true is currently supported only for ollama",
+                "stream",
+                "unsupported_stream_provider",
+            ), app_config);
+            server_state.failed_requests += 1;
+            return;
+        }
+
+        const ollama_qwen = @import("../providers/ollama_qwen.zig");
+        const stream_result = ollama_qwen.streamQwenToSse(connection.*, allocator, app_config, parsed_req) catch |err| {
+            logError("Provider stream error: {s}", .{@errorName(err)});
+            server_state.failed_requests += 1;
+            return;
+        };
+
+        switch (stream_result) {
+            .streamed => {
+                server_state.successful_requests += 1;
+                return;
+            },
+            .failed => |provider_error_response| {
+                defer provider_error_response.deinit(allocator);
+                sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
+                    provider_error_response.output,
+                    "provider_error",
+                ), app_config);
+                server_state.failed_requests += 1;
+                return;
+            },
+        }
+    }
+
     const result = backend.callProvider(allocator, app_config, parsed_req) catch |err| {
         logError("Provider request error: {}", .{err});
-        try response.sendApiError(connection, allocator, backend.errors.providerError(
+        sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
             "Provider request failed",
             "provider_request_failed",
-        ));
+        ), app_config);
         server_state.failed_requests += 1;
         return;
     };
@@ -310,10 +389,10 @@ fn handleConnection(
             "provider error model={s} message_len={d}",
             .{ result.model, result.output.len },
         );
-        try response.sendApiError(connection, allocator, backend.errors.providerError(
+        sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
             result.output,
             "provider_error",
-        ));
+        ), app_config);
         server_state.failed_requests += 1;
         return;
     }
@@ -323,13 +402,62 @@ fn handleConnection(
         "response model={s} finish_reason={s} usage_total={d}",
         .{ result.model, result.finish_reason, result.usage.total_tokens },
     );
-    try response.sendChatCompletion(connection, allocator, result);
+    sendChatCompletionSafe(connection.*, allocator, result, app_config);
     server_state.successful_requests += 1;
+}
+
+fn sendApiErrorSafe(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    api_error: backend.errors.ApiError,
+    app_config: *const config.Config,
+) void {
+    response.sendApiError(connection, allocator, api_error) catch |err| {
+        swallowSocketWriteError(app_config, err);
+    };
+}
+
+fn sendJsonSafe(
+    connection: std.net.Server.Connection,
+    status_code: u16,
+    body: []const u8,
+    app_config: *const config.Config,
+) void {
+    response.sendJsonText(connection, status_code, body) catch |err| {
+        swallowSocketWriteError(app_config, err);
+    };
+}
+
+fn sendChatCompletionSafe(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    result: types.Response,
+    app_config: *const config.Config,
+) void {
+    response.sendChatCompletion(connection, allocator, result) catch |err| {
+        swallowSocketWriteError(app_config, err);
+    };
+}
+
+fn swallowSocketWriteError(
+    app_config: *const config.Config,
+    err: anyerror,
+) void {
+    switch (err) {
+        error.Unexpected,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.OperationAborted,
+        error.NotOpenForWriting,
+        => debugLog(app_config, "socket write aborted: {s}", .{@errorName(err)}),
+        else => logError("response write error: {s}", .{@errorName(err)}),
+    }
 }
 
 fn requiresAuth(route: router.Route) bool {
     return switch (route) {
         .health => false,
+        .diagnostics_providers => false,
         else => true,
     };
 }

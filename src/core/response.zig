@@ -161,3 +161,70 @@ pub fn sendChatCompletion(
 
     try sendJson(connection, 200, response_json);
 }
+
+pub fn sendEventStreamHeaders(connection: std.net.Server.Connection) !void {
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "X-Accel-Buffering: no\r\n" ++
+        "\r\n";
+
+    try connection.stream.writeAll(response);
+}
+
+pub fn sendSseData(connection: std.net.Server.Connection, payload: []const u8) !void {
+    const frame = try std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "data: {s}\n\n",
+        .{payload},
+    );
+    defer std.heap.page_allocator.free(frame);
+
+    try connection.stream.writeAll(frame);
+}
+
+pub fn sendSseDone(connection: std.net.Server.Connection) !void {
+    try connection.stream.writeAll("data: [DONE]\n\n");
+}
+
+pub fn sendChatCompletionChunkSse(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    completion_id: []const u8,
+    model: []const u8,
+    delta_content: ?[]const u8,
+    finish_reason: ?[]const u8,
+) !void {
+    const escaped_id = try escapeJsonStringAlloc(allocator, completion_id);
+    defer allocator.free(escaped_id);
+
+    const escaped_model = try escapeJsonStringAlloc(allocator, model);
+    defer allocator.free(escaped_model);
+
+    const delta_json = if (delta_content) |text| blk: {
+        const escaped = try escapeJsonStringAlloc(allocator, text);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "{{\"content\":\"{s}\"}}", .{escaped});
+    } else try allocator.dupe(u8, "{}");
+    defer allocator.free(delta_json);
+
+    const finish_reason_json = try optionalJsonStringAlloc(allocator, finish_reason);
+    defer allocator.free(finish_reason_json);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"{s}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":{s}}}]}}",
+        .{
+            escaped_id,
+            std.time.timestamp(),
+            escaped_model,
+            delta_json,
+            finish_reason_json,
+        },
+    );
+    defer allocator.free(payload);
+
+    try sendSseData(connection, payload);
+}
