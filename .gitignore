@@ -2,6 +2,7 @@
 zig-out
 .ollama-qwen-env.example
 .env
+client/*
 
 # General
 .DS_Store
