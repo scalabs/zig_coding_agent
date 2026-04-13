@@ -1,3 +1,4 @@
+//! TCP server loop and request lifecycle orchestration.
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -36,7 +37,14 @@ const ServerState = struct {
     }
 };
 
-/// Run the server and handle incoming connections
+/// Starts the TCP listener and serves requests indefinitely.
+///
+/// Args:
+/// - allocator: allocator used by request parsing and response serialization.
+/// - app_config: immutable runtime configuration for listen address and defaults.
+///
+/// Errors:
+/// - propagates listener setup and accept-loop errors.
 pub fn run(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -106,7 +114,6 @@ pub fn run(
     }
 }
 
-/// Handle a single client connection
 fn handleConnection(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -114,6 +121,7 @@ fn handleConnection(
     server_state: *ServerState,
     tool_registry: *tooling.ToolRegistry,
 ) !void {
+    // Translate transport-level parsing failures into OpenAI-style API errors.
     const request_raw = request.readHttpRequest(allocator, connection) catch |err| switch (err) {
         error.ClientDisconnected => {
             debugLog(app_config, "client disconnected before full request", .{});

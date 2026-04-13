@@ -1,15 +1,24 @@
+//! Shared API error model and constructors for HTTP responses.
 const std = @import("std");
 
-/// Unified error types for API responses
+/// Unified error type used by transport and validation layers.
 pub const ApiError = struct {
-    status_code: u16,
-    message: []const u8,
-    error_type: []const u8,
-    param: ?[]const u8 = null,
-    code: ?[]const u8 = null,
+    status_code: u16, // HTTP response status.
+    message: []const u8, // Human-readable client-facing error text.
+    error_type: []const u8, // OpenAI-style category (invalid_request_error, provider_error).
+    param: ?[]const u8 = null, // Optional request field tied to the error.
+    code: ?[]const u8 = null, // Optional machine-readable code for client branching.
 };
 
-/// Validation error - 400 Bad Request
+/// Creates a validation error with HTTP 400 status.
+///
+/// Args:
+/// - message: user-facing validation detail.
+/// - param: optional request parameter name.
+/// - code: optional stable code for client branching.
+///
+/// Returns:
+/// - ApiError: populated invalid_request_error payload.
 pub fn validationError(
     message: []const u8,
     param: ?[]const u8,
@@ -24,7 +33,14 @@ pub fn validationError(
     };
 }
 
-/// Provider error - 502 Bad Gateway
+/// Creates a provider transport/runtime error with HTTP 502 status.
+///
+/// Args:
+/// - message: user-facing provider failure message.
+/// - code: optional stable provider error code.
+///
+/// Returns:
+/// - ApiError: populated provider_error payload.
 pub fn providerError(
     message: []const u8,
     code: ?[]const u8,
@@ -38,12 +54,22 @@ pub fn providerError(
     };
 }
 
-/// HTTP parsing error - 400 Bad Request
+/// Creates an HTTP parsing/request-shape error using validation semantics.
+///
+/// Args:
+/// - message: parsing failure detail.
+/// - code: optional stable parse error code.
+///
+/// Returns:
+/// - ApiError: populated invalid_request_error payload.
 pub fn httpError(message: []const u8, code: ?[]const u8) ApiError {
     return validationError(message, null, code);
 }
 
-/// Route not found error - 404 Not Found
+/// Creates a not-found route error with HTTP 404 status.
+///
+/// Returns:
+/// - ApiError: standardized not_found response payload.
 pub fn notFoundError() ApiError {
     return .{
         .status_code = 404,
@@ -54,7 +80,10 @@ pub fn notFoundError() ApiError {
     };
 }
 
-/// Request payload too large - 413 Payload Too Large
+/// Creates a request-too-large error with HTTP 413 status.
+///
+/// Returns:
+/// - ApiError: standardized request_too_large payload.
 pub fn payloadTooLargeError() ApiError {
     return .{
         .status_code = 413,
@@ -65,6 +94,7 @@ pub fn payloadTooLargeError() ApiError {
     };
 }
 
+/// Parse helper result used by request validation callers.
 pub const ParseChatRequestResult = union(enum) {
     ok: void,
     err: ApiError,

@@ -1,12 +1,19 @@
+//! CLI entrypoint for running the router in server mode or prompt-loop mode.
 const std = @import("std");
 const root = @import("root.zig");
 
+/// Parsed CLI options with owned heap-allocated string fields.
 const CliOptions = struct {
-    prompt: ?[]u8 = null,
-    provider_override: ?[]u8 = null,
-    until_marker: []u8,
-    max_turns: usize = 8,
+    prompt: ?[]u8 = null, // Enables prompt-loop mode when set.
+    provider_override: ?[]u8 = null, // Optional provider alias from CLI.
+    until_marker: []u8, // Loop exits when assistant output contains this marker.
+    max_turns: usize = 8, // Safety cap to avoid unbounded loops.
 
+    /// Releases all owned option buffers.
+    ///
+    /// Args:
+    /// - self: mutable options struct containing owned allocations.
+    /// - allocator: allocator that was used to allocate option buffers.
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.prompt) |prompt| allocator.free(prompt);
         if (self.provider_override) |provider| allocator.free(provider);
@@ -14,6 +21,10 @@ const CliOptions = struct {
     }
 };
 
+/// Starts the process, loads config, and dispatches to server or prompt-loop mode.
+///
+/// Errors:
+/// - allocator, configuration, CLI parsing, and provider/runtime errors.
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -48,6 +59,7 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
 
     _ = args.next();
 
+    // Support both split flags (`--prompt value`) and inline flags (`--prompt=value`).
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--provider")) {
             const value = args.next() orelse return error.MissingProviderValue;
@@ -140,6 +152,7 @@ fn runPromptLoop(
     var latest_user_prompt = initial_prompt;
     var turn: usize = 0;
 
+    // Duplicate messages for each request so ownership remains local to this call.
     while (turn < max_turns) : (turn += 1) {
         var messages_copy = try allocator.alloc(root.types.Message, conversation.items.len);
         for (conversation.items, 0..) |msg, i| {

@@ -1,6 +1,11 @@
+//! Runtime configuration loaded from environment variables.
 const std = @import("std");
 const types = @import("types.zig");
 
+/// Application configuration with owned string fields.
+///
+/// Ownership:
+/// - all string fields are owned and must be released with `deinit`.
 pub const Config = struct {
     listen_host: []const u8,
     listen_port: u16,
@@ -114,6 +119,11 @@ pub const Config = struct {
         };
     }
 
+    /// Releases all heap-allocated config strings.
+    ///
+    /// Args:
+    /// - self: config instance containing owned strings.
+    /// - allocator: allocator that allocated the config strings.
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
         allocator.free(self.default_provider);

@@ -4,7 +4,7 @@
 //! the public modules: backend, core, and config.
 const std = @import("std");
 
-// Re-export public modules
+// Re-export public modules.
 pub const backend = @import("backend/api.zig");
 pub const auth = @import("backend/auth.zig");
 pub const session = @import("backend/session.zig");
@@ -13,7 +13,7 @@ pub const core = @import("core/server.zig");
 pub const config = @import("config.zig");
 pub const types = @import("types.zig");
 
-// Re-export error types
+// Re-export common error types.
 pub const ApiError = backend.errors.ApiError;
 
 test "backend: chat request parsing" {

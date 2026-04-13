@@ -1,3 +1,4 @@
+//! Ollama-backed provider adapter for chat completion requests.
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -274,6 +275,7 @@ pub fn callQwen(
         ),
     };
 
+    // Ollama may omit done_reason; default to `stop` for OpenAI compatibility.
     const finish_reason = if (root.get("done_reason")) |done_reason|
         switch (done_reason) {
             .string => |value| value,

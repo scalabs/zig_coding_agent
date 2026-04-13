@@ -1,3 +1,4 @@
+//! Minimal route matcher for the HTTP request line.
 const std = @import("std");
 
 pub const Route = enum {

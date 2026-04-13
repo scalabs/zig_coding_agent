@@ -3,6 +3,12 @@
 OpenAI-compatible Zig server for local model routing. The current default path
 uses Ollama and exposes `POST /v1/chat/completions` for chat-style requests.
 
+> [!TIP]
+> **TL;DR:** Prompt looping is built in. Start here:
+> `zig build run -- --prompt "Work through this task step by step and end with DONE" --provider ollama`
+>
+> See [Prompt Loop (Built-In, Recommended)](#prompt-loop-built-in-recommended) for controls like `--until` and `--max-turns`.
+
 ## Requirements
 
 - Zig `0.15.2`
@@ -16,6 +22,25 @@ uses Ollama and exposes `POST /v1/chat/completions` for chat-style requests.
 - `src/backend/`: request parsing, provider dispatch, shared API errors
 - `src/core/`: HTTP server, routing, request parsing, and response formatting
 - `src/providers/`: provider-specific implementation(s)
+
+## Architecture
+
+High-level request flow:
+
+```mermaid
+flowchart TD
+  A[main.zig<br/>CLI entrypoint<br/>cmd: zig build run -- <args>] --> B{Execution mode}
+  B --> C[Server mode<br/>cmd: zig build run]
+  B --> D[Built-in prompt loop<br/>cmd: zig build run -- --prompt ... --until DONE --max-turns 8]
+
+  C --> E[core/server.zig<br/>listen host:port<br/>accept connection]
+  E --> F[core/router.zig + core/request.zig<br/>if POST /v1/chat/completions<br/>parse Content-Length + JSON body]
+  F --> G[backend/api.zig<br/>parseChatRequest call<br/>normalize provider/model]
+  G --> H[providers/ollama_qwen.zig<br/>POST /api/chat to Ollama<br/>stream false]
+  H --> I[core/response.zig<br/>send OpenAI-style JSON<br/>first choice message content]
+
+  D --> G
+```
 
 ## Configuration
 
@@ -135,13 +160,43 @@ curl -s http://127.0.0.1:11434/api/chat \
   -d '{"model":"qwen:7b","messages":[{"role":"user","content":"Say hello from Zig"}],"stream":false}'
 ```
 
-## Prompt Loop
+## Prompt Loop (Built-In, Recommended)
 
-The server returns one completion per request. If you want to keep iterating on
-the same task until the model says it is finished, do that from the client.
+Looping is built in now. Most users should use the CLI prompt loop instead of
+writing shell scripts.
 
-Bash example that keeps the conversation going until the assistant says
-`DONE` or the model finishes normally:
+Quick start:
+
+```bash
+zig build run -- --prompt "Work through this task step by step and end with DONE" --provider ollama
+```
+
+Recommended controls:
+
+- `--until <marker>`: stop once the model includes this marker (default `DONE`)
+- `--max-turns <n>`: hard stop for safety (default `8`)
+
+Example with explicit controls:
+
+```bash
+zig build run -- --prompt "Plan the refactor and end with FINISHED" --provider ollama --until FINISHED --max-turns 12
+```
+
+When to use this mode:
+
+- You want multi-turn progress on one task.
+- You want conversation state handled for you.
+- You want a reliable stop condition without custom scripting.
+
+Single-response mode is still available through normal
+`POST /v1/chat/completions` requests.
+
+## External Prompt Looping (Optional Advanced Path)
+
+Only use external bash/Python loops if you need custom orchestration outside the
+built-in behavior (for example, custom persistence, retries, or telemetry).
+
+Reference bash pattern:
 
 ```bash
 messages='[{"role":"user","content":"Work through this task one step at a time. End with DONE when finished: <your prompt>"}]'
@@ -167,15 +222,6 @@ while true; do
   messages=$(printf '%s' "$messages" | jq '. + [{role:"user", content:"Continue."}]')
 done
 ```
-
-If you only want the model to generate a single complete response, the normal
-`POST /v1/chat/completions` call with `stream: false` is already enough.
-
-## External Prompt Looping (Bash Example)
-
-If you prefer to implement looping outside the agent (for example, in a bash
-script or Python client), the above bash example shows a pattern you can follow.
-The built-in `--prompt` feature is recommended for simplicity.
 
 ## Request Shape
 
