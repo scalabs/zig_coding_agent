@@ -217,6 +217,83 @@ pub fn parseChatRequest(
     const model = if (model_source) |value| try allocator.dupe(u8, value) else null;
     errdefer if (model) |value| allocator.free(value);
 
+    const stream = if (obj.get("stream")) |stream_value|
+        switch (stream_value) {
+            .bool => |value| value,
+            else => return .{ .err = errors.validationError(
+                "stream must be a boolean",
+                "stream",
+                "invalid_stream",
+            ) },
+        }
+    else
+        false;
+
+    const think = if (obj.get("think")) |think_value|
+        switch (think_value) {
+            .bool => |value| value,
+            else => return .{ .err = errors.validationError(
+                "think must be a boolean",
+                "think",
+                "invalid_think",
+            ) },
+        }
+    else if (obj.get("thinking")) |thinking_value|
+        switch (thinking_value) {
+            .bool => |value| value,
+            else => return .{ .err = errors.validationError(
+                "thinking must be a boolean",
+                "thinking",
+                "invalid_thinking",
+            ) },
+        }
+    else
+        null;
+
+    const temperature = if (obj.get("temperature")) |temperature_value|
+        switch (temperature_value) {
+            .float => |value| blk: {
+                if (!std.math.isFinite(value)) {
+                    return .{ .err = errors.validationError(
+                        "temperature must be a finite number",
+                        "temperature",
+                        "invalid_temperature",
+                    ) };
+                }
+                break :blk value;
+            },
+            .integer => |value| @as(f64, @floatFromInt(value)),
+            else => return .{ .err = errors.validationError(
+                "temperature must be a number",
+                "temperature",
+                "invalid_temperature",
+            ) },
+        }
+    else
+        null;
+
+    const repeat_penalty = if (obj.get("repeat_penalty")) |repeat_penalty_value|
+        switch (repeat_penalty_value) {
+            .float => |value| blk: {
+                if (!std.math.isFinite(value)) {
+                    return .{ .err = errors.validationError(
+                        "repeat_penalty must be a finite number",
+                        "repeat_penalty",
+                        "invalid_repeat_penalty",
+                    ) };
+                }
+                break :blk value;
+            },
+            .integer => |value| @as(f64, @floatFromInt(value)),
+            else => return .{ .err = errors.validationError(
+                "repeat_penalty must be a number",
+                "repeat_penalty",
+                "invalid_repeat_penalty",
+            ) },
+        }
+    else
+        null;
+
     const session_id = if (obj.get("session_id")) |session_id_value|
         switch (session_id_value) {
             .string => |value| blk: {
@@ -388,6 +465,10 @@ pub fn parseChatRequest(
         .messages = parsed_messages,
         .provider = provider,
         .model = model,
+        .stream = stream,
+        .think = think,
+        .temperature = temperature,
+        .repeat_penalty = repeat_penalty,
         .session_id = session_id,
         .tenant_id = tenant_id,
         .max_context_tokens = max_context_tokens,
@@ -430,6 +511,25 @@ pub fn callProvider(
     return error.UnknownProvider;
 }
 
+pub fn buildProviderStatusJson(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+) ![]u8 {
+    const normalized_default = types.normalizeProviderName(app_config.default_provider) orelse app_config.default_provider;
+    const escaped_default = try escapeJsonStringAlloc(allocator, normalized_default);
+    defer allocator.free(escaped_default);
+
+    const ollama_qwen = @import("../providers/ollama_qwen.zig");
+    const ollama_status_json = try ollama_qwen.buildStatusJsonAlloc(allocator, app_config);
+    defer allocator.free(ollama_status_json);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"default_provider\":\"{s}\",\"ollama\":{s}}}",
+        .{ escaped_default, ollama_status_json },
+    );
+}
+
 fn hasUserMessage(messages: []const types.Message) bool {
     for (messages) |message| {
         if (std.ascii.eqlIgnoreCase(message.role, "user")) return true;
@@ -450,6 +550,27 @@ fn extractLastUserPrompt(
         }
     }
     return error.NoUserMessage;
+}
+
+fn escapeJsonStringAlloc(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 test "parseChatRequest preserves messages and extracts last user prompt" {

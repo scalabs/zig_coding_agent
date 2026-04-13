@@ -10,6 +10,10 @@ pub const Config = struct {
     auth_api_key: []const u8,
     ollama_base_url: []const u8,
     ollama_model: []const u8,
+    ollama_think: bool,
+    ollama_num_predict: u32,
+    ollama_temperature: f64,
+    ollama_repeat_penalty: f64,
     openai_base_url: []const u8,
     openai_api_key: []const u8,
     openai_model: []const u8,
@@ -58,6 +62,10 @@ pub const Config = struct {
                 "OLLAMA_MODEL",
                 "qwen:7b",
             ),
+            .ollama_think = try getEnvFlag(allocator, "OLLAMA_THINK"),
+            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 128),
+            .ollama_temperature = try getEnvF64OrDefault(allocator, "OLLAMA_TEMPERATURE", 0.7),
+            .ollama_repeat_penalty = try getEnvF64OrDefault(allocator, "OLLAMA_REPEAT_PENALTY", 1.05),
             .openai_base_url = try getEnvOrDefault(
                 allocator,
                 "OPENAI_BASE_URL",
@@ -157,6 +165,27 @@ fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
         error.EnvironmentVariableNotFound => default_value,
         else => err,
     };
+}
+
+fn getEnvU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
+    return std.process.parseEnvVarInt(key, u32, 10) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => default_value,
+        else => err,
+    };
+}
+
+fn getEnvF64OrDefault(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    default_value: f64,
+) !f64 {
+    const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return default_value,
+        else => return err,
+    };
+    defer allocator.free(value);
+
+    return try std.fmt.parseFloat(f64, value);
 }
 
 fn getEnvFlag(

@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    app.linkLibC();
 
     b.installArtifact(app);
 
