@@ -168,9 +168,15 @@ pub fn parseChatRequest(
                         ) };
                     }
 
+                    const owned_role = try allocator.dupe(u8, role);
+                    errdefer allocator.free(owned_role);
+
+                    const owned_content = try allocator.dupe(u8, content);
+                    errdefer allocator.free(owned_content);
+
                     try collected.append(allocator, .{
-                        .role = try allocator.dupe(u8, role),
-                        .content = try allocator.dupe(u8, content),
+                        .role = owned_role,
+                        .content = owned_content,
                     });
                 }
 
@@ -204,9 +210,15 @@ pub fn parseChatRequest(
                 var messages = try allocator.alloc(types.Message, 1);
                 errdefer allocator.free(messages);
 
+                const role_copy = try allocator.dupe(u8, "user");
+                errdefer allocator.free(role_copy);
+
+                const content_copy = try allocator.dupe(u8, value);
+                errdefer allocator.free(content_copy);
+
                 messages[0] = .{
-                    .role = try allocator.dupe(u8, "user"),
-                    .content = try allocator.dupe(u8, value),
+                    .role = role_copy,
+                    .content = content_copy,
                 };
 
                 break :blk messages;

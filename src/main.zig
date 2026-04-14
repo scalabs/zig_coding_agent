@@ -7,6 +7,7 @@ const CliOptions = struct {
     prompt: ?[]u8 = null, // Enables prompt-loop mode when set.
     prompt_file: ?[]u8 = null, // Optional prompt file path.
     provider_override: ?[]u8 = null, // Optional provider alias from CLI.
+    model_override: ?[]u8 = null, // Optional model override for prompt-loop requests.
     until_marker: []u8, // Loop exits when assistant output contains this marker.
     max_turns: usize = 8, // Safety cap to avoid unbounded loops.
 
@@ -19,6 +20,7 @@ const CliOptions = struct {
         if (self.prompt) |prompt| allocator.free(prompt);
         if (self.prompt_file) |prompt_file| allocator.free(prompt_file);
         if (self.provider_override) |provider| allocator.free(provider);
+        if (self.model_override) |model| allocator.free(model);
         allocator.free(self.until_marker);
     }
 };
@@ -53,7 +55,14 @@ pub fn main() !void {
     }
 
     if (cli.prompt) |prompt| {
-        try runPromptLoop(allocator, &app_config, prompt, cli.until_marker, cli.max_turns);
+        try runPromptLoop(
+            allocator,
+            &app_config,
+            prompt,
+            cli.until_marker,
+            cli.max_turns,
+            cli.model_override,
+        );
         return;
     }
 
@@ -93,6 +102,14 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             if (value.len == 0) return error.InvalidPromptFileValue;
             if (cli.prompt_file) |prompt_file| allocator.free(prompt_file);
             cli.prompt_file = try allocator.dupe(u8, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--model")) {
+            const value = args.next() orelse return error.MissingModelValue;
+            if (value.len == 0) return error.InvalidModelValue;
+            if (cli.model_override) |model| allocator.free(model);
+            cli.model_override = try allocator.dupe(u8, value);
             continue;
         }
 
@@ -136,6 +153,15 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             if (value.len == 0) return error.InvalidPromptFileValue;
             if (cli.prompt_file) |prompt_file| allocator.free(prompt_file);
             cli.prompt_file = try allocator.dupe(u8, value);
+            continue;
+        }
+
+        const model_prefix = "--model=";
+        if (std.mem.startsWith(u8, arg, model_prefix)) {
+            const value = arg[model_prefix.len..];
+            if (value.len == 0) return error.InvalidModelValue;
+            if (cli.model_override) |model| allocator.free(model);
+            cli.model_override = try allocator.dupe(u8, value);
             continue;
         }
 
@@ -186,6 +212,7 @@ fn runPromptLoop(
     initial_prompt: []const u8,
     until_marker: []const u8,
     max_turns: usize,
+    model_override: ?[]const u8,
 ) !void {
     var conversation = std.ArrayList(root.types.Message){};
     defer {
@@ -211,6 +238,7 @@ fn runPromptLoop(
                 app_config,
                 conversation.items,
                 latest_user_prompt,
+                model_override,
             );
 
             if (result.success) {
@@ -254,6 +282,7 @@ fn callProviderForConversation(
     app_config: *const root.config.Config,
     conversation: []const root.types.Message,
     latest_user_prompt: []const u8,
+    model_override: ?[]const u8,
 ) !root.types.Response {
     var messages_copy = try allocator.alloc(root.types.Message, conversation.len);
     var initialized_messages: usize = 0;
@@ -280,7 +309,7 @@ fn callProviderForConversation(
         .prompt = try allocator.dupe(u8, latest_user_prompt),
         .messages = messages_copy,
         .provider = try allocator.dupe(u8, app_config.default_provider),
-        .model = null,
+        .model = if (model_override) |value| try allocator.dupe(u8, value) else null,
     };
     defer request.deinit(allocator);
 
@@ -293,8 +322,14 @@ fn appendConversationMessage(
     role: []const u8,
     content: []const u8,
 ) !void {
+    const role_copy = try allocator.dupe(u8, role);
+    errdefer allocator.free(role_copy);
+
+    const content_copy = try allocator.dupe(u8, content);
+    errdefer allocator.free(content_copy);
+
     try conversation.append(allocator, .{
-        .role = try allocator.dupe(u8, role),
-        .content = try allocator.dupe(u8, content),
+        .role = role_copy,
+        .content = content_copy,
     });
 }

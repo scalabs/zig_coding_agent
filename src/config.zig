@@ -38,28 +38,41 @@ pub const Config = struct {
         errdefer allocator.free(default_provider);
         try validateProviderName(default_provider);
 
+        const listen_host = try getSettingOrDefault(
+            allocator,
+            &dotenv,
+            "LLM_ROUTER_HOST",
+            "127.0.0.1",
+        );
+        errdefer allocator.free(listen_host);
+
+        const listen_port = try getPortSettingOrDefault(&dotenv, "LLM_ROUTER_PORT", 8081);
+
+        const debug_logging = try getSettingFlag(allocator, &dotenv, "LLM_ROUTER_DEBUG");
+
+        const ollama_base_url = try getSettingOrDefault(
+            allocator,
+            &dotenv,
+            "OLLAMA_BASE_URL",
+            "http://127.0.0.1:11434",
+        );
+        errdefer allocator.free(ollama_base_url);
+
+        const ollama_model = try getSettingOrDefault(
+            allocator,
+            &dotenv,
+            "OLLAMA_MODEL",
+            "qwen:7b",
+        );
+        errdefer allocator.free(ollama_model);
+
         return Config{
-            .listen_host = try getSettingOrDefault(
-                allocator,
-                &dotenv,
-                "LLM_ROUTER_HOST",
-                "127.0.0.1",
-            ),
-            .listen_port = try getPortSettingOrDefault(&dotenv, "LLM_ROUTER_PORT", 8081),
-            .debug_logging = try getSettingFlag(allocator, &dotenv, "LLM_ROUTER_DEBUG"),
+            .listen_host = listen_host,
+            .listen_port = listen_port,
+            .debug_logging = debug_logging,
             .default_provider = default_provider,
-            .ollama_base_url = try getSettingOrDefault(
-                allocator,
-                &dotenv,
-                "OLLAMA_BASE_URL",
-                "http://127.0.0.1:11434",
-            ),
-            .ollama_model = try getSettingOrDefault(
-                allocator,
-                &dotenv,
-                "OLLAMA_MODEL",
-                "qwen:7b",
-            ),
+            .ollama_base_url = ollama_base_url,
+            .ollama_model = ollama_model,
         };
     }
 
