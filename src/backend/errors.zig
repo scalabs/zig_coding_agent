@@ -1,5 +1,4 @@
 //! Shared API error model and constructors for HTTP responses.
-const std = @import("std");
 
 /// Unified error type used by transport and validation layers.
 pub const ApiError = struct {

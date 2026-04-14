@@ -2,8 +2,6 @@
 //!
 //! Keep imports stable here so dependents can use `@import("zig_coding_agent")`
 //! without depending on internal file layout.
-const std = @import("std");
-
 // Re-export public modules.
 pub const backend = @import("backend/api.zig");
 pub const core = @import("core/server.zig");

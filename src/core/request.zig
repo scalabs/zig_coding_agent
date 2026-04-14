@@ -1,6 +1,5 @@
 //! Manual HTTP request parsing helpers and framed body reader.
 const std = @import("std");
-const errors = @import("../backend/errors.zig");
 
 /// Parses the Content-Length value from a raw HTTP header block.
 ///

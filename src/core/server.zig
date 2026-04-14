@@ -1,7 +1,6 @@
 //! TCP server loop and request lifecycle orchestration.
 const std = @import("std");
 const config = @import("../config.zig");
-const types = @import("../types.zig");
 const request = @import("request.zig");
 const response = @import("response.zig");
 const router = @import("router.zig");

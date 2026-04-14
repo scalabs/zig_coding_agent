@@ -53,6 +53,22 @@ Use environment variables to configure the server:
 - `OLLAMA_BASE_URL`: default `http://127.0.0.1:11434`
 - `OLLAMA_MODEL`: default `qwen:7b`
 
+If present, local `.env` is loaded from the project working directory. Precedence is:
+
+1. Process environment variables
+2. `.env` values
+3. Built-in defaults
+
+Example `.env`:
+
+```bash
+LLM_ROUTER_HOST=127.0.0.1
+LLM_ROUTER_PORT=8081
+LLM_ROUTER_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen:7b
+```
+
 You can also override the default provider at startup:
 
 ```bash
@@ -71,6 +87,9 @@ Optional loop controls:
 
 - `--until <marker>`: completion marker to stop on (default `DONE`)
 - `--max-turns <n>`: hard stop to prevent infinite loops (default `8`)
+- `--prompt-file <path>`: load initial prompt text from a file
+
+If both `--prompt` and `--prompt-file` are provided, the CLI returns an error.
 
 Example with explicit controls:
 
@@ -175,11 +194,21 @@ Recommended controls:
 
 - `--until <marker>`: stop once the model includes this marker (default `DONE`)
 - `--max-turns <n>`: hard stop for safety (default `8`)
+- `--prompt-file <path>`: load the first user prompt from disk
+
+On provider failures (`success=false`), the loop retries once and then exits with
+non-zero status if the second attempt also fails.
 
 Example with explicit controls:
 
 ```bash
 zig build run -- --prompt "Plan the refactor and end with FINISHED" --provider ollama --until FINISHED --max-turns 12
+```
+
+Prompt-file example:
+
+```bash
+zig build run -- --prompt-file prompts/task.txt --provider ollama --until DONE --max-turns 8
 ```
 
 When to use this mode:

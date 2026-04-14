@@ -26,8 +26,12 @@ pub const Config = struct {
     /// - `error.InvalidProvider` when provider is not recognized.
     /// - allocation and environment access failures.
     pub fn load(allocator: std.mem.Allocator) !Config {
-        const default_provider = try getEnvOrDefault(
+        var dotenv = try Dotenv.load(allocator);
+        defer dotenv.deinit(allocator);
+
+        const default_provider = try getSettingOrDefault(
             allocator,
+            &dotenv,
             "LLM_ROUTER_PROVIDER",
             "ollama",
         );
@@ -35,21 +39,24 @@ pub const Config = struct {
         try validateProviderName(default_provider);
 
         return Config{
-            .listen_host = try getEnvOrDefault(
+            .listen_host = try getSettingOrDefault(
                 allocator,
+                &dotenv,
                 "LLM_ROUTER_HOST",
                 "127.0.0.1",
             ),
-            .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081),
-            .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG"),
+            .listen_port = try getPortSettingOrDefault(&dotenv, "LLM_ROUTER_PORT", 8081),
+            .debug_logging = try getSettingFlag(allocator, &dotenv, "LLM_ROUTER_DEBUG"),
             .default_provider = default_provider,
-            .ollama_base_url = try getEnvOrDefault(
+            .ollama_base_url = try getSettingOrDefault(
                 allocator,
+                &dotenv,
                 "OLLAMA_BASE_URL",
                 "http://127.0.0.1:11434",
             ),
-            .ollama_model = try getEnvOrDefault(
+            .ollama_model = try getSettingOrDefault(
                 allocator,
+                &dotenv,
                 "OLLAMA_MODEL",
                 "qwen:7b",
             ),
@@ -95,30 +102,118 @@ fn validateProviderName(provider: []const u8) !void {
     _ = types.normalizeProviderName(provider) orelse return error.InvalidProvider;
 }
 
-fn getEnvOrDefault(
+const Dotenv = struct {
+    values: std.StringHashMap([]u8),
+
+    fn load(allocator: std.mem.Allocator) !Dotenv {
+        var values = std.StringHashMap([]u8).init(allocator);
+        errdefer {
+            var it = values.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            values.deinit();
+        }
+
+        const content = std.fs.cwd().readFileAlloc(allocator, ".env", 256 * 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                return .{ .values = values };
+            },
+            else => return err,
+        };
+        defer allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, std.mem.trimRight(u8, line_raw, "\r"), " \t");
+            if (line.len == 0 or line[0] == '#') continue;
+
+            const separator_index = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key_slice = std.mem.trim(u8, line[0..separator_index], " \t");
+            var value_slice = std.mem.trim(u8, line[separator_index + 1 ..], " \t");
+
+            if (key_slice.len == 0) continue;
+
+            if (value_slice.len >= 2) {
+                const first = value_slice[0];
+                const last = value_slice[value_slice.len - 1];
+                if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+                    value_slice = value_slice[1 .. value_slice.len - 1];
+                }
+            }
+
+            const value_copy = try allocator.dupe(u8, value_slice);
+            errdefer allocator.free(value_copy);
+
+            if (values.getPtr(key_slice)) |existing| {
+                allocator.free(existing.*);
+                existing.* = value_copy;
+                continue;
+            }
+
+            const key_copy = try allocator.dupe(u8, key_slice);
+            errdefer allocator.free(key_copy);
+            try values.put(key_copy, value_copy);
+        }
+
+        return .{ .values = values };
+    }
+
+    fn deinit(self: *Dotenv, allocator: std.mem.Allocator) void {
+        var it = self.values.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.values.deinit();
+    }
+
+    fn get(self: *const Dotenv, key: []const u8) ?[]const u8 {
+        return self.values.get(key);
+    }
+};
+
+fn getSettingOrDefault(
     allocator: std.mem.Allocator,
+    dotenv: *const Dotenv,
     key: []const u8,
     default_value: []const u8,
 ) ![]u8 {
     return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => try allocator.dupe(u8, default_value),
+        error.EnvironmentVariableNotFound => {
+            if (dotenv.get(key)) |value| {
+                return try allocator.dupe(u8, value);
+            }
+            return try allocator.dupe(u8, default_value);
+        },
         else => err,
     };
 }
 
-fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
+fn getPortSettingOrDefault(
+    dotenv: *const Dotenv,
+    comptime key: []const u8,
+    default_value: u16,
+) !u16 {
     return std.process.parseEnvVarInt(key, u16, 10) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => default_value,
+        error.EnvironmentVariableNotFound => {
+            if (dotenv.get(key)) |value| {
+                return try std.fmt.parseInt(u16, value, 10);
+            }
+            return default_value;
+        },
         else => err,
     };
 }
 
 // Empty, 0, false, and no are treated as false; everything else is true.
-fn getEnvFlag(
+fn getSettingFlag(
     allocator: std.mem.Allocator,
+    dotenv: *const Dotenv,
     key: []const u8,
 ) !bool {
-    const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+    const value = getSettingOrDefault(allocator, dotenv, key, "") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return false,
         else => return err,
     };

@@ -30,13 +30,16 @@ pub fn callQwen(
     const messages_json = try renderMessagesJsonAlloc(allocator, request.messages);
     defer allocator.free(messages_json);
 
+    const model_json = try jsonValueAlloc(allocator, model_name);
+    defer allocator.free(model_json);
+
     const body = try std.fmt.allocPrint(allocator,
         \\{{
-        \\  "model": "{s}",
+        \\  "model": {s},
         \\  "messages": {s},
         \\  "stream": false
         \\}}
-    , .{ model_name, messages_json });
+    , .{ model_json, messages_json });
     defer allocator.free(body);
 
     var writer = std.Io.Writer.Allocating.init(allocator);
@@ -144,25 +147,11 @@ fn buildChatUrl(
     return try std.fmt.allocPrint(allocator, "{s}/api/chat", .{base_url});
 }
 
-fn escapeJsonStringAlloc(
+fn jsonValueAlloc(
     allocator: std.mem.Allocator,
-    input: []const u8,
+    value: anytype,
 ) ![]u8 {
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-
-    for (input) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
-        }
-    }
-
-    return try out.toOwnedSlice(allocator);
+    return try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
 }
 
 fn makeResponse(
@@ -185,30 +174,7 @@ fn renderMessagesJsonAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
 ) ![]u8 {
-    var out = std.ArrayList(u8){};
-    defer out.deinit(allocator);
-
-    try out.append(allocator, '[');
-
-    for (messages, 0..) |message, index| {
-        if (index > 0) {
-            try out.append(allocator, ',');
-        }
-
-        const escaped_role = try escapeJsonStringAlloc(allocator, message.role);
-        defer allocator.free(escaped_role);
-
-        const escaped_content = try escapeJsonStringAlloc(allocator, message.content);
-        defer allocator.free(escaped_content);
-
-        try out.writer(allocator).print(
-            "{{\"role\":\"{s}\",\"content\":\"{s}\"}}",
-            .{ escaped_role, escaped_content },
-        );
-    }
-
-    try out.append(allocator, ']');
-    return try out.toOwnedSlice(allocator);
+    return try jsonValueAlloc(allocator, messages);
 }
 
 fn parseUsageField(value: ?std.json.Value) usize {
