@@ -1,6 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
-const ollama_qwen = @import("providers/ollama_qwen.zig");
+const router = @import("router.zig");
 const types = @import("types.zig");
 
 pub fn main() !void {
@@ -23,7 +23,7 @@ pub fn main() !void {
         "Server running at http://{s}:{d}\n",
         .{ app_config.listen_host, app_config.listen_port },
     );
-    std.debug.print("Provider: local Ollama Qwen only\n", .{});
+    std.debug.print("Default provider: {s}\n", .{app_config.default_provider.name()});
     if (app_config.debug_logging) {
         std.debug.print("Debug logging enabled\n", .{});
     }
@@ -161,21 +161,18 @@ fn handleConnection(
     };
     defer req.deinit(allocator);
 
+    const selected_provider = req.provider orelse app_config.default_provider;
+    const requested_model = req.model orelse "(default)";
     debugLog(
         app_config,
         "request provider={s} model={s} prompt_len={d} messages={d}\n",
-        .{
-            req.provider orelse "ollama_qwen",
-            req.model orelse "(default)",
-            req.prompt.len,
-            req.messages.len,
-        },
+        .{ selected_provider.name(), requested_model, req.prompt.len, req.messages.len },
     );
 
-    const result = ollama_qwen.callQwen(allocator, app_config, req) catch |err| {
-        std.debug.print("Provider request error: {}\n", .{err});
+    const result = router.route(allocator, app_config, req) catch |err| {
+        std.debug.print("Provider routing error: {}\n", .{err});
         try sendApiError(connection, allocator, providerApiError(
-            "Local Ollama request failed",
+            "Provider request failed",
             "provider_request_failed",
         ));
         return;
@@ -354,16 +351,12 @@ fn parseChatRequest(
 
     const provider = if (obj.get("provider")) |provider_value|
         switch (provider_value) {
-            .string => |value| blk: {
-                const normalized = types.normalizeProviderName(value) orelse {
-                    return .{ .err = validationError(
-                        "provider must be one of: ollama_qwen, ollama, qwen",
-                        "provider",
-                        "invalid_provider",
-                    ) };
-                };
-
-                break :blk try allocator.dupe(u8, normalized);
+            .string => |value| types.Provider.parse(value) orelse {
+                return .{ .err = validationError(
+                    "provider must be one of: ollama_qwen, openrouter, bedrock",
+                    "provider",
+                    "invalid_provider",
+                ) };
             },
             else => return .{ .err = validationError(
                 "provider must be a string",
@@ -373,7 +366,6 @@ fn parseChatRequest(
         }
     else
         null;
-    errdefer if (provider) |value| allocator.free(value);
 
     const model_source = if (obj.get("model")) |model_value|
         switch (model_value) {
@@ -412,12 +404,12 @@ fn parseChatRequest(
                     ) };
                 }
 
-                var collected = std.ArrayList(types.Message){};
+                var parsed_messages = std.ArrayList(types.Message){};
                 errdefer {
-                    for (collected.items) |message| {
+                    for (parsed_messages.items) |message| {
                         message.deinit(allocator);
                     }
-                    collected.deinit(allocator);
+                    parsed_messages.deinit(allocator);
                 }
 
                 for (messages.items) |message_value| {
@@ -468,13 +460,13 @@ fn parseChatRequest(
                         ) };
                     }
 
-                    try collected.append(allocator, .{
+                    try parsed_messages.append(allocator, .{
                         .role = try allocator.dupe(u8, role),
                         .content = try allocator.dupe(u8, content),
                     });
                 }
 
-                if (!hasUserMessage(collected.items)) {
+                if (!hasUserMessage(parsed_messages.items)) {
                     return .{ .err = validationError(
                         "messages must include at least one user message",
                         "messages",
@@ -482,7 +474,7 @@ fn parseChatRequest(
                     ) };
                 }
 
-                break :blk try collected.toOwnedSlice(allocator);
+                break :blk try parsed_messages.toOwnedSlice(allocator);
             },
             else => return .{ .err = validationError(
                 "messages must be an array",
@@ -523,6 +515,7 @@ fn parseChatRequest(
             null,
             "missing_input",
         ) };
+
     errdefer {
         for (parsed_messages) |message| {
             message.deinit(allocator);
@@ -541,6 +534,7 @@ fn parseChatRequest(
         .messages = parsed_messages,
         .provider = provider,
         .model = model,
+        .task = .chat,
     } };
 }
 
@@ -609,7 +603,8 @@ fn sendApiError(
     const code_json = try optionalJsonStringAlloc(allocator, api_error.code);
     defer allocator.free(code_json);
 
-    const response_json = try std.fmt.allocPrint(allocator,
+    const response_json = try std.fmt.allocPrint(
+        allocator,
         \\{{"error":{{"message":"{s}","type":"{s}","param":{s},"code":{s}}}}}
     , .{
         escaped_message,
@@ -649,7 +644,8 @@ fn sendChatCompletion(
     const escaped_finish_reason = try escapeJsonStringAlloc(allocator, result.finish_reason);
     defer allocator.free(escaped_finish_reason);
 
-    const response_json = try std.fmt.allocPrint(allocator,
+    const response_json = try std.fmt.allocPrint(
+        allocator,
         \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         escaped_id,
@@ -708,6 +704,7 @@ fn sendJson(
         404 => "Not Found",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         else => "Internal Server Error",
     };
@@ -752,8 +749,8 @@ test "parseChatRequest preserves messages and extracts last user prompt" {
     const allocator = std.testing.allocator;
     const body =
         \\{
-        \\  "provider": "qwen",
-        \\  "model": "qwen:7b",
+        \\  "provider": "bedrock",
+        \\  "model": "amazon.nova-micro-v1:0",
         \\  "messages": [
         \\    {"role": "system", "content": "You are concise."},
         \\    {"role": "user", "content": "First question"},
@@ -770,8 +767,8 @@ test "parseChatRequest preserves messages and extracts last user prompt" {
     };
     defer request.deinit(allocator);
 
-    try std.testing.expectEqualStrings("ollama_qwen", request.provider.?);
-    try std.testing.expectEqualStrings("qwen:7b", request.model.?);
+    try std.testing.expectEqual(types.Provider.bedrock, request.provider.?);
+    try std.testing.expectEqualStrings("amazon.nova-micro-v1:0", request.model.?);
     try std.testing.expectEqualStrings("Second question", request.prompt);
     try std.testing.expectEqual(@as(usize, 4), request.messages.len);
     try std.testing.expectEqualStrings("system", request.messages[0].role);
@@ -782,7 +779,7 @@ test "parseChatRequest treats model auto as default" {
     const allocator = std.testing.allocator;
     const body =
         \\{
-        \\  "provider": "ollama",
+        \\  "provider": "openrouter",
         \\  "model": "auto",
         \\  "messages": [
         \\    {"role": "user", "content": "Hello"}
@@ -797,7 +794,7 @@ test "parseChatRequest treats model auto as default" {
     };
     defer request.deinit(allocator);
 
-    try std.testing.expectEqualStrings("ollama_qwen", request.provider.?);
+    try std.testing.expectEqual(types.Provider.openrouter, request.provider.?);
     try std.testing.expect(request.model == null);
     try std.testing.expectEqualStrings("Hello", request.prompt);
 }
@@ -806,7 +803,7 @@ test "parseChatRequest rejects invalid provider" {
     const allocator = std.testing.allocator;
     const body =
         \\{
-        \\  "provider": "bedrock",
+        \\  "provider": "bad-provider",
         \\  "messages": [
         \\    {"role": "user", "content": "Hello"}
         \\  ]

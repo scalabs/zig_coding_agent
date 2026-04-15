@@ -45,7 +45,7 @@ pub fn callQwen(
     });
 
     if (result.status != .ok) {
-        return try makeResponse(allocator, model_name, "HTTP error from Ollama", false);
+        return try makeResponse(allocator, model_name, "HTTP error", false);
     }
 
     const raw = writer.written();
@@ -53,17 +53,10 @@ pub fn callQwen(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
 
-    const root = switch (parsed.value) {
-        .object => |value| value,
-        else => return try makeResponse(
-            allocator,
-            model_name,
-            "Invalid JSON from Ollama",
-            false,
-        ),
-    };
+    const root = parsed.value;
+    const obj = root.object;
 
-    const message_value = root.get("message") orelse {
+    const message_value = obj.get("message") orelse {
         return try makeResponse(
             allocator,
             model_name,
@@ -99,7 +92,7 @@ pub fn callQwen(
         ),
     };
 
-    const finish_reason = if (root.get("done_reason")) |done_reason|
+    const finish_reason = if (obj.get("done_reason")) |done_reason|
         switch (done_reason) {
             .string => |value| value,
             else => "stop",
@@ -114,10 +107,9 @@ pub fn callQwen(
         .finish_reason = try allocator.dupe(u8, finish_reason),
         .success = true,
         .usage = .{
-            .prompt_tokens = parseUsageField(root.get("prompt_eval_count")),
-            .completion_tokens = parseUsageField(root.get("eval_count")),
-            .total_tokens = parseUsageField(root.get("prompt_eval_count")) +
-                parseUsageField(root.get("eval_count")),
+            .prompt_tokens = parseUsageField(obj.get("prompt_eval_count")),
+            .completion_tokens = parseUsageField(obj.get("eval_count")),
+            .total_tokens = parseUsageField(obj.get("prompt_eval_count")) + parseUsageField(obj.get("eval_count")),
         },
     };
 }

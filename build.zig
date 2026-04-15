@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const server = b.addExecutable(.{
-        .name = "ollama-qwen-router",
+        .name = "llm-router",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const ollama_test = b.addExecutable(.{
-        .name = "test-ollama-qwen",
+        .name = "test-ollama",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/test_ollama.zig"),
             .target = target,
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(server);
     b.installArtifact(ollama_test);
 
-    const run_step = b.step("run", "Run the local Ollama Qwen API server");
+    const run_step = b.step("run", "Run the API server");
     const run_cmd = b.addRunArtifact(server);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
