@@ -49,11 +49,28 @@ pub fn parseChatRequest(
         ) },
     };
 
+    if (obj.get("messages") != null and obj.get("prompt") != null) {
+        return .{ .err = errors.validationError(
+            "Provide either messages or prompt, not both",
+            null,
+            "ambiguous_input",
+        ) };
+    }
+
     // Normalize aliases early so downstream code only sees canonical provider IDs.
     const provider = if (obj.get("provider")) |provider_value|
         switch (provider_value) {
             .string => |value| blk: {
-                const normalized = types.normalizeProviderName(value) orelse {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "provider must not be empty",
+                        "provider",
+                        "invalid_provider",
+                    ) };
+                }
+
+                const normalized = types.normalizeProviderName(trimmed) orelse {
                     return .{ .err = errors.validationError(
                         "provider must be one of: ollama_qwen, ollama, qwen, openai, claude, anthropic, llama_cpp",
                         "provider",
@@ -77,7 +94,8 @@ pub fn parseChatRequest(
     const model_source = if (obj.get("model")) |model_value|
         switch (model_value) {
             .string => |value| blk: {
-                if (value.len == 0) {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
                     return .{ .err = errors.validationError(
                         "model must not be empty",
                         "model",
@@ -85,11 +103,11 @@ pub fn parseChatRequest(
                     ) };
                 }
 
-                if (std.ascii.eqlIgnoreCase(value, "auto")) {
+                if (std.ascii.eqlIgnoreCase(trimmed, "auto")) {
                     break :blk null;
                 }
 
-                break :blk value;
+                break :blk trimmed;
             },
             else => return .{ .err = errors.validationError(
                 "model must be a string",
@@ -145,6 +163,14 @@ pub fn parseChatRequest(
                         ) },
                     };
 
+                    if (!isSupportedRole(role)) {
+                        return .{ .err = errors.validationError(
+                            "message.role must be one of: system, user, assistant, tool",
+                            "messages",
+                            "invalid_messages",
+                        ) };
+                    }
+
                     const content = switch (message_obj.get("content") orelse {
                         return .{ .err = errors.validationError(
                             "Each message must include content",
@@ -160,7 +186,7 @@ pub fn parseChatRequest(
                         ) },
                     };
 
-                    if (content.len == 0) {
+                    if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
                         return .{ .err = errors.validationError(
                             "message.content must not be empty",
                             "messages",
@@ -316,14 +342,15 @@ pub fn parseChatRequest(
     const session_id = if (obj.get("session_id")) |session_id_value|
         switch (session_id_value) {
             .string => |value| blk: {
-                if (value.len == 0) {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
                     return .{ .err = errors.validationError(
                         "session_id must not be empty",
                         "session_id",
                         "invalid_session_id",
                     ) };
                 }
-                break :blk try allocator.dupe(u8, value);
+                break :blk try allocator.dupe(u8, trimmed);
             },
             else => return .{ .err = errors.validationError(
                 "session_id must be a string",
@@ -338,14 +365,15 @@ pub fn parseChatRequest(
     const tenant_id = if (obj.get("tenant_id")) |tenant_id_value|
         switch (tenant_id_value) {
             .string => |value| blk: {
-                if (value.len == 0) {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
                     return .{ .err = errors.validationError(
                         "tenant_id must not be empty",
                         "tenant_id",
                         "invalid_tenant_id",
                     ) };
                 }
-                break :blk try allocator.dupe(u8, value);
+                break :blk try allocator.dupe(u8, trimmed);
             },
             else => return .{ .err = errors.validationError(
                 "tenant_id must be a string",
@@ -363,6 +391,14 @@ pub fn parseChatRequest(
                 if (value <= 0) {
                     return .{ .err = errors.validationError(
                         "max_context_tokens must be a positive integer",
+                        "max_context_tokens",
+                        "invalid_max_context_tokens",
+                    ) };
+                }
+
+                if (value > 1_000_000) {
+                    return .{ .err = errors.validationError(
+                        "max_context_tokens must be <= 1000000",
                         "max_context_tokens",
                         "invalid_max_context_tokens",
                     ) };
@@ -414,12 +450,32 @@ pub fn parseChatRequest(
                         ) },
                     };
 
-                    if (name.len == 0) {
+                    const trimmed_name = std.mem.trim(u8, name, " \t\r\n");
+
+                    if (trimmed_name.len == 0) {
                         return .{ .err = errors.validationError(
                             "tool.name must not be empty",
                             "tools",
                             "invalid_tools",
                         ) };
+                    }
+
+                    if (!isValidToolName(trimmed_name)) {
+                        return .{ .err = errors.validationError(
+                            "tool.name must be 1-64 chars using letters, numbers, _, -, or .",
+                            "tools",
+                            "invalid_tools",
+                        ) };
+                    }
+
+                    for (tools.items) |existing_tool| {
+                        if (std.mem.eql(u8, existing_tool.name, trimmed_name)) {
+                            return .{ .err = errors.validationError(
+                                "tool names must be unique",
+                                "tools",
+                                "invalid_tools",
+                            ) };
+                        }
                     }
 
                     const description = if (tool_obj.get("description")) |description_value|
@@ -435,7 +491,7 @@ pub fn parseChatRequest(
                         "";
 
                     try tools.append(allocator, .{
-                        .name = try allocator.dupe(u8, name),
+                        .name = try allocator.dupe(u8, trimmed_name),
                         .description = try allocator.dupe(u8, description),
                     });
                 }
@@ -460,14 +516,15 @@ pub fn parseChatRequest(
     const tool_choice = if (obj.get("tool_choice")) |tool_choice_value|
         switch (tool_choice_value) {
             .string => |value| blk: {
-                if (value.len == 0) {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
                     return .{ .err = errors.validationError(
                         "tool_choice must not be empty",
                         "tool_choice",
                         "invalid_tool_choice",
                     ) };
                 }
-                break :blk try allocator.dupe(u8, value);
+                break :blk try allocator.dupe(u8, trimmed);
             },
             else => return .{ .err = errors.validationError(
                 "tool_choice must be a string",
@@ -478,6 +535,46 @@ pub fn parseChatRequest(
     else
         null;
     errdefer if (tool_choice) |value| allocator.free(value);
+
+    if (tool_choice) |choice| {
+        if (!isBuiltinToolChoice(choice) and !hasToolNamed(parsed_tools, choice)) {
+            deinitParsedRequestParts(
+                allocator,
+                provider,
+                parsed_messages,
+                prompt,
+                model,
+                session_id,
+                tenant_id,
+                parsed_tools,
+                tool_choice,
+            );
+            return .{ .err = errors.validationError(
+                "tool_choice must be one of: auto, none, required, or a requested tool name",
+                "tool_choice",
+                "invalid_tool_choice",
+            ) };
+        }
+
+        if (parsed_tools.len == 0 and !std.ascii.eqlIgnoreCase(choice, "none") and !std.ascii.eqlIgnoreCase(choice, "auto")) {
+            deinitParsedRequestParts(
+                allocator,
+                provider,
+                parsed_messages,
+                prompt,
+                model,
+                session_id,
+                tenant_id,
+                parsed_tools,
+                tool_choice,
+            );
+            return .{ .err = errors.validationError(
+                "tool_choice requires tools unless set to auto or none",
+                "tool_choice",
+                "invalid_tool_choice",
+            ) };
+        }
+    }
 
     return .{ .ok = types.Request{
         .prompt = prompt,
@@ -564,6 +661,69 @@ pub fn buildProviderStatusJson(
 fn hasUserMessage(messages: []const types.Message) bool {
     for (messages) |message| {
         if (std.ascii.eqlIgnoreCase(message.role, "user")) return true;
+    }
+    return false;
+}
+
+fn deinitParsedRequestParts(
+    allocator: std.mem.Allocator,
+    provider: ?[]const u8,
+    parsed_messages: []const types.Message,
+    prompt: []const u8,
+    model: ?[]const u8,
+    session_id: ?[]const u8,
+    tenant_id: ?[]const u8,
+    parsed_tools: []const types.Tool,
+    tool_choice: ?[]const u8,
+) void {
+    if (provider) |value| allocator.free(value);
+
+    for (parsed_messages) |message| {
+        message.deinit(allocator);
+    }
+    allocator.free(parsed_messages);
+
+    allocator.free(prompt);
+
+    if (model) |value| allocator.free(value);
+    if (session_id) |value| allocator.free(value);
+    if (tenant_id) |value| allocator.free(value);
+
+    for (parsed_tools) |tool| {
+        tool.deinit(allocator);
+    }
+    allocator.free(parsed_tools);
+
+    if (tool_choice) |value| allocator.free(value);
+}
+
+fn isSupportedRole(role: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(role, "system") or
+        std.ascii.eqlIgnoreCase(role, "user") or
+        std.ascii.eqlIgnoreCase(role, "assistant") or
+        std.ascii.eqlIgnoreCase(role, "tool");
+}
+
+fn isValidToolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |char| {
+        const is_alpha_num = std.ascii.isAlphanumeric(char);
+        if (!(is_alpha_num or char == '_' or char == '-' or char == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isBuiltinToolChoice(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "auto") or
+        std.ascii.eqlIgnoreCase(value, "none") or
+        std.ascii.eqlIgnoreCase(value, "required");
+}
+
+fn hasToolNamed(tools: []const types.Tool, name: []const u8) bool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return true;
     }
     return false;
 }
@@ -677,6 +837,74 @@ test "parseChatRequest rejects invalid provider" {
             try std.testing.expectEqual(@as(u16, 400), api_error.status_code);
             try std.testing.expectEqualStrings("invalid_provider", api_error.code.?);
             try std.testing.expectEqualStrings("provider", api_error.param.?);
+        },
+    }
+}
+
+test "parseChatRequest rejects ambiguous prompt and messages" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "prompt": "hello",
+        \\  "messages": [
+        \\    {"role": "user", "content": "hello"}
+        \\  ]
+        \\}
+    ;
+
+    const parsed = try parseChatRequest(allocator, body);
+    switch (parsed) {
+        .ok => return error.ExpectedValidationError,
+        .err => |api_error| {
+            try std.testing.expectEqual(@as(u16, 400), api_error.status_code);
+            try std.testing.expectEqualStrings("ambiguous_input", api_error.code.?);
+        },
+    }
+}
+
+test "parseChatRequest rejects unsupported message role" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "messages": [
+        \\    {"role": "developer", "content": "hello"},
+        \\    {"role": "user", "content": "continue"}
+        \\  ]
+        \\}
+    ;
+
+    const parsed = try parseChatRequest(allocator, body);
+    switch (parsed) {
+        .ok => return error.ExpectedValidationError,
+        .err => |api_error| {
+            try std.testing.expectEqual(@as(u16, 400), api_error.status_code);
+            try std.testing.expectEqualStrings("invalid_messages", api_error.code.?);
+            try std.testing.expectEqualStrings("messages", api_error.param.?);
+        },
+    }
+}
+
+test "parseChatRequest validates tool_choice against requested tools" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "messages": [
+        \\    {"role": "user", "content": "hello"}
+        \\  ],
+        \\  "tools": [
+        \\    {"name": "echo", "description": "Echo input"}
+        \\  ],
+        \\  "tool_choice": "http_get"
+        \\}
+    ;
+
+    const parsed = try parseChatRequest(allocator, body);
+    switch (parsed) {
+        .ok => return error.ExpectedValidationError,
+        .err => |api_error| {
+            try std.testing.expectEqual(@as(u16, 400), api_error.status_code);
+            try std.testing.expectEqualStrings("invalid_tool_choice", api_error.code.?);
+            try std.testing.expectEqualStrings("tool_choice", api_error.param.?);
         },
     }
 }

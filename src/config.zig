@@ -11,6 +11,8 @@ pub const Config = struct {
     listen_port: u16,
     debug_logging: bool,
     default_provider: []const u8,
+    request_timeout_ms: u32,
+    provider_timeout_ms: u32,
     instance_id: []const u8,
     auth_api_key: []const u8,
     ollama_base_url: []const u8,
@@ -30,13 +32,20 @@ pub const Config = struct {
     llama_cpp_model: []const u8,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
-        const default_provider = try getEnvOrDefault(
+        const requested_default_provider = try getEnvOrDefault(
             allocator,
             "LLM_ROUTER_PROVIDER",
             "ollama",
         );
+        errdefer allocator.free(requested_default_provider);
+
+        const normalized_default_provider = types.normalizeProviderName(requested_default_provider) orelse {
+            return error.InvalidProvider;
+        };
+
+        const default_provider = try allocator.dupe(u8, normalized_default_provider);
+        allocator.free(requested_default_provider);
         errdefer allocator.free(default_provider);
-        try validateProviderName(default_provider);
 
         return Config{
             .listen_host = try getEnvOrDefault(
@@ -47,6 +56,8 @@ pub const Config = struct {
             .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081),
             .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG"),
             .default_provider = default_provider,
+            .request_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_REQUEST_TIMEOUT_MS", 30_000),
+            .provider_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_PROVIDER_TIMEOUT_MS", 60_000),
             .instance_id = try getEnvOrDefault(
                 allocator,
                 "LLM_ROUTER_INSTANCE_ID",
@@ -147,9 +158,11 @@ pub const Config = struct {
         allocator: std.mem.Allocator,
         provider: []const u8,
     ) !void {
-        try validateProviderName(provider);
+        const normalized = types.normalizeProviderName(provider) orelse {
+            return error.InvalidProvider;
+        };
 
-        const next_provider = try allocator.dupe(u8, provider);
+        const next_provider = try allocator.dupe(u8, normalized);
         allocator.free(self.default_provider);
         self.default_provider = next_provider;
     }
@@ -184,6 +197,12 @@ fn getEnvU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
     };
 }
 
+fn getEnvPositiveU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
+    const value = try getEnvU32OrDefault(key, default_value);
+    if (value == 0) return error.InvalidConfiguration;
+    return value;
+}
+
 fn getEnvF64OrDefault(
     allocator: std.mem.Allocator,
     key: []const u8,
@@ -214,4 +233,38 @@ fn getEnvFlag(
     if (std.ascii.eqlIgnoreCase(value, "no")) return false;
 
     return true;
+}
+
+test "setDefaultProvider stores canonical provider alias" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .listen_host = try allocator.dupe(u8, "127.0.0.1"),
+        .listen_port = 8081,
+        .debug_logging = false,
+        .default_provider = try allocator.dupe(u8, "ollama_qwen"),
+        .request_timeout_ms = 30_000,
+        .provider_timeout_ms = 60_000,
+        .instance_id = try allocator.dupe(u8, "local-instance"),
+        .auth_api_key = try allocator.dupe(u8, ""),
+        .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
+        .ollama_model = try allocator.dupe(u8, "qwen:7b"),
+        .ollama_think = false,
+        .ollama_num_predict = 128,
+        .ollama_temperature = 0.7,
+        .ollama_repeat_penalty = 1.05,
+        .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
+        .openai_api_key = try allocator.dupe(u8, ""),
+        .openai_model = try allocator.dupe(u8, "gpt-4.1-mini"),
+        .claude_base_url = try allocator.dupe(u8, "https://api.anthropic.com/v1"),
+        .claude_api_key = try allocator.dupe(u8, ""),
+        .claude_model = try allocator.dupe(u8, "claude-3-5-sonnet-latest"),
+        .llama_cpp_base_url = try allocator.dupe(u8, "http://127.0.0.1:8080"),
+        .llama_cpp_api_key = try allocator.dupe(u8, ""),
+        .llama_cpp_model = try allocator.dupe(u8, "local-model"),
+    };
+    defer cfg.deinit(allocator);
+
+    try cfg.setDefaultProvider(allocator, "qwen");
+    try std.testing.expectEqualStrings("ollama_qwen", cfg.default_provider);
 }
