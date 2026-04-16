@@ -45,10 +45,17 @@ pub fn callChat(
     });
 
     if (fetch_result.status != .ok) {
+        const error_message = try std.fmt.allocPrint(
+            allocator,
+            "{s} returned HTTP {d}",
+            .{ provider_label, @intFromEnum(fetch_result.status) },
+        );
+        defer allocator.free(error_message);
+
         return try makeFailureResponse(
             allocator,
             model_name,
-            try std.fmt.allocPrint(allocator, "{s} returned HTTP {d}", .{ provider_label, @intFromEnum(fetch_result.status) }),
+            error_message,
         );
     }
 

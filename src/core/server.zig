@@ -72,6 +72,10 @@ pub fn run(
             app_config.ollama_repeat_penalty,
         },
     );
+    logInfo(
+        "Timeouts: request_timeout_ms={d} provider_timeout_ms={d}",
+        .{ app_config.request_timeout_ms, app_config.provider_timeout_ms },
+    );
 
     const default_provider = types.normalizeProviderName(app_config.default_provider) orelse app_config.default_provider;
     if (std.mem.eql(u8, default_provider, "ollama_qwen")) {
@@ -380,12 +384,17 @@ fn handleConnection(
         }
     }
 
+    const requested_provider = parsed_req.provider orelse app_config.default_provider;
+    const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
+
     const result = backend.callProvider(allocator, app_config, parsed_req) catch |err| {
         logError("Provider request error: {}", .{err});
-        sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
-            "Provider request failed",
-            "provider_request_failed",
-        ), app_config);
+        sendApiErrorSafe(
+            connection.*,
+            allocator,
+            backend.errors.providerTransportError(@errorName(err)),
+            app_config,
+        );
         server_state.failed_requests += 1;
         return;
     };
@@ -397,10 +406,12 @@ fn handleConnection(
             "provider error model={s} message_len={d}",
             .{ result.model, result.output.len },
         );
-        sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
-            result.output,
-            "provider_error",
-        ), app_config);
+        sendApiErrorSafe(
+            connection.*,
+            allocator,
+            backend.errors.providerFailureFromDetail(normalized_provider, result.output),
+            app_config,
+        );
         server_state.failed_requests += 1;
         return;
     }

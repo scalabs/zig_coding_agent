@@ -11,7 +11,7 @@ pub fn callClaude(
         return .{
             .id = null,
             .model = try allocator.dupe(u8, request.model orelse app_config.claude_model),
-            .output = try allocator.dupe(u8, "CLAUDE_API_KEY is not configured on the server"),
+            .output = try allocator.dupe(u8, "Claude API key is not configured on the server"),
             .finish_reason = try allocator.dupe(u8, "stop"),
             .success = false,
             .usage = .{},

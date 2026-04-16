@@ -12,7 +12,7 @@ pub fn callOpenAI(
         return .{
             .id = null,
             .model = try allocator.dupe(u8, request.model orelse app_config.openai_model),
-            .output = try allocator.dupe(u8, "OPENAI_API_KEY is not configured on the server"),
+            .output = try allocator.dupe(u8, "OpenAI API key is not configured on the server"),
             .finish_reason = try allocator.dupe(u8, "stop"),
             .success = false,
             .usage = .{},

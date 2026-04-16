@@ -59,6 +59,8 @@ fn sendJson(
         404 => "Not Found",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         502 => "Bad Gateway",
         else => "Internal Server Error",
     };
