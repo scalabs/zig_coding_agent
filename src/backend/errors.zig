@@ -245,6 +245,17 @@ pub fn payloadTooLargeError() ApiError {
     };
 }
 
+/// Creates a request-timeout error with HTTP 408 status.
+pub fn requestTimeoutError() ApiError {
+    return .{
+        .status_code = 408,
+        .message = "Request timed out while reading body",
+        .error_type = "invalid_request_error",
+        .param = null,
+        .code = "request_timeout",
+    };
+}
+
 /// Parse helper result used by request validation callers.
 pub const ParseChatRequestResult = union(enum) {
     ok: void,

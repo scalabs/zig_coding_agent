@@ -99,7 +99,7 @@ pub fn run(
     var tool_registry = tooling.ToolRegistry.init(allocator);
     defer tool_registry.deinit(allocator);
     try tool_registry.register(allocator, "echo");
-    try tool_registry.register(allocator, "http_get");
+    try tool_registry.register(allocator, "utc");
 
     while (true) {
         var connection = try server.accept();
@@ -126,9 +126,13 @@ fn handleConnection(
     tool_registry: *tooling.ToolRegistry,
 ) !void {
     // Translate transport-level parsing failures into OpenAI-style API errors.
-    const request_raw = request.readHttpRequest(allocator, connection) catch |err| switch (err) {
+    const request_raw = request.readHttpRequest(allocator, connection, app_config.request_timeout_ms) catch |err| switch (err) {
         error.ClientDisconnected => {
             debugLog(app_config, "client disconnected before full request", .{});
+            return;
+        },
+        error.RequestTimedOut => {
+            sendApiErrorSafe(connection.*, allocator, backend.errors.requestTimeoutError(), app_config);
             return;
         },
         error.RequestTooLarge => {
@@ -384,9 +388,22 @@ fn handleConnection(
         }
     }
 
+    if (try tooling.tryExecuteDebugTool(allocator, parsed_req)) |tool_result| {
+        defer tool_result.deinit(allocator);
+        debugLog(
+            app_config,
+            "debug tool executed tool_choice={s}",
+            .{parsed_req.tool_choice orelse "(none)"},
+        );
+        sendChatCompletionSafe(connection.*, allocator, tool_result, app_config);
+        server_state.successful_requests += 1;
+        return;
+    }
+
     const requested_provider = parsed_req.provider orelse app_config.default_provider;
     const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
 
+    const provider_started_ms = std.time.milliTimestamp();
     const result = backend.callProvider(allocator, app_config, parsed_req) catch |err| {
         logError("Provider request error: {}", .{err});
         sendApiErrorSafe(
@@ -399,6 +416,18 @@ fn handleConnection(
         return;
     };
     defer result.deinit(allocator);
+
+    const provider_elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - provider_started_ms, 0));
+    if (provider_elapsed_ms > app_config.provider_timeout_ms) {
+        sendApiErrorSafe(
+            connection.*,
+            allocator,
+            backend.errors.providerTransportError("ProviderTimeout"),
+            app_config,
+        );
+        server_state.failed_requests += 1;
+        return;
+    }
 
     if (!result.success) {
         debugLog(

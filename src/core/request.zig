@@ -64,6 +64,7 @@ pub fn firstRequestLine(request_raw: []const u8) []const u8 {
 pub const ReadHttpRequestError = error{
     RequestTooLarge,
     HeadersTooLarge,
+    RequestTimedOut,
     InvalidHttpRequest,
     MissingContentLength,
     InvalidContentLength,
@@ -86,9 +87,12 @@ pub const ReadHttpRequestError = error{
 pub fn readHttpRequest(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
+    request_timeout_ms: u32,
 ) ![]u8 {
     const max_request_size = 1024 * 1024;
     const max_header_size = 16 * 1024;
+
+    const started_ms = std.time.milliTimestamp();
 
     var request = std.ArrayList(u8){};
     errdefer request.deinit(allocator);
@@ -99,6 +103,16 @@ pub fn readHttpRequest(
 
     // Read until header parsing reveals the exact required request length.
     while (true) {
+        const now_ms = std.time.milliTimestamp();
+        const elapsed_ms = now_ms - started_ms;
+        if (elapsed_ms >= request_timeout_ms) {
+            return error.RequestTimedOut;
+        }
+
+        const remaining_ms = request_timeout_ms - @as(u32, @intCast(elapsed_ms));
+        const ready = try waitForReadable(connection.stream.handle, remaining_ms);
+        if (!ready) return error.RequestTimedOut;
+
         const bytes_read = std.posix.recv(connection.stream.handle, chunk[0..], 0) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => return error.ClientDisconnected,
@@ -150,4 +164,26 @@ pub fn readHttpRequest(
 
     request.items.len = total_length.?;
     return try request.toOwnedSlice(allocator);
+}
+
+fn waitForReadable(
+    socket: std.posix.socket_t,
+    timeout_ms: u32,
+) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = socket,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    const timeout_i32: i32 = if (timeout_ms > @as(u32, @intCast(std.math.maxInt(i32))))
+        std.math.maxInt(i32)
+    else
+        @as(i32, @intCast(timeout_ms));
+
+    const ready_count = std.posix.poll(fds[0..], timeout_i32) catch {
+        return false;
+    };
+    if (ready_count == 0) return false;
+    return true;
 }
