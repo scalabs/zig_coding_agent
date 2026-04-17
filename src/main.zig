@@ -6,6 +6,8 @@ const root = @import("root.zig");
 const CliOptions = struct {
     prompt: ?[]u8 = null, // Enables prompt-loop mode when set.
     provider_override: ?[]u8 = null, // Optional provider alias from CLI.
+    env_file_path: ?[]u8 = null, // Optional dotenv path loaded before config.
+    use_env: bool = false, // Enable dotenv loading.
     until_marker: []u8, // Loop exits when assistant output contains this marker.
     max_turns: usize = 8, // Safety cap to avoid unbounded loops.
 
@@ -17,6 +19,7 @@ const CliOptions = struct {
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.prompt) |prompt| allocator.free(prompt);
         if (self.provider_override) |provider| allocator.free(provider);
+        if (self.env_file_path) |env_file_path| allocator.free(env_file_path);
         allocator.free(self.until_marker);
     }
 };
@@ -33,7 +36,18 @@ pub fn main() !void {
     var cli = try parseCliOptions(allocator);
     defer cli.deinit(allocator);
 
-    var app_config = try root.config.Config.load(allocator);
+    var env_overrides: ?root.config.EnvOverrides = null;
+    defer if (env_overrides) |*map| deinitEnvOverrides(map, allocator);
+
+    if (cli.use_env or cli.env_file_path != null) {
+        const env_path = cli.env_file_path orelse ".env";
+        env_overrides = try loadDotEnvOverridesAlloc(allocator, env_path);
+    }
+
+    var app_config = if (env_overrides) |*overrides|
+        try root.config.Config.loadWithOverrides(allocator, overrides)
+    else
+        try root.config.Config.load(allocator);
     defer app_config.deinit(allocator);
 
     if (cli.provider_override) |provider| {
@@ -61,6 +75,20 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
 
     // Support both split flags (`--prompt value`) and inline flags (`--prompt=value`).
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--use-env")) {
+            cli.use_env = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--env-file")) {
+            const value = args.next() orelse return error.MissingEnvFileValue;
+            if (value.len == 0) return error.InvalidEnvFileValue;
+            if (cli.env_file_path) |path| allocator.free(path);
+            cli.env_file_path = try allocator.dupe(u8, value);
+            cli.use_env = true;
+            continue;
+        }
+
         if (std.mem.eql(u8, arg, "--provider")) {
             const value = args.next() orelse return error.MissingProviderValue;
             if (cli.provider_override) |provider| allocator.free(provider);
@@ -126,10 +154,87 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             const parsed = try std.fmt.parseInt(usize, value, 10);
             if (parsed == 0) return error.InvalidMaxTurnsValue;
             cli.max_turns = parsed;
+            continue;
+        }
+
+        const env_file_prefix = "--env-file=";
+        if (std.mem.startsWith(u8, arg, env_file_prefix)) {
+            const value = arg[env_file_prefix.len..];
+            if (value.len == 0) return error.InvalidEnvFileValue;
+            if (cli.env_file_path) |path| allocator.free(path);
+            cli.env_file_path = try allocator.dupe(u8, value);
+            cli.use_env = true;
+            continue;
         }
     }
 
     return cli;
+}
+
+fn loadDotEnvOverridesAlloc(
+    allocator: std.mem.Allocator,
+    env_file_path: []const u8,
+) !root.config.EnvOverrides {
+    const content = std.fs.cwd().readFileAlloc(allocator, env_file_path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return error.EnvFileNotFound,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var overrides = root.config.EnvOverrides.init(allocator);
+    errdefer deinitEnvOverrides(&overrides, allocator);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '#') continue;
+
+        const eq_index = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq_index], " \t");
+        if (key.len == 0) continue;
+
+        const value_raw = std.mem.trim(u8, line[eq_index + 1 ..], " \t");
+        const value = trimWrappingQuotes(value_raw);
+
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+
+        const owned_value = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned_value);
+
+        if (overrides.fetchRemove(owned_key)) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        try overrides.put(owned_key, owned_value);
+    }
+
+    return overrides;
+}
+
+fn deinitEnvOverrides(
+    overrides: *root.config.EnvOverrides,
+    allocator: std.mem.Allocator,
+) void {
+    var iterator = overrides.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    overrides.deinit();
+}
+
+fn trimWrappingQuotes(value: []const u8) []const u8 {
+    if (value.len < 2) return value;
+
+    const first = value[0];
+    const last = value[value.len - 1];
+    if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+        return value[1 .. value.len - 1];
+    }
+
+    return value;
 }
 
 fn runPromptLoop(

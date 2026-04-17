@@ -100,6 +100,8 @@ pub fn run(
     defer tool_registry.deinit(allocator);
     try tool_registry.register(allocator, "echo");
     try tool_registry.register(allocator, "utc");
+    try tool_registry.register(allocator, "cmd");
+    try tool_registry.register(allocator, "bash");
 
     var file_session_store: ?session.FileSessionStore = null;
     var session_store: ?session.SessionStore = null;
@@ -455,7 +457,7 @@ fn handleConnection(
         }
     }
 
-    if (try tooling.tryExecuteDebugTool(allocator, parsed_req)) |tool_result| {
+    if (try tooling.tryExecuteDebugTool(allocator, parsed_req, app_config)) |tool_result| {
         defer tool_result.deinit(allocator);
         debugLog(
             app_config,
@@ -470,13 +472,26 @@ fn handleConnection(
     const requested_provider = parsed_req.provider orelse app_config.default_provider;
     const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
 
-    const provider_request = try cloneRequestWithMessagesAlloc(
+    var provider_request = try cloneRequestWithMessagesAlloc(
         allocator,
         parsed_req,
         request_prompt,
         request_messages,
     );
     defer provider_request.deinit(allocator);
+
+    const auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config);
+    defer if (auto_tool_summary) |summary| allocator.free(summary);
+
+    if (auto_tool_summary) |summary| {
+        const augmented_messages = try appendSystemMessageAlloc(allocator, provider_request.messages, summary);
+
+        for (provider_request.messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(provider_request.messages);
+        provider_request.messages = augmented_messages;
+    }
 
     const provider_started_ms = std.time.milliTimestamp();
     const result = backend.callProvider(allocator, app_config, provider_request) catch |err| {
@@ -631,6 +646,34 @@ fn extractLastUserPromptAlloc(
     }
 
     return try allocator.dupe(u8, "Continue.");
+}
+
+fn appendSystemMessageAlloc(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    content: []const u8,
+) ![]types.Message {
+    var out = std.ArrayList(types.Message){};
+    errdefer {
+        for (out.items) |message| {
+            message.deinit(allocator);
+        }
+        out.deinit(allocator);
+    }
+
+    for (messages) |message| {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, message.role),
+            .content = try allocator.dupe(u8, message.content),
+        });
+    }
+
+    try out.append(allocator, .{
+        .role = try allocator.dupe(u8, "system"),
+        .content = try allocator.dupe(u8, content),
+    });
+
+    return try out.toOwnedSlice(allocator);
 }
 
 fn sendApiErrorSafe(

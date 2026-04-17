@@ -679,11 +679,50 @@ fn buildChatPayloadAlloc(
 ) ![]u8 {
     const tuning = resolveTuning(app_config, request);
 
+    const tool_choice_json = if (request.tool_choice) |tool_choice| blk: {
+        const escaped_tool_choice = try escapeJsonStringAlloc(allocator, tool_choice);
+        defer allocator.free(escaped_tool_choice);
+        break :blk try std.fmt.allocPrint(allocator, ",\"tool_choice\":\"{s}\"", .{escaped_tool_choice});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(tool_choice_json);
+
+    const tools_json = if (request.tools.len > 0) blk: {
+        const rendered_tools = try renderToolsJsonAlloc(allocator, request.tools);
+        defer allocator.free(rendered_tools);
+        break :blk try std.fmt.allocPrint(allocator, ",\"tools\":{s}", .{rendered_tools});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(tools_json);
+
     return try std.fmt.allocPrint(
         allocator,
-        "{{\"model\":\"{s}\",\"messages\":{s},\"stream\":{},\"think\":{},\"options\":{{\"num_predict\":{d},\"temperature\":{d:.4},\"repeat_penalty\":{d:.4}}}}}",
-        .{ model_name, messages_json, stream, tuning.think, tuning.num_predict, tuning.temperature, tuning.repeat_penalty },
+        "{{\"model\":\"{s}\",\"messages\":{s},\"stream\":{},\"think\":{},\"options\":{{\"num_predict\":{d},\"temperature\":{d:.4},\"repeat_penalty\":{d:.4}}}{s}{s}}}",
+        .{ model_name, messages_json, stream, tuning.think, tuning.num_predict, tuning.temperature, tuning.repeat_penalty, tools_json, tool_choice_json },
     );
+}
+
+fn renderToolsJsonAlloc(
+    allocator: std.mem.Allocator,
+    tools: []const types.Tool,
+) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    try out.append(allocator, '[');
+    for (tools, 0..) |tool, index| {
+        if (index > 0) try out.append(allocator, ',');
+
+        const escaped_name = try escapeJsonStringAlloc(allocator, tool.name);
+        defer allocator.free(escaped_name);
+        const escaped_description = try escapeJsonStringAlloc(allocator, tool.description);
+        defer allocator.free(escaped_description);
+
+        try out.writer(allocator).print(
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"}}}}",
+            .{ escaped_name, escaped_description },
+        );
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
 }
 
 fn resolveTuning(app_config: *const config.Config, request: types.Request) OllamaTuning {

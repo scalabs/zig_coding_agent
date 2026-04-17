@@ -2,6 +2,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+pub const EnvOverrides = std.StringHashMap([]const u8);
+
 /// Application configuration with owned string fields.
 ///
 /// Ownership:
@@ -43,12 +45,23 @@ pub const Config = struct {
     llama_cpp_model: []const u8,
     session_store_path: []const u8,
     session_retention_messages: usize,
+    tool_exec_enabled: bool,
+    tool_exec_timeout_ms: u32,
+    tool_exec_max_output_bytes: usize,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
+        return try loadWithOverrides(allocator, null);
+    }
+
+    pub fn loadWithOverrides(
+        allocator: std.mem.Allocator,
+        env_overrides: ?*const EnvOverrides,
+    ) !Config {
         const requested_default_provider = try getEnvOrDefault(
             allocator,
             "LLM_ROUTER_PROVIDER",
             "ollama",
+            env_overrides,
         );
         errdefer allocator.free(requested_default_provider);
 
@@ -65,50 +78,58 @@ pub const Config = struct {
                 allocator,
                 "LLM_ROUTER_HOST",
                 "127.0.0.1",
+                env_overrides,
             ),
-            .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081),
-            .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG"),
+            .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081, env_overrides),
+            .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG", env_overrides),
             .default_provider = default_provider,
-            .request_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_REQUEST_TIMEOUT_MS", 30_000),
-            .provider_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_PROVIDER_TIMEOUT_MS", 60_000),
+            .request_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_REQUEST_TIMEOUT_MS", 30_000, env_overrides),
+            .provider_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_PROVIDER_TIMEOUT_MS", 60_000, env_overrides),
             .instance_id = try getEnvOrDefault(
                 allocator,
                 "LLM_ROUTER_INSTANCE_ID",
                 "local-instance",
+                env_overrides,
             ),
             .auth_api_key = try getEnvOrDefault(
                 allocator,
                 "LLM_ROUTER_API_KEY",
                 "",
+                env_overrides,
             ),
             .ollama_base_url = try getEnvOrDefault(
                 allocator,
                 "OLLAMA_BASE_URL",
                 "http://127.0.0.1:11434",
+                env_overrides,
             ),
             .ollama_model = try getEnvOrDefault(
                 allocator,
                 "OLLAMA_MODEL",
-                "qwen:7b",
+                "qwen3.5:9b",
+                env_overrides,
             ),
-            .ollama_think = try getEnvFlag(allocator, "OLLAMA_THINK"),
-            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 128),
-            .ollama_temperature = try getEnvF64OrDefault(allocator, "OLLAMA_TEMPERATURE", 0.7),
-            .ollama_repeat_penalty = try getEnvF64OrDefault(allocator, "OLLAMA_REPEAT_PENALTY", 1.05),
+            .ollama_think = try getEnvFlag(allocator, "OLLAMA_THINK", env_overrides),
+            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 128, env_overrides),
+            .ollama_temperature = try getEnvF64OrDefault(allocator, "OLLAMA_TEMPERATURE", 0.7, env_overrides),
+            .ollama_repeat_penalty = try getEnvF64OrDefault(allocator, "OLLAMA_REPEAT_PENALTY", 1.05, env_overrides),
             .openai_base_url = try getEnvOrDefault(
                 allocator,
                 "OPENAI_BASE_URL",
                 "https://api.openai.com/v1",
+                env_overrides,
             ),
             .openai_api_key = try getEnvOrDefault(
                 allocator,
                 "OPENAI_API_KEY",
                 "",
+                env_overrides,
             ),
             .openai_model = try getEnvOrDefault(
                 allocator,
                 "OPENAI_MODEL",
                 "gpt-4.1-mini",
+                env_overrides,
             ),
             .openrouter_base_url = try getEnvOrDefault(
                 allocator,
@@ -139,16 +160,19 @@ pub const Config = struct {
                 allocator,
                 "CLAUDE_BASE_URL",
                 "https://api.anthropic.com/v1",
+                env_overrides,
             ),
             .claude_api_key = try getEnvOrDefault(
                 allocator,
                 "CLAUDE_API_KEY",
                 "",
+                env_overrides,
             ),
             .claude_model = try getEnvOrDefault(
                 allocator,
                 "CLAUDE_MODEL",
                 "claude-3-5-sonnet-latest",
+                env_overrides,
             ),
             .bedrock_runtime_base_url = try getFirstEnvOrDefault(
                 allocator,
@@ -184,26 +208,34 @@ pub const Config = struct {
                 allocator,
                 "LLAMA_CPP_BASE_URL",
                 "http://127.0.0.1:8080",
+                env_overrides,
             ),
             .llama_cpp_api_key = try getEnvOrDefault(
                 allocator,
                 "LLAMA_CPP_API_KEY",
                 "",
+                env_overrides,
             ),
             .llama_cpp_model = try getEnvOrDefault(
                 allocator,
                 "LLAMA_CPP_MODEL",
                 "local-model",
+                env_overrides,
             ),
             .session_store_path = try getEnvOrDefault(
                 allocator,
                 "LLM_ROUTER_SESSION_STORE_PATH",
                 "logs/sessions",
+                env_overrides,
             ),
             .session_retention_messages = try getEnvPositiveUsizeOrDefault(
                 "LLM_ROUTER_SESSION_RETENTION_MESSAGES",
                 24,
+                env_overrides,
             ),
+            .tool_exec_enabled = try getEnvFlag(allocator, "LLM_ROUTER_TOOL_EXEC_ENABLED", env_overrides),
+            .tool_exec_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS", 15_000, env_overrides),
+            .tool_exec_max_output_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES", 65_536, env_overrides),
         };
     }
 
@@ -265,13 +297,19 @@ fn getEnvOrDefault(
     allocator: std.mem.Allocator,
     key: []const u8,
     default_value: []const u8,
+    env_overrides: ?*const EnvOverrides,
 ) ![]u8 {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| return try allocator.dupe(u8, value);
+    }
+
     return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, default_value),
         else => err,
     };
 }
 
+<<<<<<< HEAD
 fn getFirstEnvOrDefault(
     allocator: std.mem.Allocator,
     keys: []const []const u8,
@@ -290,26 +328,65 @@ fn getFirstEnvOrDefault(
 }
 
 fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
+=======
+fn getEnvPortOrDefault(
+    comptime key: []const u8,
+    default_value: u16,
+    env_overrides: ?*const EnvOverrides,
+) !u16 {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return try std.fmt.parseInt(u16, value, 10);
+        }
+    }
+
+>>>>>>> 00e62e5 (Added command exectution tool)
     return std.process.parseEnvVarInt(key, u16, 10) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => default_value,
         else => err,
     };
 }
 
-fn getEnvU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
+fn getEnvU32OrDefault(
+    comptime key: []const u8,
+    default_value: u32,
+    env_overrides: ?*const EnvOverrides,
+) !u32 {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return try std.fmt.parseInt(u32, value, 10);
+        }
+    }
+
     return std.process.parseEnvVarInt(key, u32, 10) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => default_value,
         else => err,
     };
 }
 
-fn getEnvPositiveU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
-    const value = try getEnvU32OrDefault(key, default_value);
+fn getEnvPositiveU32OrDefault(
+    comptime key: []const u8,
+    default_value: u32,
+    env_overrides: ?*const EnvOverrides,
+) !u32 {
+    const value = try getEnvU32OrDefault(key, default_value, env_overrides);
     if (value == 0) return error.InvalidConfiguration;
     return value;
 }
 
-fn getEnvPositiveUsizeOrDefault(comptime key: []const u8, default_value: usize) !usize {
+fn getEnvPositiveUsizeOrDefault(
+    comptime key: []const u8,
+    default_value: usize,
+    env_overrides: ?*const EnvOverrides,
+) !usize {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            const parsed = try std.fmt.parseInt(usize, value, 10);
+            if (parsed == 0) return error.InvalidConfiguration;
+            return parsed;
+        }
+    }
+
     const value = std.process.parseEnvVarInt(key, usize, 10) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => default_value,
         else => return err,
@@ -322,7 +399,14 @@ fn getEnvF64OrDefault(
     allocator: std.mem.Allocator,
     key: []const u8,
     default_value: f64,
+    env_overrides: ?*const EnvOverrides,
 ) !f64 {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return try std.fmt.parseFloat(f64, value);
+        }
+    }
+
     const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return default_value,
         else => return err,
@@ -335,13 +419,24 @@ fn getEnvF64OrDefault(
 fn getEnvFlag(
     allocator: std.mem.Allocator,
     key: []const u8,
+    env_overrides: ?*const EnvOverrides,
 ) !bool {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return parseBoolFlag(value);
+        }
+    }
+
     const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return false,
         else => return err,
     };
     defer allocator.free(value);
 
+    return parseBoolFlag(value);
+}
+
+fn parseBoolFlag(value: []const u8) bool {
     if (value.len == 0) return false;
     if (std.mem.eql(u8, value, "0")) return false;
     if (std.ascii.eqlIgnoreCase(value, "false")) return false;
@@ -390,6 +485,9 @@ test "setDefaultProvider stores canonical provider alias" {
         .llama_cpp_model = try allocator.dupe(u8, "local-model"),
         .session_store_path = try allocator.dupe(u8, "logs/sessions"),
         .session_retention_messages = 24,
+        .tool_exec_enabled = false,
+        .tool_exec_timeout_ms = 15_000,
+        .tool_exec_max_output_bytes = 65_536,
     };
     defer cfg.deinit(allocator);
 
