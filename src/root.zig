@@ -43,3 +43,7 @@ test "providers: external provider adapters" {
 test "types: normalization" {
     _ = @import("types.zig");
 }
+
+test "phase2: session persistence integration" {
+    _ = @import("session_phase2_test.zig");
+}

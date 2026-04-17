@@ -41,6 +41,8 @@ pub const Config = struct {
     llama_cpp_base_url: []const u8,
     llama_cpp_api_key: []const u8,
     llama_cpp_model: []const u8,
+    session_store_path: []const u8,
+    session_retention_messages: usize,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         const requested_default_provider = try getEnvOrDefault(
@@ -193,6 +195,15 @@ pub const Config = struct {
                 "LLAMA_CPP_MODEL",
                 "local-model",
             ),
+            .session_store_path = try getEnvOrDefault(
+                allocator,
+                "LLM_ROUTER_SESSION_STORE_PATH",
+                "logs/sessions",
+            ),
+            .session_retention_messages = try getEnvPositiveUsizeOrDefault(
+                "LLM_ROUTER_SESSION_RETENTION_MESSAGES",
+                24,
+            ),
         };
     }
 
@@ -228,6 +239,7 @@ pub const Config = struct {
         allocator.free(self.llama_cpp_base_url);
         allocator.free(self.llama_cpp_api_key);
         allocator.free(self.llama_cpp_model);
+        allocator.free(self.session_store_path);
     }
 
     pub fn setDefaultProvider(
@@ -293,6 +305,15 @@ fn getEnvU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
 
 fn getEnvPositiveU32OrDefault(comptime key: []const u8, default_value: u32) !u32 {
     const value = try getEnvU32OrDefault(key, default_value);
+    if (value == 0) return error.InvalidConfiguration;
+    return value;
+}
+
+fn getEnvPositiveUsizeOrDefault(comptime key: []const u8, default_value: usize) !usize {
+    const value = std.process.parseEnvVarInt(key, usize, 10) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => default_value,
+        else => return err,
+    };
     if (value == 0) return error.InvalidConfiguration;
     return value;
 }
@@ -367,6 +388,8 @@ test "setDefaultProvider stores canonical provider alias" {
         .llama_cpp_base_url = try allocator.dupe(u8, "http://127.0.0.1:8080"),
         .llama_cpp_api_key = try allocator.dupe(u8, ""),
         .llama_cpp_model = try allocator.dupe(u8, "local-model"),
+        .session_store_path = try allocator.dupe(u8, "logs/sessions"),
+        .session_retention_messages = 24,
     };
     defer cfg.deinit(allocator);
 

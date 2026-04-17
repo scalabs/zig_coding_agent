@@ -101,6 +101,30 @@ pub fn run(
     try tool_registry.register(allocator, "echo");
     try tool_registry.register(allocator, "utc");
 
+    var file_session_store: ?session.FileSessionStore = null;
+    var session_store: ?session.SessionStore = null;
+    if (app_config.session_store_path.len > 0) {
+        file_session_store = session.FileSessionStore.init(
+            allocator,
+            app_config.session_store_path,
+            app_config.session_retention_messages,
+        ) catch |err| blk: {
+            logError("Session store initialization failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        if (file_session_store) |*store_impl| {
+            session_store = store_impl.asStore();
+            logInfo(
+                "Session persistence enabled path={s} retention_messages={d}",
+                .{ app_config.session_store_path, app_config.session_retention_messages },
+            );
+        }
+    }
+    defer if (session_store) |*store| store.deinit(allocator);
+
+    const active_session_store: ?*session.SessionStore = if (session_store) |*store| store else null;
+
     while (true) {
         var connection = try server.accept();
         defer connection.stream.close();
@@ -111,7 +135,7 @@ pub fn run(
         // Client tracking is intentionally disabled in the hot path on Windows
         // until socket stability issues are fully resolved.
 
-        handleConnection(allocator, app_config, &connection, &server_state, &tool_registry) catch |err| {
+        handleConnection(allocator, app_config, &connection, &server_state, &tool_registry, active_session_store) catch |err| {
             logError("Request handling error: {s}", .{@errorName(err)});
             server_state.failed_requests += 1;
         };
@@ -124,6 +148,7 @@ fn handleConnection(
     connection: *std.net.Server.Connection,
     server_state: *ServerState,
     tool_registry: *tooling.ToolRegistry,
+    session_store: ?*session.SessionStore,
 ) !void {
     // Translate transport-level parsing failures into OpenAI-style API errors.
     const request_raw = request.readHttpRequest(allocator, connection, app_config.request_timeout_ms) catch |err| switch (err) {
@@ -328,8 +353,50 @@ fn handleConnection(
         return;
     }
 
+    var loaded_session: ?session.SessionState = null;
+    defer if (loaded_session) |state| state.deinit(allocator);
+
+    var request_messages = try session.cloneMessagesAlloc(allocator, parsed_req.messages);
+    defer {
+        for (request_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(request_messages);
+    }
+
+    var request_prompt = try allocator.dupe(u8, parsed_req.prompt);
+    defer allocator.free(request_prompt);
+
+    if (session_store) |store| {
+        if (parsed_req.session_id) |session_id| {
+            loaded_session = store.load(allocator, session_id, parsed_req.tenant_id) catch |err| blk: {
+                logError("Session load failed for '{s}': {s}", .{ session_id, @errorName(err) });
+                break :blk null;
+            };
+
+            if (loaded_session) |state| {
+                if (state.messages.len > 0) {
+                    const merged_messages = try session.mergeMessagesAlloc(
+                        allocator,
+                        state.messages,
+                        parsed_req.messages,
+                    );
+
+                    for (request_messages) |message| {
+                        message.deinit(allocator);
+                    }
+                    allocator.free(request_messages);
+                    request_messages = merged_messages;
+
+                    allocator.free(request_prompt);
+                    request_prompt = try extractLastUserPromptAlloc(allocator, request_messages);
+                }
+            }
+        }
+    }
+
     if (parsed_req.max_context_tokens) |max_tokens| {
-        const estimated = session.estimateTokenCount(parsed_req.messages);
+        const estimated = session.estimateTokenCount(request_messages);
         if (session.shouldCompressContext(estimated, max_tokens)) {
             debugLog(
                 app_config,
@@ -345,8 +412,8 @@ fn handleConnection(
         .{
             parsed_req.provider orelse app_config.default_provider,
             parsed_req.model orelse "(default)",
-            parsed_req.prompt.len,
-            parsed_req.messages.len,
+            request_prompt.len,
+            request_messages.len,
         },
     );
 
@@ -403,8 +470,16 @@ fn handleConnection(
     const requested_provider = parsed_req.provider orelse app_config.default_provider;
     const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
 
+    const provider_request = try cloneRequestWithMessagesAlloc(
+        allocator,
+        parsed_req,
+        request_prompt,
+        request_messages,
+    );
+    defer provider_request.deinit(allocator);
+
     const provider_started_ms = std.time.milliTimestamp();
-    const result = backend.callProvider(allocator, app_config, parsed_req) catch |err| {
+    const result = backend.callProvider(allocator, app_config, provider_request) catch |err| {
         logError("Provider request error: {}", .{err});
         sendApiErrorSafe(
             connection.*,
@@ -450,8 +525,112 @@ fn handleConnection(
         "response model={s} finish_reason={s} usage_total={d}",
         .{ result.model, result.finish_reason, result.usage.total_tokens },
     );
+
+    if (session_store) |store| {
+        if (parsed_req.session_id) |session_id| {
+            const with_assistant = session.appendAssistantMessageAlloc(
+                allocator,
+                provider_request.messages,
+                result.output,
+            ) catch |err| blk: {
+                logError("Session append failed for '{s}': {s}", .{ session_id, @errorName(err) });
+                break :blk null;
+            };
+
+            if (with_assistant) |messages| {
+                defer {
+                    for (messages) |message| {
+                        message.deinit(allocator);
+                    }
+                    allocator.free(messages);
+                }
+
+                var state = session.SessionState{
+                    .session_id = try allocator.dupe(u8, session_id),
+                    .tenant_id = if (parsed_req.tenant_id) |value| try allocator.dupe(u8, value) else null,
+                    .summary = if (loaded_session) |loaded| try allocator.dupe(u8, loaded.summary) else try allocator.dupe(u8, ""),
+                    .messages = try session.trimToRetentionAlloc(
+                        allocator,
+                        messages,
+                        app_config.session_retention_messages,
+                    ),
+                    .message_count = 0,
+                };
+                state.message_count = state.messages.len;
+                defer state.deinit(allocator);
+
+                store.save(allocator, state) catch |err| {
+                    logError("Session save failed for '{s}': {s}", .{ session_id, @errorName(err) });
+                };
+            }
+        }
+    }
+
     sendChatCompletionSafe(connection.*, allocator, result, app_config);
     server_state.successful_requests += 1;
+}
+
+fn cloneRequestWithMessagesAlloc(
+    allocator: std.mem.Allocator,
+    parsed_req: types.Request,
+    prompt: []const u8,
+    messages: []const types.Message,
+) !types.Request {
+    const copied_messages = try session.cloneMessagesAlloc(allocator, messages);
+    errdefer {
+        for (copied_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(copied_messages);
+    }
+
+    var copied_tools = try allocator.alloc(types.Tool, parsed_req.tools.len);
+    var initialized_tools: usize = 0;
+    errdefer {
+        for (copied_tools[0..initialized_tools]) |tool| {
+            tool.deinit(allocator);
+        }
+        allocator.free(copied_tools);
+    }
+
+    for (parsed_req.tools, 0..) |tool, idx| {
+        copied_tools[idx] = .{
+            .name = try allocator.dupe(u8, tool.name),
+            .description = try allocator.dupe(u8, tool.description),
+        };
+        initialized_tools += 1;
+    }
+
+    return .{
+        .prompt = try allocator.dupe(u8, prompt),
+        .messages = copied_messages,
+        .provider = if (parsed_req.provider) |provider| try allocator.dupe(u8, provider) else null,
+        .model = if (parsed_req.model) |model| try allocator.dupe(u8, model) else null,
+        .stream = parsed_req.stream,
+        .think = parsed_req.think,
+        .temperature = parsed_req.temperature,
+        .repeat_penalty = parsed_req.repeat_penalty,
+        .session_id = if (parsed_req.session_id) |session_id| try allocator.dupe(u8, session_id) else null,
+        .tenant_id = if (parsed_req.tenant_id) |tenant_id| try allocator.dupe(u8, tenant_id) else null,
+        .max_context_tokens = parsed_req.max_context_tokens,
+        .tools = copied_tools,
+        .tool_choice = if (parsed_req.tool_choice) |tool_choice| try allocator.dupe(u8, tool_choice) else null,
+    };
+}
+
+fn extractLastUserPromptAlloc(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+) ![]u8 {
+    var i: usize = messages.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.eqlIgnoreCase(messages[i].role, "user")) {
+            return try allocator.dupe(u8, messages[i].content);
+        }
+    }
+
+    return try allocator.dupe(u8, "Continue.");
 }
 
 fn sendApiErrorSafe(
