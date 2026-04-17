@@ -9,6 +9,26 @@ pub fn callChat(
     request: types.Request,
     provider_label: []const u8,
 ) !types.Response {
+    return try callChatWithExtraHeaders(
+        allocator,
+        base_url,
+        api_key,
+        model_name,
+        request,
+        provider_label,
+        &.{},
+    );
+}
+
+pub fn callChatWithExtraHeaders(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    api_key: ?[]const u8,
+    model_name: []const u8,
+    request: types.Request,
+    provider_label: []const u8,
+    extra_headers: []const std.http.Header,
+) !types.Response {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
@@ -33,6 +53,10 @@ pub fn callChat(
         }
     }
 
+    for (extra_headers) |header| {
+        try headers.append(allocator, header);
+    }
+
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
 
@@ -44,58 +68,139 @@ pub fn callChat(
         .response_writer = &writer.writer,
     });
 
-    if (fetch_result.status != .ok) {
+    return try parseChatResponse(
+        allocator,
+        model_name,
+        provider_label,
+        fetch_result.status,
+        writer.written(),
+    );
+}
+
+fn buildUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    suffix: []const u8,
+) ![]u8 {
+    if (std.mem.endsWith(u8, base_url, "/v1")) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, suffix });
+    }
+
+    if (std.mem.endsWith(u8, base_url, "/v1/")) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url[0 .. base_url.len - 1], suffix });
+    }
+
+    if (std.mem.endsWith(u8, base_url, "/")) {
+        return try std.fmt.allocPrint(allocator, "{s}v1{s}", .{ base_url, suffix });
+    }
+
+    return try std.fmt.allocPrint(allocator, "{s}/v1{s}", .{ base_url, suffix });
+}
+
+fn parseChatResponse(
+    allocator: std.mem.Allocator,
+    fallback_model: []const u8,
+    provider_label: []const u8,
+    status: std.http.Status,
+    raw: []const u8,
+) !types.Response {
+    const is_http_ok = status == .ok;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        if (is_http_ok) {
+            return try makeFailureResponse(
+                allocator,
+                fallback_model,
+                "Provider response was not valid JSON",
+            );
+        }
+
         const error_message = try std.fmt.allocPrint(
             allocator,
             "{s} returned HTTP {d}",
-            .{ provider_label, @intFromEnum(fetch_result.status) },
+            .{ provider_label, @intFromEnum(status) },
         );
         defer allocator.free(error_message);
 
-        return try makeFailureResponse(
-            allocator,
-            model_name,
-            error_message,
-        );
-    }
-
-    const raw = writer.written();
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        return try makeFailureResponse(allocator, fallback_model, error_message);
+    };
     defer parsed.deinit();
 
     const root = switch (parsed.value) {
         .object => |value| value,
-        else => return try makeFailureResponse(allocator, model_name, "Provider response was not a JSON object"),
+        else => return try makeFailureResponse(allocator, fallback_model, "Provider response was not a JSON object"),
     };
 
+    if (extractErrorMessage(root)) |detail| {
+        if (!is_http_ok) {
+            const error_message = try std.fmt.allocPrint(
+                allocator,
+                "{s} returned HTTP {d}: {s}",
+                .{ provider_label, @intFromEnum(status), detail },
+            );
+            defer allocator.free(error_message);
+
+            return try makeFailureResponse(allocator, fallback_model, error_message);
+        }
+
+        return try makeFailureResponse(allocator, fallback_model, detail);
+    }
+
+    if (!is_http_ok) {
+        const error_message = try std.fmt.allocPrint(
+            allocator,
+            "{s} returned HTTP {d}",
+            .{ provider_label, @intFromEnum(status) },
+        );
+        defer allocator.free(error_message);
+
+        return try makeFailureResponse(allocator, fallback_model, error_message);
+    }
+
+    const id_value = if (root.get("id")) |id_value|
+        switch (id_value) {
+            .string => |value| value,
+            else => null,
+        }
+    else
+        null;
+
+    const model_value = if (root.get("model")) |model_value|
+        switch (model_value) {
+            .string => |value| value,
+            else => fallback_model,
+        }
+    else
+        fallback_model;
+
     const choices = switch (root.get("choices") orelse {
-        return try makeFailureResponse(allocator, model_name, "Provider response missing choices");
+        return try makeFailureResponse(allocator, fallback_model, "Provider response missing choices");
     }) {
         .array => |value| value,
-        else => return try makeFailureResponse(allocator, model_name, "Provider choices was not an array"),
+        else => return try makeFailureResponse(allocator, fallback_model, "Provider choices was not an array"),
     };
 
     if (choices.items.len == 0) {
-        return try makeFailureResponse(allocator, model_name, "Provider choices array was empty");
+        return try makeFailureResponse(allocator, fallback_model, "Provider choices array was empty");
     }
 
     const first_choice = switch (choices.items[0]) {
         .object => |value| value,
-        else => return try makeFailureResponse(allocator, model_name, "Provider choice was not an object"),
+        else => return try makeFailureResponse(allocator, fallback_model, "Provider choice was not an object"),
     };
 
     const message_obj = switch (first_choice.get("message") orelse {
-        return try makeFailureResponse(allocator, model_name, "Provider choice missing message");
+        return try makeFailureResponse(allocator, fallback_model, "Provider choice missing message");
     }) {
         .object => |value| value,
-        else => return try makeFailureResponse(allocator, model_name, "Provider message was not an object"),
+        else => return try makeFailureResponse(allocator, fallback_model, "Provider message was not an object"),
     };
 
     const output = switch (message_obj.get("content") orelse {
-        return try makeFailureResponse(allocator, model_name, "Provider message missing content");
+        return try makeFailureResponse(allocator, fallback_model, "Provider message missing content");
     }) {
         .string => |value| value,
-        else => return try makeFailureResponse(allocator, model_name, "Provider content was not a string"),
+        else => return try makeFailureResponse(allocator, fallback_model, "Provider content was not a string"),
     };
 
     const finish_reason = if (first_choice.get("finish_reason")) |finish_reason_value|
@@ -119,8 +224,8 @@ pub fn callChat(
         types.Usage{};
 
     return .{
-        .id = null,
-        .model = try allocator.dupe(u8, model_name),
+        .id = if (id_value) |value| try allocator.dupe(u8, value) else null,
+        .model = try allocator.dupe(u8, model_value),
         .output = try allocator.dupe(u8, output),
         .finish_reason = try allocator.dupe(u8, finish_reason),
         .success = true,
@@ -128,24 +233,17 @@ pub fn callChat(
     };
 }
 
-fn buildUrl(
-    allocator: std.mem.Allocator,
-    base_url: []const u8,
-    suffix: []const u8,
-) ![]u8 {
-    if (std.mem.endsWith(u8, base_url, "/v1")) {
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, suffix });
-    }
+fn extractErrorMessage(root: std.json.ObjectMap) ?[]const u8 {
+    const error_value = root.get("error") orelse return null;
 
-    if (std.mem.endsWith(u8, base_url, "/v1/")) {
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url[0 .. base_url.len - 1], suffix });
-    }
-
-    if (std.mem.endsWith(u8, base_url, "/")) {
-        return try std.fmt.allocPrint(allocator, "{s}v1{s}", .{ base_url, suffix });
-    }
-
-    return try std.fmt.allocPrint(allocator, "{s}/v1{s}", .{ base_url, suffix });
+    return switch (error_value) {
+        .object => |error_object| switch (error_object.get("message") orelse return null) {
+            .string => |message| message,
+            else => null,
+        },
+        .string => |message| message,
+        else => null,
+    };
 }
 
 fn renderPayloadJsonAlloc(
@@ -275,4 +373,61 @@ fn parseUsageField(value: ?std.json.Value) usize {
         .float => |number| if (number < 0) 0 else @as(usize, @intFromFloat(number)),
         else => 0,
     };
+}
+
+test "buildUrl normalizes OpenAI-compatible v1 path variants" {
+    const allocator = std.testing.allocator;
+
+    const direct = try buildUrl(allocator, "https://openrouter.ai/api/v1", "/chat/completions");
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", direct);
+
+    const slash = try buildUrl(allocator, "https://openrouter.ai/api/v1/", "/chat/completions");
+    defer allocator.free(slash);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", slash);
+
+    const no_v1 = try buildUrl(allocator, "https://openrouter.ai/api", "/chat/completions");
+    defer allocator.free(no_v1);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", no_v1);
+}
+
+test "parseChatResponse surfaces OpenRouter-style upstream JSON errors" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"error":{"message":"rate limit exceeded"}}
+    ;
+
+    const response = try parseChatResponse(
+        allocator,
+        "openrouter/auto",
+        "OpenRouter",
+        .too_many_requests,
+        raw,
+    );
+    defer response.deinit(allocator);
+
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqualStrings("OpenRouter returned HTTP 429: rate limit exceeded", response.output);
+}
+
+test "parseChatResponse keeps ids and usage for successful responses" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"id":"chatcmpl-123","model":"openrouter/my-model","choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}
+    ;
+
+    const response = try parseChatResponse(
+        allocator,
+        "openrouter/auto",
+        "OpenRouter",
+        .ok,
+        raw,
+    );
+    defer response.deinit(allocator);
+
+    try std.testing.expect(response.success);
+    try std.testing.expectEqualStrings("chatcmpl-123", response.id.?);
+    try std.testing.expectEqualStrings("openrouter/my-model", response.model);
+    try std.testing.expectEqualStrings("hello", response.output);
+    try std.testing.expectEqual(@as(usize, 5), response.usage.total_tokens);
 }

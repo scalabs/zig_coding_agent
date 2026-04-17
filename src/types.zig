@@ -120,19 +120,23 @@ pub fn normalizeProviderName(value: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(value, "ollama")) return "ollama_qwen";
     if (std.ascii.eqlIgnoreCase(value, "qwen")) return "ollama_qwen";
     if (std.ascii.eqlIgnoreCase(value, "openai")) return "openai";
+    if (std.ascii.eqlIgnoreCase(value, "openrouter")) return "openrouter";
     if (std.ascii.eqlIgnoreCase(value, "claude")) return "claude";
     if (std.ascii.eqlIgnoreCase(value, "anthropic")) return "claude";
+    if (std.ascii.eqlIgnoreCase(value, "bedrock")) return "bedrock";
     if (std.ascii.eqlIgnoreCase(value, "llama_cpp")) return "llama_cpp";
     if (std.ascii.eqlIgnoreCase(value, "llama.cpp")) return "llama_cpp";
     return null;
 }
 
-test "normalizeProviderName accepts Qwen aliases" {
+test "normalizeProviderName accepts supported provider aliases" {
     try std.testing.expectEqualStrings("ollama_qwen", normalizeProviderName("ollama_qwen").?);
     try std.testing.expectEqualStrings("ollama_qwen", normalizeProviderName("ollama").?);
     try std.testing.expectEqualStrings("ollama_qwen", normalizeProviderName("qwen").?);
     try std.testing.expectEqualStrings("openai", normalizeProviderName("openai").?);
+    try std.testing.expectEqualStrings("openrouter", normalizeProviderName("openrouter").?);
     try std.testing.expectEqualStrings("claude", normalizeProviderName("anthropic").?);
+    try std.testing.expectEqualStrings("bedrock", normalizeProviderName("bedrock").?);
     try std.testing.expectEqualStrings("llama_cpp", normalizeProviderName("llama.cpp").?);
-    try std.testing.expect(normalizeProviderName("bedrock") == null);
+    try std.testing.expect(normalizeProviderName("unknown") == null);
 }

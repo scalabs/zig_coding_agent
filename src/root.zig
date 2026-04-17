@@ -34,6 +34,12 @@ test "core: routing" {
     _ = @import("core/router.zig");
 }
 
+test "providers: external provider adapters" {
+    _ = @import("providers/openai_compatible.zig");
+    _ = @import("providers/openrouter.zig");
+    _ = @import("providers/bedrock.zig");
+}
+
 test "types: normalization" {
     _ = @import("types.zig");
 }

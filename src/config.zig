@@ -24,9 +24,20 @@ pub const Config = struct {
     openai_base_url: []const u8,
     openai_api_key: []const u8,
     openai_model: []const u8,
+    openrouter_base_url: []const u8,
+    openrouter_api_key: []const u8,
+    openrouter_http_referer: []const u8,
+    openrouter_app_name: []const u8,
+    openrouter_model: []const u8,
     claude_base_url: []const u8,
     claude_api_key: []const u8,
     claude_model: []const u8,
+    bedrock_runtime_base_url: []const u8,
+    bedrock_region: []const u8,
+    bedrock_access_key_id: []const u8,
+    bedrock_secret_access_key: []const u8,
+    bedrock_session_token: []const u8,
+    bedrock_model: []const u8,
     llama_cpp_base_url: []const u8,
     llama_cpp_api_key: []const u8,
     llama_cpp_model: []const u8,
@@ -97,6 +108,31 @@ pub const Config = struct {
                 "OPENAI_MODEL",
                 "gpt-4.1-mini",
             ),
+            .openrouter_base_url = try getEnvOrDefault(
+                allocator,
+                "OPENROUTER_BASE_URL",
+                "https://openrouter.ai/api/v1",
+            ),
+            .openrouter_api_key = try getEnvOrDefault(
+                allocator,
+                "OPENROUTER_API_KEY",
+                "",
+            ),
+            .openrouter_http_referer = try getEnvOrDefault(
+                allocator,
+                "OPENROUTER_HTTP_REFERER",
+                "",
+            ),
+            .openrouter_app_name = try getEnvOrDefault(
+                allocator,
+                "OPENROUTER_APP_NAME",
+                "",
+            ),
+            .openrouter_model = try getEnvOrDefault(
+                allocator,
+                "OPENROUTER_MODEL",
+                "openrouter/auto",
+            ),
             .claude_base_url = try getEnvOrDefault(
                 allocator,
                 "CLAUDE_BASE_URL",
@@ -111,6 +147,36 @@ pub const Config = struct {
                 allocator,
                 "CLAUDE_MODEL",
                 "claude-3-5-sonnet-latest",
+            ),
+            .bedrock_runtime_base_url = try getFirstEnvOrDefault(
+                allocator,
+                &.{"BEDROCK_RUNTIME_BASE_URL"},
+                "",
+            ),
+            .bedrock_region = try getFirstEnvOrDefault(
+                allocator,
+                &.{ "BEDROCK_REGION", "AWS_REGION", "AWS_DEFAULT_REGION" },
+                "us-east-1",
+            ),
+            .bedrock_access_key_id = try getFirstEnvOrDefault(
+                allocator,
+                &.{ "BEDROCK_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID" },
+                "",
+            ),
+            .bedrock_secret_access_key = try getFirstEnvOrDefault(
+                allocator,
+                &.{ "BEDROCK_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY" },
+                "",
+            ),
+            .bedrock_session_token = try getFirstEnvOrDefault(
+                allocator,
+                &.{ "BEDROCK_SESSION_TOKEN", "AWS_SESSION_TOKEN" },
+                "",
+            ),
+            .bedrock_model = try getEnvOrDefault(
+                allocator,
+                "BEDROCK_MODEL",
+                "amazon.nova-micro-v1:0",
             ),
             .llama_cpp_base_url = try getEnvOrDefault(
                 allocator,
@@ -145,9 +211,20 @@ pub const Config = struct {
         allocator.free(self.openai_base_url);
         allocator.free(self.openai_api_key);
         allocator.free(self.openai_model);
+        allocator.free(self.openrouter_base_url);
+        allocator.free(self.openrouter_api_key);
+        allocator.free(self.openrouter_http_referer);
+        allocator.free(self.openrouter_app_name);
+        allocator.free(self.openrouter_model);
         allocator.free(self.claude_base_url);
         allocator.free(self.claude_api_key);
         allocator.free(self.claude_model);
+        allocator.free(self.bedrock_runtime_base_url);
+        allocator.free(self.bedrock_region);
+        allocator.free(self.bedrock_access_key_id);
+        allocator.free(self.bedrock_secret_access_key);
+        allocator.free(self.bedrock_session_token);
+        allocator.free(self.bedrock_model);
         allocator.free(self.llama_cpp_base_url);
         allocator.free(self.llama_cpp_api_key);
         allocator.free(self.llama_cpp_model);
@@ -181,6 +258,23 @@ fn getEnvOrDefault(
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, default_value),
         else => err,
     };
+}
+
+fn getFirstEnvOrDefault(
+    allocator: std.mem.Allocator,
+    keys: []const []const u8,
+    default_value: []const u8,
+) ![]u8 {
+    for (keys) |key| {
+        const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => continue,
+            else => return err,
+        };
+
+        return value;
+    }
+
+    return try allocator.dupe(u8, default_value);
 }
 
 fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
@@ -256,9 +350,20 @@ test "setDefaultProvider stores canonical provider alias" {
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
         .openai_api_key = try allocator.dupe(u8, ""),
         .openai_model = try allocator.dupe(u8, "gpt-4.1-mini"),
+        .openrouter_base_url = try allocator.dupe(u8, "https://openrouter.ai/api/v1"),
+        .openrouter_api_key = try allocator.dupe(u8, ""),
+        .openrouter_http_referer = try allocator.dupe(u8, ""),
+        .openrouter_app_name = try allocator.dupe(u8, ""),
+        .openrouter_model = try allocator.dupe(u8, "openrouter/auto"),
         .claude_base_url = try allocator.dupe(u8, "https://api.anthropic.com/v1"),
         .claude_api_key = try allocator.dupe(u8, ""),
         .claude_model = try allocator.dupe(u8, "claude-3-5-sonnet-latest"),
+        .bedrock_runtime_base_url = try allocator.dupe(u8, ""),
+        .bedrock_region = try allocator.dupe(u8, "us-east-1"),
+        .bedrock_access_key_id = try allocator.dupe(u8, ""),
+        .bedrock_secret_access_key = try allocator.dupe(u8, ""),
+        .bedrock_session_token = try allocator.dupe(u8, ""),
+        .bedrock_model = try allocator.dupe(u8, "amazon.nova-micro-v1:0"),
         .llama_cpp_base_url = try allocator.dupe(u8, "http://127.0.0.1:8080"),
         .llama_cpp_api_key = try allocator.dupe(u8, ""),
         .llama_cpp_model = try allocator.dupe(u8, "local-model"),
@@ -267,4 +372,10 @@ test "setDefaultProvider stores canonical provider alias" {
 
     try cfg.setDefaultProvider(allocator, "qwen");
     try std.testing.expectEqualStrings("ollama_qwen", cfg.default_provider);
+
+    try cfg.setDefaultProvider(allocator, "openrouter");
+    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+
+    try cfg.setDefaultProvider(allocator, "bedrock");
+    try std.testing.expectEqualStrings("bedrock", cfg.default_provider);
 }
