@@ -52,6 +52,17 @@ Use environment variables to configure the server:
 - `LLM_ROUTER_PROVIDER`: default `ollama`
 - `OLLAMA_BASE_URL`: default `http://127.0.0.1:11434`
 - `OLLAMA_MODEL`: default `qwen:7b`
+- `OPENROUTER_BASE_URL`: default `https://openrouter.ai/api/v1`
+- `OPENROUTER_API_KEY`: default empty
+- `OPENROUTER_HTTP_REFERER`: default empty
+- `OPENROUTER_APP_NAME`: default empty
+- `OPENROUTER_MODEL`: default `openrouter/auto`
+- `BEDROCK_RUNTIME_BASE_URL`: optional override for the regional runtime endpoint
+- `BEDROCK_REGION`: default `us-east-1`, with fallbacks from `AWS_REGION` or `AWS_DEFAULT_REGION`
+- `BEDROCK_ACCESS_KEY_ID`: falls back to `AWS_ACCESS_KEY_ID`
+- `BEDROCK_SECRET_ACCESS_KEY`: falls back to `AWS_SECRET_ACCESS_KEY`
+- `BEDROCK_SESSION_TOKEN`: falls back to `AWS_SESSION_TOKEN`
+- `BEDROCK_MODEL`: default `amazon.nova-micro-v1:0`
 
 You can also override the default provider at startup:
 
@@ -59,7 +70,14 @@ You can also override the default provider at startup:
 zig build run -- --provider ollama
 ```
 
-Supported provider values are `ollama`, `qwen`, and `ollama_qwen`.
+Supported provider values are:
+
+- `ollama`, `qwen`, `ollama_qwen`
+- `openai`
+- `openrouter`
+- `claude`, `anthropic`
+- `bedrock`
+- `llama_cpp`, `llama.cpp`
 
 You can run an in-project prompt loop (no external shell loop required):
 
@@ -150,6 +168,22 @@ Manual integration check against the local router:
    curl -s http://127.0.0.1:8081/v1/chat/completions \
      -H 'Content-Type: application/json' \
      -d '{"provider":"ollama","messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+   ```
+
+4. OpenRouter example:
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"provider":"openrouter","model":"openrouter/auto","messages":[{"role":"user","content":"Say hello from OpenRouter"}]}'
+   ```
+
+5. Bedrock example:
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"provider":"bedrock","model":"amazon.nova-micro-v1:0","messages":[{"role":"user","content":"Say hello from Bedrock"}]}'
    ```
 
 Optional dependency sanity check for Ollama itself:

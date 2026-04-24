@@ -72,7 +72,7 @@ pub fn parseChatRequest(
 
                 const normalized = types.normalizeProviderName(trimmed) orelse {
                     return .{ .err = errors.validationError(
-                        "provider must be one of: ollama_qwen, ollama, qwen, openai, claude, anthropic, llama_cpp",
+                        "provider must be one of: ollama_qwen, ollama, qwen, openai, openrouter, claude, anthropic, bedrock, llama_cpp, llama.cpp",
                         "provider",
                         "invalid_provider",
                     ) };
@@ -626,9 +626,19 @@ pub fn callProvider(
         return try openai.callOpenAI(allocator, app_config, request);
     }
 
+    if (std.mem.eql(u8, provider, "openrouter")) {
+        const openrouter = @import("../providers/openrouter.zig");
+        return try openrouter.callOpenRouter(allocator, app_config, request);
+    }
+
     if (std.mem.eql(u8, provider, "claude")) {
         const claude = @import("../providers/claude.zig");
         return try claude.callClaude(allocator, app_config, request);
+    }
+
+    if (std.mem.eql(u8, provider, "bedrock")) {
+        const bedrock = @import("../providers/bedrock.zig");
+        return try bedrock.callBedrock(allocator, app_config, request);
     }
 
     if (std.mem.eql(u8, provider, "llama_cpp")) {
@@ -651,10 +661,18 @@ pub fn buildProviderStatusJson(
     const ollama_status_json = try ollama_qwen.buildStatusJsonAlloc(allocator, app_config);
     defer allocator.free(ollama_status_json);
 
+    const openrouter = @import("../providers/openrouter.zig");
+    const openrouter_status_json = try openrouter.buildStatusJsonAlloc(allocator, app_config);
+    defer allocator.free(openrouter_status_json);
+
+    const bedrock = @import("../providers/bedrock.zig");
+    const bedrock_status_json = try bedrock.buildStatusJsonAlloc(allocator, app_config);
+    defer allocator.free(bedrock_status_json);
+
     return try std.fmt.allocPrint(
         allocator,
-        "{{\"default_provider\":\"{s}\",\"ollama\":{s}}}",
-        .{ escaped_default, ollama_status_json },
+        "{{\"default_provider\":\"{s}\",\"ollama\":{s},\"openrouter\":{s},\"bedrock\":{s}}}",
+        .{ escaped_default, ollama_status_json, openrouter_status_json, bedrock_status_json },
     );
 }
 
@@ -819,11 +837,53 @@ test "parseChatRequest treats model auto as default" {
     try std.testing.expectEqual(@as(usize, 0), request.tools.len);
 }
 
+test "parseChatRequest accepts openrouter and bedrock providers" {
+    const allocator = std.testing.allocator;
+
+    const openrouter_body =
+        \\{
+        \\  "provider": "openrouter",
+        \\  "messages": [
+        \\    {"role": "user", "content": "Hello from OpenRouter"}
+        \\  ]
+        \\}
+    ;
+
+    const parsed_openrouter = try parseChatRequest(allocator, openrouter_body);
+    const openrouter_request = switch (parsed_openrouter) {
+        .ok => |request| request,
+        .err => return error.UnexpectedApiError,
+    };
+    defer openrouter_request.deinit(allocator);
+
+    try std.testing.expectEqualStrings("openrouter", openrouter_request.provider.?);
+    try std.testing.expectEqualStrings("Hello from OpenRouter", openrouter_request.prompt);
+
+    const bedrock_body =
+        \\{
+        \\  "provider": "bedrock",
+        \\  "messages": [
+        \\    {"role": "user", "content": "Hello from Bedrock"}
+        \\  ]
+        \\}
+    ;
+
+    const parsed_bedrock = try parseChatRequest(allocator, bedrock_body);
+    const bedrock_request = switch (parsed_bedrock) {
+        .ok => |request| request,
+        .err => return error.UnexpectedApiError,
+    };
+    defer bedrock_request.deinit(allocator);
+
+    try std.testing.expectEqualStrings("bedrock", bedrock_request.provider.?);
+    try std.testing.expectEqualStrings("Hello from Bedrock", bedrock_request.prompt);
+}
+
 test "parseChatRequest rejects invalid provider" {
     const allocator = std.testing.allocator;
     const body =
         \\{
-        \\  "provider": "bedrock",
+        \\  "provider": "bad-provider",
         \\  "messages": [
         \\    {"role": "user", "content": "Hello"}
         \\  ]

@@ -62,7 +62,10 @@ pub fn run(
         .{ app_config.listen_host, app_config.listen_port },
     );
     logInfo("Default provider: {s}", .{app_config.default_provider});
-    logInfo("Available providers: ollama (aliases: qwen, ollama_qwen)", .{});
+    logInfo(
+        "Available providers: ollama (aliases: qwen, ollama_qwen), openai, openrouter, claude (alias: anthropic), bedrock, llama_cpp (alias: llama.cpp)",
+        .{},
+    );
     logInfo(
         "Ollama speed settings: think={} num_predict={d} temperature={d:.2} repeat_penalty={d:.2}",
         .{
@@ -77,16 +80,13 @@ pub fn run(
         .{ app_config.request_timeout_ms, app_config.provider_timeout_ms },
     );
 
-    const default_provider = types.normalizeProviderName(app_config.default_provider) orelse app_config.default_provider;
-    if (std.mem.eql(u8, default_provider, "ollama_qwen")) {
-        const provider_status = backend.buildProviderStatusJson(allocator, app_config) catch |err| blk: {
-            logError("Provider status detection failed: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        if (provider_status) |status| {
-            defer allocator.free(status);
-            logInfo("Provider status: {s}", .{status});
-        }
+    const provider_status = backend.buildProviderStatusJson(allocator, app_config) catch |err| blk: {
+        logError("Provider status detection failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (provider_status) |status| {
+        defer allocator.free(status);
+        logInfo("Provider status: {s}", .{status});
     }
 
     if (app_config.debug_logging) {
