@@ -52,6 +52,7 @@ Use environment variables to configure the server:
 - `LLM_ROUTER_PROVIDER`: default `ollama`
 - `OLLAMA_BASE_URL`: default `http://127.0.0.1:11434`
 - `OLLAMA_MODEL`: default `qwen:7b`
+<<<<<<< HEAD
 - `OPENROUTER_BASE_URL`: default `https://openrouter.ai/api/v1`
 - `OPENROUTER_API_KEY`: default empty
 - `OPENROUTER_HTTP_REFERER`: default empty
@@ -63,6 +64,13 @@ Use environment variables to configure the server:
 - `BEDROCK_SECRET_ACCESS_KEY`: falls back to `AWS_SECRET_ACCESS_KEY`
 - `BEDROCK_SESSION_TOKEN`: falls back to `AWS_SESSION_TOKEN`
 - `BEDROCK_MODEL`: default `amazon.nova-micro-v1:0`
+=======
+- `LLM_ROUTER_SESSION_STORE_PATH`: default `logs/sessions` (set empty to disable persistence)
+- `LLM_ROUTER_SESSION_RETENTION_MESSAGES`: default `24`
+- `LLM_ROUTER_TOOL_EXEC_ENABLED`: default `0` (set `1` to enable `cmd`/`bash` debug tools)
+- `LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES`: default `65536`
+- `LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED`: default `1` (set `0` to stream only the final loop result)
+>>>>>>> 20ff50a (WIP before rebase)
 
 You can also override the default provider at startup:
 
@@ -70,6 +78,7 @@ You can also override the default provider at startup:
 zig build run -- --provider ollama
 ```
 
+<<<<<<< HEAD
 Supported provider values are:
 
 - `ollama`, `qwen`, `ollama_qwen`
@@ -78,6 +87,17 @@ Supported provider values are:
 - `claude`, `anthropic`
 - `bedrock`
 - `llama_cpp`, `llama.cpp`
+=======
+CLI dotenv loading (optional):
+
+```bash
+zig build run -- --use-env
+# or
+zig build run -- --env-file=.env.local
+```
+
+Supported provider values are `ollama`, `qwen`, and `ollama_qwen`.
+>>>>>>> 20ff50a (WIP before rebase)
 
 You can run an in-project prompt loop (no external shell loop required):
 
@@ -89,11 +109,55 @@ Optional loop controls:
 
 - `--until <marker>`: completion marker to stop on (default `DONE`)
 - `--max-turns <n>`: hard stop to prevent infinite loops (default `8`)
+- `--loop-mode <basic|agent>`: choose simple continuation or iterative agent refinement (default `basic`)
+- `--agent-loop`: shorthand for `--loop-mode=agent`
 
 Example with explicit controls:
 
 ```bash
 zig build run -- --prompt "Plan a migration and end with FINISHED" --provider ollama --until FINISHED --max-turns 12
+```
+
+## Agent Loop (Small-Model Mode)
+
+Use `agent` loop mode when your goal is to get stronger final quality from a smaller model through iterative refinement.
+
+What changes in `agent` mode:
+
+- adds loop-specific system guidance for iterative improvement
+- asks the model to self-critique and improve each turn
+- stops early when the model repeats output without progress
+
+Recommended command:
+
+```bash
+zig build run -- --use-env --loop-mode=agent --provider ollama --prompt "Solve the task step by step and include DONE only when fully complete." --until DONE --max-turns 12
+```
+
+Important: app flags must come after the extra `--` separator (`zig build run -- --use-env ...`).
+
+Frontend/API usage (frontend-independent):
+
+- `loop_mode`: `basic` or `agent`
+- `loop_until`: completion marker (for example `DONE`)
+- `loop_max_turns`: max in-request loop turns
+
+When `stream: true` is combined with loop fields, the server can emit per-turn loop progress chunks.
+Control this with `LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED`:
+
+- `1` (default): emit loop progress chunks plus final stop chunk
+- `0`: suppress loop progress chunks and emit only final result chunks
+
+Example payload:
+
+```json
+{
+  "provider": "ollama",
+  "messages": [{"role": "user", "content": "Solve this task and include DONE when complete."}],
+  "loop_mode": "agent",
+  "loop_until": "DONE",
+  "loop_max_turns": 12
+}
 ```
 
 ## Build And Run
@@ -269,6 +333,14 @@ Example request:
 curl -s http://127.0.0.1:8081/v1/chat/completions \
  -H 'Content-Type: application/json' \
  -d '{"messages":[{"role":"user","content":"Say hello from local Qwen"}]}'
+```
+
+Stateful session request example (history survives restarts when persistence is enabled):
+
+```bash
+curl -s http://127.0.0.1:8081/v1/chat/completions \
+ -H 'Content-Type: application/json' \
+ -d '{"session_id":"demo-1","messages":[{"role":"user","content":"Remember that my favorite color is green."}]}'
 ```
 
 Legacy provider values are still accepted: `ollama`, `qwen`, and

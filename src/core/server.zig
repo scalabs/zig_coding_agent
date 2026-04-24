@@ -433,8 +433,46 @@ fn handleConnection(
             return;
         }
 
+        var stream_request = try cloneRequestWithMessagesAlloc(
+            allocator,
+            parsed_req,
+            request_prompt,
+            request_messages,
+        );
+        defer stream_request.deinit(allocator);
+
+        const stream_auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config);
+        defer if (stream_auto_tool_summary) |summary| allocator.free(summary);
+
+        if (stream_auto_tool_summary) |summary| {
+            const augmented_messages = try appendSystemMessageAlloc(allocator, stream_request.messages, summary);
+            for (stream_request.messages) |message| {
+                message.deinit(allocator);
+            }
+            allocator.free(stream_request.messages);
+            stream_request.messages = augmented_messages;
+        }
+
+        const stream_loop_enabled = stream_request.loop_mode != null or stream_request.loop_max_turns != null;
+        if (stream_loop_enabled) {
+            streamLoopRequestToSse(
+                connection.*,
+                allocator,
+                app_config,
+                stream_request,
+                app_config.loop_stream_progress_enabled,
+            ) catch |err| {
+                logError("Provider stream loop error: {s}", .{@errorName(err)});
+                server_state.failed_requests += 1;
+                return;
+            };
+
+            server_state.successful_requests += 1;
+            return;
+        }
+
         const ollama_qwen = @import("../providers/ollama_qwen.zig");
-        const stream_result = ollama_qwen.streamQwenToSse(connection.*, allocator, app_config, parsed_req) catch |err| {
+        const stream_result = ollama_qwen.streamQwenToSse(connection.*, allocator, app_config, stream_request) catch |err| {
             logError("Provider stream error: {s}", .{@errorName(err)});
             server_state.failed_requests += 1;
             return;
@@ -493,19 +531,51 @@ fn handleConnection(
         provider_request.messages = augmented_messages;
     }
 
-    const provider_started_ms = std.time.milliTimestamp();
-    const result = backend.callProvider(allocator, app_config, provider_request) catch |err| {
-        logError("Provider request error: {}", .{err});
-        sendApiErrorSafe(
-            connection.*,
-            allocator,
-            backend.errors.providerTransportError(@errorName(err)),
-            app_config,
-        );
-        server_state.failed_requests += 1;
-        return;
+    var loop_messages_for_persistence: ?[]types.Message = null;
+    defer if (loop_messages_for_persistence) |messages| {
+        for (messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(messages);
     };
-    defer result.deinit(allocator);
+
+    var result: types.Response = undefined;
+    var result_ready = false;
+    defer if (result_ready) result.deinit(allocator);
+
+    const loop_enabled = provider_request.loop_mode != null or provider_request.loop_max_turns != null;
+
+    const provider_started_ms = std.time.milliTimestamp();
+    if (loop_enabled) {
+        const loop_execution = executeLoopRequestAlloc(allocator, app_config, provider_request) catch |err| {
+            logError("Provider loop request error: {}", .{err});
+            sendApiErrorSafe(
+                connection.*,
+                allocator,
+                backend.errors.providerTransportError(@errorName(err)),
+                app_config,
+            );
+            server_state.failed_requests += 1;
+            return;
+        };
+
+        result = loop_execution.response;
+        result_ready = true;
+        loop_messages_for_persistence = loop_execution.messages;
+    } else {
+        result = backend.callProvider(allocator, app_config, provider_request) catch |err| {
+            logError("Provider request error: {}", .{err});
+            sendApiErrorSafe(
+                connection.*,
+                allocator,
+                backend.errors.providerTransportError(@errorName(err)),
+                app_config,
+            );
+            server_state.failed_requests += 1;
+            return;
+        };
+        result_ready = true;
+    }
 
     const provider_elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - provider_started_ms, 0));
     if (provider_elapsed_ms > app_config.provider_timeout_ms) {
@@ -535,6 +605,32 @@ fn handleConnection(
         return;
     }
 
+    if (std.mem.trim(u8, result.output, " \t\r\n").len == 0) {
+        if (auto_tool_summary) |summary| {
+            allocator.free(result.output);
+            result.output = try std.fmt.allocPrint(
+                allocator,
+                "Tool-assisted fallback response (model returned empty text):\n\n{s}",
+                .{summary},
+            );
+
+            allocator.free(result.finish_reason);
+            result.finish_reason = try allocator.dupe(u8, "tool_fallback");
+        } else {
+            sendApiErrorSafe(
+                connection.*,
+                allocator,
+                backend.errors.providerError(
+                    "Provider returned empty assistant content",
+                    "empty_model_response",
+                ),
+                app_config,
+            );
+            server_state.failed_requests += 1;
+            return;
+        }
+    }
+
     debugLog(
         app_config,
         "response model={s} finish_reason={s} usage_total={d}",
@@ -543,7 +639,10 @@ fn handleConnection(
 
     if (session_store) |store| {
         if (parsed_req.session_id) |session_id| {
-            const with_assistant = session.appendAssistantMessageAlloc(
+            const loop_messages = loop_messages_for_persistence;
+            const with_assistant = if (loop_messages) |messages| blk: {
+                break :blk try session.cloneMessagesAlloc(allocator, messages);
+            } else session.appendAssistantMessageAlloc(
                 allocator,
                 provider_request.messages,
                 result.output,
@@ -630,7 +729,288 @@ fn cloneRequestWithMessagesAlloc(
         .max_context_tokens = parsed_req.max_context_tokens,
         .tools = copied_tools,
         .tool_choice = if (parsed_req.tool_choice) |tool_choice| try allocator.dupe(u8, tool_choice) else null,
+        .loop_mode = if (parsed_req.loop_mode) |loop_mode| try allocator.dupe(u8, loop_mode) else null,
+        .loop_until = if (parsed_req.loop_until) |loop_until| try allocator.dupe(u8, loop_until) else null,
+        .loop_max_turns = parsed_req.loop_max_turns,
     };
+}
+
+const LoopExecution = struct {
+    response: types.Response,
+    messages: []types.Message,
+};
+
+fn streamLoopRequestToSse(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    base_request: types.Request,
+    emit_progress: bool,
+) !void {
+    const loop_mode = base_request.loop_mode orelse "basic";
+    const loop_until = base_request.loop_until orelse "DONE";
+    const loop_max_turns = base_request.loop_max_turns orelse 8;
+
+    try response.sendEventStreamHeaders(connection);
+
+    const completion_id = try std.fmt.allocPrint(
+        allocator,
+        "chatcmpl-{d}",
+        .{std.time.microTimestamp()},
+    );
+    defer allocator.free(completion_id);
+
+    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    defer {
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+    }
+
+    if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) {
+        const with_guidance = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            "You are running in API agent loop mode. Improve the answer each turn. Briefly self-critique then improve. Include the completion marker exactly when fully complete.",
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_guidance;
+    }
+
+    var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
+    defer allocator.free(latest_user_prompt);
+
+    var previous_output: ?[]u8 = null;
+    defer if (previous_output) |value| allocator.free(value);
+    var repeated_count: usize = 0;
+
+    var turn: usize = 0;
+    while (turn < loop_max_turns) : (turn += 1) {
+        var turn_request = try cloneRequestWithMessagesAlloc(allocator, base_request, latest_user_prompt, working_messages);
+        defer turn_request.deinit(allocator);
+
+        if (turn_request.loop_mode) |value| {
+            allocator.free(value);
+            turn_request.loop_mode = null;
+        }
+        if (turn_request.loop_until) |value| {
+            allocator.free(value);
+            turn_request.loop_until = null;
+        }
+        turn_request.loop_max_turns = null;
+
+        var turn_result = try backend.callProvider(allocator, app_config, turn_request);
+        defer turn_result.deinit(allocator);
+
+        const with_assistant = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "assistant",
+            turn_result.output,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_assistant;
+
+        if (emit_progress) {
+            const progress_text = try std.fmt.allocPrint(
+                allocator,
+                "[loop turn {d}/{d}]\n{s}\n",
+                .{ turn + 1, loop_max_turns, turn_result.output },
+            );
+            defer allocator.free(progress_text);
+
+            try response.sendChatCompletionChunkSse(
+                connection,
+                allocator,
+                completion_id,
+                turn_result.model,
+                progress_text,
+                null,
+            );
+        }
+
+        const normalized_output = std.mem.trim(u8, turn_result.output, " \t\r\n");
+        if (previous_output) |prev| {
+            if (std.mem.eql(u8, prev, normalized_output)) {
+                repeated_count += 1;
+            } else {
+                repeated_count = 0;
+            }
+            allocator.free(prev);
+        }
+        previous_output = try allocator.dupe(u8, normalized_output);
+
+        const reached_until = std.mem.indexOf(u8, turn_result.output, loop_until) != null;
+        const reached_max = (turn + 1) >= loop_max_turns;
+        const repeated_stop = std.ascii.eqlIgnoreCase(loop_mode, "agent") and repeated_count >= 1;
+        const should_stop = reached_until or reached_max or repeated_stop or !turn_result.success;
+
+        if (should_stop) {
+            if (!emit_progress and turn_result.output.len > 0) {
+                try response.sendChatCompletionChunkSse(
+                    connection,
+                    allocator,
+                    completion_id,
+                    turn_result.model,
+                    turn_result.output,
+                    null,
+                );
+            }
+
+            try response.sendChatCompletionChunkSse(
+                connection,
+                allocator,
+                completion_id,
+                turn_result.model,
+                null,
+                turn_result.finish_reason,
+            );
+            try response.sendSseDone(connection);
+            return;
+        }
+
+        allocator.free(latest_user_prompt);
+        latest_user_prompt = try allocator.dupe(
+            u8,
+            if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
+                "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
+            else
+                "Continue.",
+        );
+
+        const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_continue;
+    }
+
+    try response.sendSseDone(connection);
+}
+
+fn executeLoopRequestAlloc(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    base_request: types.Request,
+) !LoopExecution {
+    const loop_mode = base_request.loop_mode orelse "basic";
+    const loop_until = base_request.loop_until orelse "DONE";
+    const loop_max_turns = base_request.loop_max_turns orelse 8;
+
+    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    errdefer {
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+    }
+
+    if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) {
+        const with_guidance = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            "You are running in API agent loop mode. Improve the answer each turn. Briefly self-critique then improve. Include the completion marker exactly when fully complete.",
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_guidance;
+    }
+
+    var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
+    defer allocator.free(latest_user_prompt);
+
+    var previous_output: ?[]u8 = null;
+    defer if (previous_output) |value| allocator.free(value);
+    var repeated_count: usize = 0;
+
+    var turn: usize = 0;
+    while (turn < loop_max_turns) : (turn += 1) {
+        var turn_request = try cloneRequestWithMessagesAlloc(allocator, base_request, latest_user_prompt, working_messages);
+        defer turn_request.deinit(allocator);
+
+        if (turn_request.loop_mode) |value| {
+            allocator.free(value);
+            turn_request.loop_mode = null;
+        }
+        if (turn_request.loop_until) |value| {
+            allocator.free(value);
+            turn_request.loop_until = null;
+        }
+        turn_request.loop_max_turns = null;
+
+        var turn_result = try backend.callProvider(allocator, app_config, turn_request);
+
+        const with_assistant = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "assistant",
+            turn_result.output,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_assistant;
+
+        if (std.mem.indexOf(u8, turn_result.output, loop_until) != null) {
+            return .{ .response = turn_result, .messages = working_messages };
+        }
+
+        if (!turn_result.success) {
+            return .{ .response = turn_result, .messages = working_messages };
+        }
+
+        const normalized_output = std.mem.trim(u8, turn_result.output, " \t\r\n");
+        if (previous_output) |prev| {
+            if (std.mem.eql(u8, prev, normalized_output)) {
+                repeated_count += 1;
+            } else {
+                repeated_count = 0;
+            }
+            allocator.free(prev);
+        }
+        previous_output = try allocator.dupe(u8, normalized_output);
+
+        if (turn + 1 >= loop_max_turns) {
+            return .{ .response = turn_result, .messages = working_messages };
+        }
+
+        if (std.ascii.eqlIgnoreCase(loop_mode, "agent") and repeated_count >= 1) {
+            return .{ .response = turn_result, .messages = working_messages };
+        }
+
+        turn_result.deinit(allocator);
+
+        allocator.free(latest_user_prompt);
+        latest_user_prompt = try allocator.dupe(
+            u8,
+            if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
+                "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
+            else
+                "Continue.",
+        );
+
+        const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_continue;
+    }
+
+    return error.InvalidLoopState;
 }
 
 fn extractLastUserPromptAlloc(
@@ -670,6 +1050,35 @@ fn appendSystemMessageAlloc(
 
     try out.append(allocator, .{
         .role = try allocator.dupe(u8, "system"),
+        .content = try allocator.dupe(u8, content),
+    });
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendRoleMessageAlloc(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    role: []const u8,
+    content: []const u8,
+) ![]types.Message {
+    var out = std.ArrayList(types.Message){};
+    errdefer {
+        for (out.items) |message| {
+            message.deinit(allocator);
+        }
+        out.deinit(allocator);
+    }
+
+    for (messages) |message| {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, message.role),
+            .content = try allocator.dupe(u8, message.content),
+        });
+    }
+
+    try out.append(allocator, .{
+        .role = try allocator.dupe(u8, role),
         .content = try allocator.dupe(u8, content),
     });
 

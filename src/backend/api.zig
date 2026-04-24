@@ -536,6 +536,98 @@ pub fn parseChatRequest(
         null;
     errdefer if (tool_choice) |value| allocator.free(value);
 
+    const loop_mode = if (obj.get("loop_mode")) |loop_mode_value|
+        switch (loop_mode_value) {
+            .string => |value| blk: {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "loop_mode must not be empty",
+                        "loop_mode",
+                        "invalid_loop_mode",
+                    ) };
+                }
+
+                if (!std.ascii.eqlIgnoreCase(trimmed, "basic") and !std.ascii.eqlIgnoreCase(trimmed, "agent")) {
+                    return .{ .err = errors.validationError(
+                        "loop_mode must be one of: basic, agent",
+                        "loop_mode",
+                        "invalid_loop_mode",
+                    ) };
+                }
+
+                break :blk try allocator.dupe(u8, trimmed);
+            },
+            else => return .{ .err = errors.validationError(
+                "loop_mode must be a string",
+                "loop_mode",
+                "invalid_loop_mode",
+            ) },
+        }
+    else if (obj.get("agent_loop")) |agent_loop_value|
+        switch (agent_loop_value) {
+            .bool => |value| if (value) try allocator.dupe(u8, "agent") else null,
+            else => return .{ .err = errors.validationError(
+                "agent_loop must be a boolean",
+                "agent_loop",
+                "invalid_agent_loop",
+            ) },
+        }
+    else
+        null;
+    errdefer if (loop_mode) |value| allocator.free(value);
+
+    const loop_until = if (obj.get("loop_until")) |loop_until_value|
+        switch (loop_until_value) {
+            .string => |value| blk: {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "loop_until must not be empty",
+                        "loop_until",
+                        "invalid_loop_until",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, trimmed);
+            },
+            else => return .{ .err = errors.validationError(
+                "loop_until must be a string",
+                "loop_until",
+                "invalid_loop_until",
+            ) },
+        }
+    else
+        null;
+    errdefer if (loop_until) |value| allocator.free(value);
+
+    const loop_max_turns = if (obj.get("loop_max_turns")) |loop_max_turns_value|
+        switch (loop_max_turns_value) {
+            .integer => |value| blk: {
+                if (value <= 0) {
+                    return .{ .err = errors.validationError(
+                        "loop_max_turns must be a positive integer",
+                        "loop_max_turns",
+                        "invalid_loop_max_turns",
+                    ) };
+                }
+                if (value > 128) {
+                    return .{ .err = errors.validationError(
+                        "loop_max_turns must be <= 128",
+                        "loop_max_turns",
+                        "invalid_loop_max_turns",
+                    ) };
+                }
+                break :blk @as(usize, @intCast(value));
+            },
+            else => return .{ .err = errors.validationError(
+                "loop_max_turns must be a positive integer",
+                "loop_max_turns",
+                "invalid_loop_max_turns",
+            ) },
+        }
+    else
+        null;
+
     if (tool_choice) |choice| {
         if (!isBuiltinToolChoice(choice) and !hasToolNamed(parsed_tools, choice)) {
             deinitParsedRequestParts(
@@ -548,6 +640,8 @@ pub fn parseChatRequest(
                 tenant_id,
                 parsed_tools,
                 tool_choice,
+                loop_mode,
+                loop_until,
             );
             return .{ .err = errors.validationError(
                 "tool_choice must be one of: auto, none, required, or a requested tool name",
@@ -567,6 +661,8 @@ pub fn parseChatRequest(
                 tenant_id,
                 parsed_tools,
                 tool_choice,
+                loop_mode,
+                loop_until,
             );
             return .{ .err = errors.validationError(
                 "tool_choice requires tools unless set to auto or none",
@@ -590,6 +686,9 @@ pub fn parseChatRequest(
         .max_context_tokens = max_context_tokens,
         .tools = parsed_tools,
         .tool_choice = tool_choice,
+        .loop_mode = loop_mode,
+        .loop_until = loop_until,
+        .loop_max_turns = loop_max_turns,
     } };
 }
 
@@ -693,6 +792,8 @@ fn deinitParsedRequestParts(
     tenant_id: ?[]const u8,
     parsed_tools: []const types.Tool,
     tool_choice: ?[]const u8,
+    loop_mode: ?[]const u8,
+    loop_until: ?[]const u8,
 ) void {
     if (provider) |value| allocator.free(value);
 
@@ -713,6 +814,8 @@ fn deinitParsedRequestParts(
     allocator.free(parsed_tools);
 
     if (tool_choice) |value| allocator.free(value);
+    if (loop_mode) |value| allocator.free(value);
+    if (loop_until) |value| allocator.free(value);
 }
 
 fn isSupportedRole(role: []const u8) bool {

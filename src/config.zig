@@ -48,6 +48,7 @@ pub const Config = struct {
     tool_exec_enabled: bool,
     tool_exec_timeout_ms: u32,
     tool_exec_max_output_bytes: usize,
+    loop_stream_progress_enabled: bool,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         return try loadWithOverrides(allocator, null);
@@ -236,6 +237,7 @@ pub const Config = struct {
             .tool_exec_enabled = try getEnvFlag(allocator, "LLM_ROUTER_TOOL_EXEC_ENABLED", env_overrides),
             .tool_exec_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS", 15_000, env_overrides),
             .tool_exec_max_output_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES", 65_536, env_overrides),
+            .loop_stream_progress_enabled = try getEnvFlagOrDefault(allocator, "LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED", true, env_overrides),
         };
     }
 
@@ -436,6 +438,27 @@ fn getEnvFlag(
     return parseBoolFlag(value);
 }
 
+fn getEnvFlagOrDefault(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    default_value: bool,
+    env_overrides: ?*const EnvOverrides,
+) !bool {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return parseBoolFlag(value);
+        }
+    }
+
+    const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return default_value,
+        else => return err,
+    };
+    defer allocator.free(value);
+
+    return parseBoolFlag(value);
+}
+
 fn parseBoolFlag(value: []const u8) bool {
     if (value.len == 0) return false;
     if (std.mem.eql(u8, value, "0")) return false;
@@ -460,7 +483,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
         .ollama_model = try allocator.dupe(u8, "qwen:7b"),
         .ollama_think = false,
-        .ollama_num_predict = 128,
+        .ollama_num_predict = 512,
         .ollama_temperature = 0.7,
         .ollama_repeat_penalty = 1.05,
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
@@ -488,6 +511,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .tool_exec_enabled = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .loop_stream_progress_enabled = true,
     };
     defer cfg.deinit(allocator);
 

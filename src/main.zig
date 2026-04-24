@@ -2,12 +2,18 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+const LoopMode = enum {
+    basic,
+    agent,
+};
+
 /// Parsed CLI options with owned heap-allocated string fields.
 const CliOptions = struct {
     prompt: ?[]u8 = null, // Enables prompt-loop mode when set.
     provider_override: ?[]u8 = null, // Optional provider alias from CLI.
     env_file_path: ?[]u8 = null, // Optional dotenv path loaded before config.
     use_env: bool = false, // Enable dotenv loading.
+    loop_mode: LoopMode = .basic, // Iteration style for prompt loop mode.
     until_marker: []u8, // Loop exits when assistant output contains this marker.
     max_turns: usize = 8, // Safety cap to avoid unbounded loops.
 
@@ -55,7 +61,7 @@ pub fn main() !void {
     }
 
     if (cli.prompt) |prompt| {
-        try runPromptLoop(allocator, &app_config, prompt, cli.until_marker, cli.max_turns);
+        try runPromptLoop(allocator, &app_config, prompt, cli.until_marker, cli.max_turns, cli.loop_mode);
         return;
     }
 
@@ -75,6 +81,17 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
 
     // Support both split flags (`--prompt value`) and inline flags (`--prompt=value`).
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--agent-loop")) {
+            cli.loop_mode = .agent;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--loop-mode")) {
+            const value = args.next() orelse return error.MissingLoopModeValue;
+            cli.loop_mode = try parseLoopMode(value);
+            continue;
+        }
+
         if (std.mem.eql(u8, arg, "--use-env")) {
             cli.use_env = true;
             continue;
@@ -166,9 +183,22 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             cli.use_env = true;
             continue;
         }
+
+        const loop_mode_prefix = "--loop-mode=";
+        if (std.mem.startsWith(u8, arg, loop_mode_prefix)) {
+            const value = arg[loop_mode_prefix.len..];
+            cli.loop_mode = try parseLoopMode(value);
+            continue;
+        }
     }
 
     return cli;
+}
+
+fn parseLoopMode(value: []const u8) !LoopMode {
+    if (std.ascii.eqlIgnoreCase(value, "basic")) return .basic;
+    if (std.ascii.eqlIgnoreCase(value, "agent")) return .agent;
+    return error.InvalidLoopMode;
 }
 
 fn loadDotEnvOverridesAlloc(
@@ -243,6 +273,7 @@ fn runPromptLoop(
     initial_prompt: []const u8,
     until_marker: []const u8,
     max_turns: usize,
+    loop_mode: LoopMode,
 ) !void {
     var conversation = std.ArrayList(root.types.Message){};
     defer {
@@ -252,10 +283,22 @@ fn runPromptLoop(
         conversation.deinit(allocator);
     }
 
+    if (loop_mode == .agent) {
+        try appendConversationMessage(
+            allocator,
+            &conversation,
+            "system",
+            "You are running in an iterative agent loop. Improve the solution every turn. Use concise self-critique before each improvement. When the task is complete, include the completion marker exactly.",
+        );
+    }
+
     try appendConversationMessage(allocator, &conversation, "user", initial_prompt);
 
     var latest_user_prompt = initial_prompt;
     var turn: usize = 0;
+    var repeated_count: usize = 0;
+    var previous_output: ?[]u8 = null;
+    defer if (previous_output) |value| allocator.free(value);
 
     // Duplicate messages for each request so ownership remains local to this call.
     while (turn < max_turns) : (turn += 1) {
@@ -292,12 +335,31 @@ fn runPromptLoop(
             return;
         }
 
+        const normalized_output = std.mem.trim(u8, result.output, " \t\r\n");
+        if (previous_output) |prev| {
+            if (std.mem.eql(u8, prev, normalized_output)) {
+                repeated_count += 1;
+            } else {
+                repeated_count = 0;
+            }
+            allocator.free(prev);
+        }
+        previous_output = try allocator.dupe(u8, normalized_output);
+
+        if (loop_mode == .agent and repeated_count >= 1) {
+            std.debug.print("Loop stopped early: model repeated output without progress.\n", .{});
+            return;
+        }
+
         if (turn + 1 >= max_turns) {
             std.debug.print("Loop stopped after {d} turns without marker '{s}'.\n", .{ max_turns, until_marker });
             return;
         }
 
-        latest_user_prompt = "Continue.";
+        latest_user_prompt = switch (loop_mode) {
+            .basic => "Continue.",
+            .agent => "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result.",
+        };
         try appendConversationMessage(allocator, &conversation, "user", latest_user_prompt);
     }
 }

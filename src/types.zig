@@ -18,6 +18,9 @@ pub const Request = struct {
     max_context_tokens: ?usize = null,
     tools: []Tool,
     tool_choice: ?[]const u8 = null,
+    loop_mode: ?[]const u8 = null,
+    loop_until: ?[]const u8 = null,
+    loop_max_turns: ?usize = null,
 
     /// Releases all owned request allocations.
     ///
@@ -48,6 +51,12 @@ pub const Request = struct {
         allocator.free(self.tools);
         if (self.tool_choice) |tool_choice| {
             allocator.free(tool_choice);
+        }
+        if (self.loop_mode) |loop_mode| {
+            allocator.free(loop_mode);
+        }
+        if (self.loop_until) |loop_until| {
+            allocator.free(loop_until);
         }
     }
 };
