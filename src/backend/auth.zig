@@ -12,8 +12,25 @@ pub fn authorizeRequest(
     if (required_api_key.len == 0) return .allowed;
 
     const supplied_key = findApiKeyFromRequest(request_raw) orelse return .denied;
-    if (std.mem.eql(u8, supplied_key, required_api_key)) return .allowed;
+    if (timingSafeEql(supplied_key, required_api_key)) return .allowed;
     return .denied;
+}
+
+/// Constant-time API key comparison using HMAC-SHA256 digests.
+///
+/// Deriving a fixed-length MAC for each candidate before comparison
+/// eliminates both content timing leaks (early exit on first differing byte)
+/// and length timing leaks (early exit when the two slices have different
+/// lengths).  The context key is public and non-secret; only digest equality
+/// matters for the correctness of the comparison.
+fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    const ctx_key = "zig-coding-agent/auth-key-cmp";
+    var mac_a: [Hmac.mac_length]u8 = undefined;
+    var mac_b: [Hmac.mac_length]u8 = undefined;
+    Hmac.create(&mac_a, a, ctx_key);
+    Hmac.create(&mac_b, b, ctx_key);
+    return std.crypto.utils.timingSafeEql([Hmac.mac_length]u8, mac_a, mac_b);
 }
 
 pub fn findApiKeyFromRequest(request_raw: []const u8) ?[]const u8 {
@@ -50,6 +67,18 @@ fn findHeaderValue(request_raw: []const u8, header_name: []const u8) ?[]const u8
     }
 
     return null;
+}
+
+test "timingSafeEql returns false for different-length keys" {
+    try std.testing.expect(!timingSafeEql("short", "longer-key"));
+}
+
+test "timingSafeEql returns false for same-length keys that differ" {
+    try std.testing.expect(!timingSafeEql("key-aaaa", "key-bbbb"));
+}
+
+test "timingSafeEql returns true for identical keys" {
+    try std.testing.expect(timingSafeEql("secret-api-key", "secret-api-key"));
 }
 
 test "authorizeRequest supports x-api-key and bearer header" {

@@ -95,6 +95,12 @@ pub fn execute(
         .bash => [_][]const u8{ "bash", "-lc", command },
     };
 
+    // TODO(security): `Child.run` blocks until the child exits and provides no
+    // built-in timeout.  A hung command (e.g. `sleep 9999`) will hold the
+    // server's single accept-loop thread open for its entire duration.
+    // Replace this call with `Child.spawn` + async I/O polling + `Child.kill`
+    // once per-connection threading is in place.  Until then, `tool_exec_enabled`
+    // must remain false (the default) in any exposed deployment.
     const run_result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &argv,

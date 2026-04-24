@@ -578,15 +578,16 @@ fn handleConnection(
     }
 
     const provider_elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - provider_started_ms, 0));
+    // Log a warning when the provider exceeded the configured timeout budget, but
+    // do NOT discard the already-completed response.  A post-hoc check cannot
+    // cancel an in-flight HTTP call; discarding a valid result would only confuse
+    // the client.  Real request cancellation requires a concurrent timer and is
+    // tracked as a future improvement.
     if (provider_elapsed_ms > app_config.provider_timeout_ms) {
-        sendApiErrorSafe(
-            connection.*,
-            allocator,
-            backend.errors.providerTransportError("ProviderTimeout"),
-            app_config,
+        logError(
+            "Provider response exceeded timeout budget elapsed_ms={d} timeout_ms={d}",
+            .{ provider_elapsed_ms, app_config.provider_timeout_ms },
         );
-        server_state.failed_requests += 1;
-        return;
     }
 
     if (!result.success) {

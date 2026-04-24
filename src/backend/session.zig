@@ -480,6 +480,10 @@ fn escapeJsonStringAlloc(
             '\n' => try out.appendSlice(allocator, "\\n"),
             '\r' => try out.appendSlice(allocator, "\\r"),
             '\t' => try out.appendSlice(allocator, "\\t"),
+            0x00...0x08, 0x0b...0x0c, 0x0e...0x1f, 0x7f => {
+                // Escape remaining control characters as \uXXXX per RFC 8259.
+                try out.writer(allocator).print("\\u{X:0>4}", .{c});
+            },
             else => try out.append(allocator, c),
         }
     }
