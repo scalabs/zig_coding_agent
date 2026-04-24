@@ -136,26 +136,31 @@ pub const Config = struct {
                 allocator,
                 "OPENROUTER_BASE_URL",
                 "https://openrouter.ai/api/v1",
+                env_overrides,
             ),
             .openrouter_api_key = try getEnvOrDefault(
                 allocator,
                 "OPENROUTER_API_KEY",
                 "",
+                env_overrides,
             ),
             .openrouter_http_referer = try getEnvOrDefault(
                 allocator,
                 "OPENROUTER_HTTP_REFERER",
                 "",
+                env_overrides,
             ),
             .openrouter_app_name = try getEnvOrDefault(
                 allocator,
                 "OPENROUTER_APP_NAME",
                 "",
+                env_overrides,
             ),
             .openrouter_model = try getEnvOrDefault(
                 allocator,
                 "OPENROUTER_MODEL",
                 "openrouter/auto",
+                env_overrides,
             ),
             .claude_base_url = try getEnvOrDefault(
                 allocator,
@@ -179,31 +184,37 @@ pub const Config = struct {
                 allocator,
                 &.{"BEDROCK_RUNTIME_BASE_URL"},
                 "",
+                env_overrides,
             ),
             .bedrock_region = try getFirstEnvOrDefault(
                 allocator,
                 &.{ "BEDROCK_REGION", "AWS_REGION", "AWS_DEFAULT_REGION" },
                 "us-east-1",
+                env_overrides,
             ),
             .bedrock_access_key_id = try getFirstEnvOrDefault(
                 allocator,
                 &.{ "BEDROCK_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID" },
                 "",
+                env_overrides,
             ),
             .bedrock_secret_access_key = try getFirstEnvOrDefault(
                 allocator,
                 &.{ "BEDROCK_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY" },
                 "",
+                env_overrides,
             ),
             .bedrock_session_token = try getFirstEnvOrDefault(
                 allocator,
                 &.{ "BEDROCK_SESSION_TOKEN", "AWS_SESSION_TOKEN" },
                 "",
+                env_overrides,
             ),
             .bedrock_model = try getEnvOrDefault(
                 allocator,
                 "BEDROCK_MODEL",
                 "amazon.nova-micro-v1:0",
+                env_overrides,
             ),
             .llama_cpp_base_url = try getEnvOrDefault(
                 allocator,
@@ -311,12 +322,18 @@ fn getEnvOrDefault(
     };
 }
 
-<<<<<<< HEAD
 fn getFirstEnvOrDefault(
     allocator: std.mem.Allocator,
     keys: []const []const u8,
     default_value: []const u8,
+    env_overrides: ?*const EnvOverrides,
 ) ![]u8 {
+    if (env_overrides) |overrides| {
+        for (keys) |key| {
+            if (overrides.get(key)) |value| return try allocator.dupe(u8, value);
+        }
+    }
+
     for (keys) |key| {
         const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
             error.EnvironmentVariableNotFound => continue,
@@ -329,8 +346,6 @@ fn getFirstEnvOrDefault(
     return try allocator.dupe(u8, default_value);
 }
 
-fn getEnvPortOrDefault(comptime key: []const u8, default_value: u16) !u16 {
-=======
 fn getEnvPortOrDefault(
     comptime key: []const u8,
     default_value: u16,
@@ -342,7 +357,6 @@ fn getEnvPortOrDefault(
         }
     }
 
->>>>>>> 00e62e5 (Added command exectution tool)
     return std.process.parseEnvVarInt(key, u16, 10) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => default_value,
         else => err,

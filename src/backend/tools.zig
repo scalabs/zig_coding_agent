@@ -103,11 +103,14 @@ pub fn maybeExecutePromptToolsAlloc(
         executed_any = true;
     }
 
-    const command_to_run = try extractCommandFromPromptAlloc(allocator, prompt);
-    defer if (command_to_run) |command| allocator.free(command);
+    const cmd_requested = hasRequestedTool(request.tools, "cmd");
+    const bash_requested = hasRequestedTool(request.tools, "bash");
 
-    if (command_to_run) |command| {
-        if (hasRequestedTool(request.tools, "cmd") and shouldUseCmd(prompt)) {
+    if (cmd_requested) {
+        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, prompt);
+        defer if (command_to_run) |command| allocator.free(command);
+
+        if (command_to_run) |command| {
             const cmd_request = try buildSinglePromptRequestAlloc(allocator, command);
             defer cmd_request.deinit(allocator);
 
@@ -116,7 +119,14 @@ pub fn maybeExecutePromptToolsAlloc(
 
             try output.writer(allocator).print("\n[tool=cmd]\n{s}\n", .{cmd_result.output});
             executed_any = true;
-        } else if (hasRequestedTool(request.tools, "bash") and shouldUseBash(prompt)) {
+        }
+    }
+
+    if (!executed_any and bash_requested) {
+        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, prompt);
+        defer if (command_to_run) |command| allocator.free(command);
+
+        if (command_to_run) |command| {
             const bash_request = try buildSinglePromptRequestAlloc(allocator, command);
             defer bash_request.deinit(allocator);
 
@@ -124,15 +134,6 @@ pub fn maybeExecutePromptToolsAlloc(
             defer bash_result.deinit(allocator);
 
             try output.writer(allocator).print("\n[tool=bash]\n{s}\n", .{bash_result.output});
-            executed_any = true;
-        } else if (hasRequestedTool(request.tools, "cmd") and hasRequestedTool(request.tools, "bash")) {
-            const cmd_request = try buildSinglePromptRequestAlloc(allocator, command);
-            defer cmd_request.deinit(allocator);
-
-            const cmd_result = try command_exec_tool.execute(allocator, app_config, cmd_request, .cmd);
-            defer cmd_result.deinit(allocator);
-
-            try output.writer(allocator).print("\n[tool=cmd]\n{s}\n", .{cmd_result.output});
             executed_any = true;
         }
     }
@@ -153,19 +154,6 @@ fn mentionsUtcIntent(prompt: []const u8) bool {
         containsIgnoreCase(prompt, "time");
 }
 
-fn shouldUseCmd(prompt: []const u8) bool {
-    return containsIgnoreCase(prompt, "cmd") or
-        containsIgnoreCase(prompt, "windows") or
-        containsIgnoreCase(prompt, "ping") or
-        containsIgnoreCase(prompt, "command");
-}
-
-fn shouldUseBash(prompt: []const u8) bool {
-    return containsIgnoreCase(prompt, "bash") or
-        containsIgnoreCase(prompt, "shell") or
-        containsIgnoreCase(prompt, "linux");
-}
-
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return indexOfIgnoreCase(haystack, needle) != null;
 }
@@ -181,24 +169,6 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
         }
     }
     return null;
-}
-
-fn extractCommandFromPromptAlloc(
-    allocator: std.mem.Allocator,
-    prompt: []const u8,
-) !?[]u8 {
-    const ping_idx = indexOfIgnoreCase(prompt, "ping ") orelse return null;
-    const tail = prompt[ping_idx..];
-
-    var end = tail.len;
-    if (indexOfIgnoreCase(tail, " command")) |idx| {
-        end = idx;
-    }
-
-    const command_slice = std.mem.trim(u8, tail[0..end], " \t\r\n\"'");
-    if (command_slice.len == 0) return null;
-
-    return try allocator.dupe(u8, command_slice);
 }
 
 fn buildSinglePromptRequestAlloc(
@@ -352,4 +322,45 @@ test "maybeExecutePromptToolsAlloc runs utc from prompt intent" {
 
     try std.testing.expect(summary != null);
     try std.testing.expect(std.mem.indexOf(u8, summary.?, "[tool=utc]") != null);
+}
+
+test "maybeExecutePromptToolsAlloc extracts command for cmd" {
+    if (@import("builtin").os.tag != .windows) return;
+
+    const allocator = std.testing.allocator;
+
+    const messages = try allocator.alloc(types.Message, 1);
+    messages[0] = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = try allocator.dupe(u8, "Run the zig build test command"),
+    };
+
+    const tools = try allocator.alloc(types.Tool, 1);
+    tools[0] = .{
+        .name = try allocator.dupe(u8, "cmd"),
+        .description = try allocator.dupe(u8, "windows command tool"),
+    };
+
+    const req = types.Request{
+        .prompt = try allocator.dupe(u8, "Run the zig build test command"),
+        .messages = messages,
+        .provider = null,
+        .model = null,
+        .session_id = null,
+        .tenant_id = null,
+        .max_context_tokens = null,
+        .tools = tools,
+        .tool_choice = try allocator.dupe(u8, "auto"),
+    };
+    defer req.deinit(allocator);
+
+    var cfg = try command_exec_tool.buildTestConfig(allocator, true);
+    defer cfg.deinit(allocator);
+
+    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg);
+    defer if (summary) |value| allocator.free(value);
+
+    try std.testing.expect(summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.?, "[tool=cmd]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary.?, "command=zig build test") != null);
 }
