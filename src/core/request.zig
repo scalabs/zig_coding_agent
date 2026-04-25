@@ -1,0 +1,189 @@
+//! Manual HTTP request parsing helpers and framed body reader.
+const std = @import("std");
+const errors = @import("../backend/errors.zig");
+
+/// Parses the Content-Length value from a raw HTTP header block.
+///
+/// Args:
+/// - headers: raw request bytes containing request line and headers only.
+///
+/// Returns:
+/// - !usize: parsed body byte length.
+///
+/// Errors:
+/// - returns `error.InvalidHttpRequest` when request line is missing.
+/// - returns `error.MissingContentLength` when header is absent.
+/// - returns `error.InvalidContentLength` for non-numeric values.
+pub fn parseContentLength(headers: []const u8) !usize {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    _ = lines.next() orelse return error.InvalidHttpRequest;
+
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+
+        const separator_index = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..separator_index], " ");
+        const header_value = std.mem.trim(u8, line[separator_index + 1 ..], " ");
+
+        if (std.ascii.eqlIgnoreCase(header_name, "Content-Length")) {
+            return std.fmt.parseInt(usize, header_value, 10) catch {
+                return error.InvalidContentLength;
+            };
+        }
+    }
+
+    return error.MissingContentLength;
+}
+
+/// Returns a slice to the message body portion after the CRLF header separator.
+///
+/// Args:
+/// - request_raw: full raw HTTP request bytes.
+///
+/// Returns:
+/// - ?[]const u8: body slice when separator is present, null otherwise.
+pub fn findBody(request_raw: []const u8) ?[]const u8 {
+    const separator = "\r\n\r\n";
+    const index = std.mem.indexOf(u8, request_raw, separator) orelse return null;
+    return request_raw[index + separator.len ..];
+}
+
+/// Returns the first request line for logging and route parsing.
+///
+/// Args:
+/// - request_raw: full raw HTTP request bytes.
+///
+/// Returns:
+/// - []const u8: slice from start through first CRLF or full buffer if absent.
+pub fn firstRequestLine(request_raw: []const u8) []const u8 {
+    const request_line_end = std.mem.indexOf(u8, request_raw, "\r\n") orelse request_raw.len;
+    return request_raw[0..request_line_end];
+}
+
+pub const ReadHttpRequestError = error{
+    RequestTooLarge,
+    HeadersTooLarge,
+    RequestTimedOut,
+    InvalidHttpRequest,
+    MissingContentLength,
+    InvalidContentLength,
+    IncompleteRequestBody,
+    ClientDisconnected,
+};
+
+/// Reads one complete HTTP request from a connection into an owned buffer.
+///
+/// Args:
+/// - allocator: allocator used for the returned request bytes.
+/// - connection: accepted server connection stream.
+///
+/// Returns:
+/// - ![]u8: owned full request bytes trimmed to header + exact body length.
+///
+/// Errors:
+/// - framing/size errors from `ReadHttpRequestError`.
+/// - stream read and allocation failures.
+pub fn readHttpRequest(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    request_timeout_ms: u32,
+) ![]u8 {
+    const max_request_size = 1024 * 1024;
+    const max_header_size = 16 * 1024;
+
+    const started_ms = std.time.milliTimestamp();
+
+    var request = std.ArrayList(u8){};
+    errdefer request.deinit(allocator);
+
+    var chunk: [4096]u8 = undefined;
+    var header_end: ?usize = null;
+    var total_length: ?usize = null;
+
+    // Read until header parsing reveals the exact required request length.
+    while (true) {
+        const now_ms = std.time.milliTimestamp();
+        const elapsed_ms = now_ms - started_ms;
+        if (elapsed_ms >= request_timeout_ms) {
+            return error.RequestTimedOut;
+        }
+
+        const remaining_ms = request_timeout_ms - @as(u32, @intCast(elapsed_ms));
+        const ready = try waitForReadable(connection.stream.handle, remaining_ms);
+        if (!ready) return error.RequestTimedOut;
+
+        const bytes_read = std.posix.recv(connection.stream.handle, chunk[0..], 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return error.ClientDisconnected,
+        };
+        if (bytes_read == 0) break;
+
+        if (request.items.len + bytes_read > max_request_size) {
+            return error.RequestTooLarge;
+        }
+
+        try request.appendSlice(allocator, chunk[0..bytes_read]);
+
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, request.items, "\r\n\r\n")) |index| {
+                header_end = index + 4;
+
+                const content_length = parseContentLength(request.items[0..index]) catch |err| switch (err) {
+                    error.MissingContentLength => 0,
+                    else => return err,
+                };
+                const required_length = header_end.? + content_length;
+                if (required_length > max_request_size) {
+                    return error.RequestTooLarge;
+                }
+
+                total_length = required_length;
+            } else if (request.items.len > max_header_size) {
+                return error.HeadersTooLarge;
+            }
+        }
+
+        if (total_length) |required_length| {
+            if (request.items.len >= required_length) break;
+        }
+    }
+
+    if (request.items.len == 0) {
+        return try allocator.alloc(u8, 0);
+    }
+
+    if (header_end == null or total_length == null) {
+        return error.InvalidHttpRequest;
+    }
+
+    // Reject truncated bodies rather than passing partial payloads downstream.
+    if (request.items.len < total_length.?) {
+        return error.IncompleteRequestBody;
+    }
+
+    request.items.len = total_length.?;
+    return try request.toOwnedSlice(allocator);
+}
+
+fn waitForReadable(
+    socket: std.posix.socket_t,
+    timeout_ms: u32,
+) !bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = socket,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    const timeout_i32: i32 = if (timeout_ms > @as(u32, @intCast(std.math.maxInt(i32))))
+        std.math.maxInt(i32)
+    else
+        @as(i32, @intCast(timeout_ms));
+
+    const ready_count = std.posix.poll(fds[0..], timeout_i32) catch {
+        return false;
+    };
+    if (ready_count == 0) return false;
+    return true;
+}
