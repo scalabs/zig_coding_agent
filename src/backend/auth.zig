@@ -30,7 +30,7 @@ fn timingSafeEql(a: []const u8, b: []const u8) bool {
     var mac_b: [Hmac.mac_length]u8 = undefined;
     Hmac.create(&mac_a, a, ctx_key);
     Hmac.create(&mac_b, b, ctx_key);
-    return std.crypto.utils.timingSafeEql([Hmac.mac_length]u8, mac_a, mac_b);
+    return std.crypto.timing_safe.eql([Hmac.mac_length]u8, mac_a, mac_b);
 }
 
 pub fn findApiKeyFromRequest(request_raw: []const u8) ?[]const u8 {
