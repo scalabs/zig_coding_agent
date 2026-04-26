@@ -3,7 +3,7 @@ zig-out
 .agents/
 .ollama-qwen-env.example
 .env
-client/*
+__pycache__/
 logs/*
 # General
 .DS_Store
