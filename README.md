@@ -2,7 +2,7 @@
 
 OpenAI-compatible LLM router and prompt-loop runtime written in Zig.
 
-This project exposes a chat-completions API, routes requests across multiple providers, supports optional streaming, and includes built-in loop controls for iterative agent workflows.
+This project exposes a chat-completions API, routes requests across multiple providers, supports optional streaming, and includes built-in loop controls for iterative agent workflows. Scope: **thin, reliable model harness** (see `phase.md` Phase 0 and `plan.md` for the frozen feature set and deferrals).
 
 > [!TIP]
 > Fastest local smoke test:
@@ -19,6 +19,10 @@ This project exposes a chat-completions API, routes requests across multiple pro
 - Optional debug tooling (echo, utc, cmd, bash) with safe defaults.
 - Tool declarations with optional JSON Schema input metadata for compatible providers.
 - Simple deploy surface: single Zig binary, environment-based configuration.
+
+## Scope freeze (Phase 0)
+
+Phase 0 is **complete**: one canonical chat path and response shape, with deferrals listed in `plan.md` (distributed orchestration, deep tenancy/RBAC, heavy observability, plugin marketplaces). Operational routes (`/health`, `/metrics`, `/diagnostics/*`) stay diagnostics-only.
 
 ## Architecture
 
