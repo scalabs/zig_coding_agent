@@ -49,6 +49,7 @@ pub const Config = struct {
     tool_exec_timeout_ms: u32,
     tool_exec_max_output_bytes: usize,
     loop_stream_progress_enabled: bool,
+    max_concurrent_connections: usize,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         return try loadWithOverrides(allocator, null);
@@ -249,6 +250,7 @@ pub const Config = struct {
             .tool_exec_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS", 15_000, env_overrides),
             .tool_exec_max_output_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES", 65_536, env_overrides),
             .loop_stream_progress_enabled = try getEnvFlagOrDefault(allocator, "LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED", true, env_overrides),
+            .max_concurrent_connections = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS", 64, env_overrides),
         };
     }
 
@@ -526,6 +528,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
         .loop_stream_progress_enabled = true,
+        .max_concurrent_connections = 64,
     };
     defer cfg.deinit(allocator);
 
