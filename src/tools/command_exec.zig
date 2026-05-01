@@ -505,6 +505,7 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
         .loop_stream_progress_enabled = true,
+        .max_concurrent_connections = 64,
     };
 }
 

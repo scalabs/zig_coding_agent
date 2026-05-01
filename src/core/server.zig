@@ -11,6 +11,7 @@ const tooling = @import("../backend/tools.zig");
 const session = @import("../backend/session.zig");
 
 const ServerState = struct {
+    mutex: std.Thread.Mutex = .{},
     total_requests: u64 = 0,
     successful_requests: u64 = 0,
     failed_requests: u64 = 0,
@@ -29,12 +30,114 @@ const ServerState = struct {
     }
 
     fn noteClient(self: *ServerState, allocator: std.mem.Allocator, label: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.connected_clients.items) |existing| {
             if (std.mem.eql(u8, existing, label)) return;
         }
 
         try self.connected_clients.append(allocator, try allocator.dupe(u8, label));
     }
+
+    fn noteRequestStarted(self: *ServerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.total_requests += 1;
+    }
+
+    fn noteRequestSucceeded(self: *ServerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.successful_requests += 1;
+    }
+
+    fn noteRequestFailed(self: *ServerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.failed_requests += 1;
+    }
+
+    fn noteConnectionOpened(self: *ServerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active_connections += 1;
+    }
+
+    fn noteConnectionClosed(self: *ServerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active_connections -= 1;
+    }
+
+    fn snapshot(self: *ServerState) Snapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .total_requests = self.total_requests,
+            .successful_requests = self.successful_requests,
+            .failed_requests = self.failed_requests,
+            .active_connections = self.active_connections,
+        };
+    }
+
+    fn knownClientsJsonAlloc(self: *ServerState, allocator: std.mem.Allocator) ![]u8 {
+        var clients_json = std.ArrayList(u8){};
+        errdefer clients_json.deinit(allocator);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try clients_json.append(allocator, '[');
+        for (self.connected_clients.items, 0..) |client, idx| {
+            if (idx > 0) try clients_json.append(allocator, ',');
+            const escaped = try response.escapeJsonStringAlloc(allocator, client);
+            defer allocator.free(escaped);
+            try clients_json.writer(allocator).print("\"{s}\"", .{escaped});
+        }
+        try clients_json.append(allocator, ']');
+        return try clients_json.toOwnedSlice(allocator);
+    }
+};
+
+const Snapshot = struct {
+    total_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+    active_connections: u64,
+};
+
+const ConnectionGate = struct {
+    mutex: std.Thread.Mutex = .{},
+    active: usize = 0,
+    max_active: usize,
+
+    fn tryAcquire(self: *ConnectionGate) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active >= self.max_active) return false;
+        self.active += 1;
+        return true;
+    }
+
+    fn release(self: *ConnectionGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active -= 1;
+    }
+};
+
+const SessionStoreGuard = struct {
+    mutex: std.Thread.Mutex = .{},
+};
+
+const WorkerContext = struct {
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    server_state: *ServerState,
+    tool_registry: *tooling.ToolRegistry,
+    session_store: ?*session.SessionStore,
+    session_store_guard: *SessionStoreGuard,
+    gate: *ConnectionGate,
 };
 
 /// Starts the TCP listener and serves requests indefinitely.
@@ -127,21 +230,55 @@ pub fn run(
 
     const active_session_store: ?*session.SessionStore = if (session_store) |*store| store else null;
 
+    var gate = ConnectionGate{ .max_active = app_config.max_concurrent_connections };
+    var session_store_guard = SessionStoreGuard{};
+    const worker_context = WorkerContext{
+        .allocator = allocator,
+        .app_config = app_config,
+        .server_state = &server_state,
+        .tool_registry = &tool_registry,
+        .session_store = active_session_store,
+        .session_store_guard = &session_store_guard,
+        .gate = &gate,
+    };
+
     while (true) {
-        var connection = try server.accept();
-        defer connection.stream.close();
+        const connection = try server.accept();
+        if (!gate.tryAcquire()) {
+            sendJsonSafe(
+                connection,
+                503,
+                "{\"error\":{\"message\":\"Server is at connection capacity\",\"type\":\"server_error\",\"param\":null,\"code\":\"connection_capacity\"}}",
+                app_config,
+            );
+            connection.stream.close();
+            continue;
+        }
 
-        server_state.active_connections += 1;
-        defer server_state.active_connections -= 1;
-
-        // Client tracking is intentionally disabled in the hot path on Windows
-        // until socket stability issues are fully resolved.
-
-        handleConnection(allocator, app_config, &connection, &server_state, &tool_registry, active_session_store) catch |err| {
-            logError("Request handling error: {s}", .{@errorName(err)});
-            server_state.failed_requests += 1;
-        };
+        var worker = try std.Thread.spawn(.{}, connectionWorkerMain, .{ worker_context, connection });
+        worker.detach();
     }
+}
+
+fn connectionWorkerMain(context: WorkerContext, connection: std.net.Server.Connection) void {
+    defer context.gate.release();
+    var worker_connection = connection;
+    defer worker_connection.stream.close();
+    context.server_state.noteConnectionOpened();
+    defer context.server_state.noteConnectionClosed();
+
+    handleConnection(
+        context.allocator,
+        context.app_config,
+        &worker_connection,
+        context.server_state,
+        context.tool_registry,
+        context.session_store,
+        context.session_store_guard,
+    ) catch |err| {
+        logError("Request handling error: {s}", .{@errorName(err)});
+        context.server_state.noteRequestFailed();
+    };
 }
 
 fn handleConnection(
@@ -151,6 +288,7 @@ fn handleConnection(
     server_state: *ServerState,
     tool_registry: *tooling.ToolRegistry,
     session_store: ?*session.SessionStore,
+    session_store_guard: *SessionStoreGuard,
 ) !void {
     // Translate transport-level parsing failures into OpenAI-style API errors.
     const request_raw = request.readHttpRequest(allocator, connection, app_config.request_timeout_ms) catch |err| switch (err) {
@@ -209,7 +347,7 @@ fn handleConnection(
     defer allocator.free(request_raw);
 
     if (request_raw.len == 0) return;
-    server_state.total_requests += 1;
+    server_state.noteRequestStarted();
 
     debugLog(
         app_config,
@@ -222,19 +360,19 @@ fn handleConnection(
             "Malformed HTTP request",
             "invalid_http_request",
         ), app_config);
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     };
 
     if (route == null) {
         sendApiErrorSafe(connection.*, allocator, backend.errors.notFoundError(), app_config);
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     }
 
     if (requiresAuth(route.?) and auth.authorizeRequest(app_config.auth_api_key, request_raw) == .denied) {
         sendJsonSafe(connection.*, 401, "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth_error\",\"param\":null,\"code\":\"unauthorized\"}}", app_config);
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     }
 
@@ -247,62 +385,57 @@ fn handleConnection(
             );
             defer allocator.free(health_json);
             sendJsonSafe(connection.*, 200, health_json, app_config);
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         },
         .metrics => {
+            const snapshot = server_state.snapshot();
             const metrics_json = try std.fmt.allocPrint(
                 allocator,
                 "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d},\"active_connections\":{d}}}",
                 .{
                     app_config.instance_id,
-                    server_state.total_requests,
-                    server_state.successful_requests,
-                    server_state.failed_requests,
-                    server_state.active_connections,
+                    snapshot.total_requests,
+                    snapshot.successful_requests,
+                    snapshot.failed_requests,
+                    snapshot.active_connections,
                 },
             );
             defer allocator.free(metrics_json);
             sendJsonSafe(connection.*, 200, metrics_json, app_config);
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         },
         .diagnostics_clients => {
-            var clients_json = std.ArrayList(u8){};
-            defer clients_json.deinit(allocator);
-            try clients_json.append(allocator, '[');
-            for (server_state.connected_clients.items, 0..) |client, idx| {
-                if (idx > 0) try clients_json.append(allocator, ',');
-                const escaped = try response.escapeJsonStringAlloc(allocator, client);
-                defer allocator.free(escaped);
-                try clients_json.writer(allocator).print("\"{s}\"", .{escaped});
-            }
-            try clients_json.append(allocator, ']');
+            const snapshot = server_state.snapshot();
+            const clients_json = try server_state.knownClientsJsonAlloc(allocator);
+            defer allocator.free(clients_json);
 
             const payload = try std.fmt.allocPrint(
                 allocator,
                 "{{\"instance_id\":\"{s}\",\"active_connections\":{d},\"known_clients\":{s}}}",
-                .{ app_config.instance_id, server_state.active_connections, clients_json.items },
+                .{ app_config.instance_id, snapshot.active_connections, clients_json },
             );
             defer allocator.free(payload);
             sendJsonSafe(connection.*, 200, payload, app_config);
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         },
         .diagnostics_requests => {
+            const snapshot = server_state.snapshot();
             const payload = try std.fmt.allocPrint(
                 allocator,
                 "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d}}}",
                 .{
                     app_config.instance_id,
-                    server_state.total_requests,
-                    server_state.successful_requests,
-                    server_state.failed_requests,
+                    snapshot.total_requests,
+                    snapshot.successful_requests,
+                    snapshot.failed_requests,
                 },
             );
             defer allocator.free(payload);
             sendJsonSafe(connection.*, 200, payload, app_config);
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         },
         .diagnostics_providers => {
@@ -317,7 +450,7 @@ fn handleConnection(
             defer allocator.free(payload);
 
             sendJsonSafe(connection.*, 200, payload, app_config);
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         },
         .chat_completions => {},
@@ -328,7 +461,7 @@ fn handleConnection(
             "Missing request body",
             "missing_body",
         ), app_config);
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     };
 
@@ -339,7 +472,7 @@ fn handleConnection(
         .ok => |parsed_request| parsed_request,
         .err => |api_error| {
             sendApiErrorSafe(connection.*, allocator, api_error, app_config);
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         },
     };
@@ -351,7 +484,7 @@ fn handleConnection(
             "tools",
             "unknown_tool",
         ), app_config);
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     }
 
@@ -371,10 +504,12 @@ fn handleConnection(
 
     if (session_store) |store| {
         if (parsed_req.session_id) |session_id| {
+            session_store_guard.mutex.lock();
             loaded_session = store.load(allocator, session_id, parsed_req.tenant_id) catch |err| blk: {
                 logError("Session load failed for '{s}': {s}", .{ session_id, @errorName(err) });
                 break :blk null;
             };
+            session_store_guard.mutex.unlock();
 
             if (loaded_session) |state| {
                 if (state.messages.len > 0) {
@@ -429,7 +564,7 @@ fn handleConnection(
                 "stream",
                 "unsupported_stream_provider",
             ), app_config);
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         }
 
@@ -463,24 +598,24 @@ fn handleConnection(
                 app_config.loop_stream_progress_enabled,
             ) catch |err| {
                 logError("Provider stream loop error: {s}", .{@errorName(err)});
-                server_state.failed_requests += 1;
+                server_state.noteRequestFailed();
                 return;
             };
 
-            server_state.successful_requests += 1;
+            server_state.noteRequestSucceeded();
             return;
         }
 
         const ollama_qwen = @import("../providers/ollama_qwen.zig");
         const stream_result = ollama_qwen.streamQwenToSse(connection.*, allocator, app_config, stream_request) catch |err| {
             logError("Provider stream error: {s}", .{@errorName(err)});
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         };
 
         switch (stream_result) {
             .streamed => {
-                server_state.successful_requests += 1;
+                server_state.noteRequestSucceeded();
                 return;
             },
             .failed => |provider_error_response| {
@@ -489,7 +624,7 @@ fn handleConnection(
                     provider_error_response.output,
                     "provider_error",
                 ), app_config);
-                server_state.failed_requests += 1;
+                server_state.noteRequestFailed();
                 return;
             },
         }
@@ -503,7 +638,7 @@ fn handleConnection(
             .{parsed_req.tool_choice orelse "(none)"},
         );
         sendChatCompletionSafe(connection.*, allocator, tool_result, app_config);
-        server_state.successful_requests += 1;
+        server_state.noteRequestSucceeded();
         return;
     }
 
@@ -555,7 +690,7 @@ fn handleConnection(
                 backend.errors.providerTransportError(@errorName(err)),
                 app_config,
             );
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         };
 
@@ -571,7 +706,7 @@ fn handleConnection(
                 backend.errors.providerTransportError(@errorName(err)),
                 app_config,
             );
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         };
         result_ready = true;
@@ -602,7 +737,7 @@ fn handleConnection(
             backend.errors.providerFailureFromDetail(normalized_provider, result.output),
             app_config,
         );
-        server_state.failed_requests += 1;
+        server_state.noteRequestFailed();
         return;
     }
 
@@ -627,7 +762,7 @@ fn handleConnection(
                 ),
                 app_config,
             );
-            server_state.failed_requests += 1;
+            server_state.noteRequestFailed();
             return;
         }
     }
@@ -674,15 +809,17 @@ fn handleConnection(
                 state.message_count = state.messages.len;
                 defer state.deinit(allocator);
 
+                session_store_guard.mutex.lock();
                 store.save(allocator, state) catch |err| {
                     logError("Session save failed for '{s}': {s}", .{ session_id, @errorName(err) });
                 };
+                session_store_guard.mutex.unlock();
             }
         }
     }
 
     sendChatCompletionSafe(connection.*, allocator, result, app_config);
-    server_state.successful_requests += 1;
+    server_state.noteRequestSucceeded();
 }
 
 fn cloneRequestWithMessagesAlloc(
@@ -1161,4 +1298,14 @@ fn logInfo(comptime format: []const u8, args: anytype) void {
 
 fn logError(comptime format: []const u8, args: anytype) void {
     std.debug.print("[error] " ++ format ++ "\n", args);
+}
+
+test "connection gate enforces bounded capacity" {
+    var gate = ConnectionGate{ .max_active = 2 };
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(!gate.tryAcquire());
+
+    gate.release();
+    try std.testing.expect(gate.tryAcquire());
 }
