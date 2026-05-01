@@ -17,6 +17,12 @@ const CommandValidationError = error{
     DangerousPattern,
 };
 
+const PipeCapture = struct {
+    bytes: []u8 = &.{},
+    err_name: ?[]const u8 = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 pub fn execute(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -95,17 +101,12 @@ pub fn execute(
         .bash => [_][]const u8{ "bash", "-lc", command },
     };
 
-    // TODO(security): `Child.run` blocks until the child exits and provides no
-    // built-in timeout.  A hung command (e.g. `sleep 9999`) will hold the
-    // server's single accept-loop thread open for its entire duration.
-    // Replace this call with `Child.spawn` + async I/O polling + `Child.kill`
-    // once per-connection threading is in place.  Until then, `tool_exec_enabled`
-    // must remain false (the default) in any exposed deployment.
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &argv,
-        .max_output_bytes = app_config.tool_exec_max_output_bytes,
-    }) catch |err| {
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
         return try makeToolResponse(
             allocator,
             tool_name,
@@ -116,8 +117,55 @@ pub fn execute(
             ),
         );
     };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
+
+    var stdout_capture = PipeCapture{};
+    var stderr_capture = PipeCapture{};
+
+    var stdout_thread: ?std.Thread = null;
+    var stderr_thread: ?std.Thread = null;
+
+    if (child.stdout) |stdout_file| {
+        stdout_thread = try std.Thread.spawn(.{}, capturePipeMain, .{
+            &stdout_capture,
+            stdout_file,
+            app_config.tool_exec_max_output_bytes,
+        });
+    } else {
+        stdout_capture.done.store(true, .release);
+    }
+    if (child.stderr) |stderr_file| {
+        stderr_thread = try std.Thread.spawn(.{}, capturePipeMain, .{
+            &stderr_capture,
+            stderr_file,
+            app_config.tool_exec_max_output_bytes,
+        });
+    } else {
+        stderr_capture.done.store(true, .release);
+    }
+
+    const timeout_deadline = start_ms + @as(i64, app_config.tool_exec_timeout_ms);
+    var timed_out = false;
+    while (true) {
+        const stdout_done = stdout_capture.done.load(.acquire);
+        const stderr_done = stderr_capture.done.load(.acquire);
+        if (stdout_done and stderr_done) break;
+        if (std.time.milliTimestamp() >= timeout_deadline) {
+            timed_out = true;
+            break;
+        }
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }
+
+    const terminated_as: std.process.Child.Term = if (timed_out)
+        child.kill() catch .{ .Unknown = 1 }
+    else
+        child.wait() catch .{ .Unknown = 1 };
+
+    if (stdout_thread) |thread| thread.join();
+    if (stderr_thread) |thread| thread.join();
+
+    defer if (stdout_capture.bytes.len > 0) std.heap.page_allocator.free(stdout_capture.bytes);
+    defer if (stderr_capture.bytes.len > 0) std.heap.page_allocator.free(stderr_capture.bytes);
 
     const end_ms = std.time.milliTimestamp();
     const duration_ms = if (end_ms >= start_ms)
@@ -125,13 +173,26 @@ pub fn execute(
     else
         @as(u64, 0);
 
-    const term_text = try childTermToTextAlloc(allocator, run_result.term);
+    const term_text = try childTermToTextAlloc(allocator, terminated_as);
     defer allocator.free(term_text);
 
-    const status_tag = if (isSuccessfulTermination(run_result.term)) "DEBUG_TOOL_OK" else "DEBUG_TOOL_ERROR";
+    const status_tag = if (!timed_out and isSuccessfulTermination(terminated_as)) "DEBUG_TOOL_OK" else "DEBUG_TOOL_ERROR";
+    const timeout_exceeded_text = if (timed_out) "true" else "false";
+    const stdout_text = if (stdout_capture.err_name) |err_name|
+        try std.fmt.allocPrint(allocator, "read_error={s}", .{err_name})
+    else
+        try allocator.dupe(u8, stdout_capture.bytes);
+    defer allocator.free(stdout_text);
+
+    const stderr_text = if (stderr_capture.err_name) |err_name|
+        try std.fmt.allocPrint(allocator, "read_error={s}", .{err_name})
+    else
+        try allocator.dupe(u8, stderr_capture.bytes);
+    defer allocator.free(stderr_text);
+
     const output = try std.fmt.allocPrint(
         allocator,
-        "{s}\ntool={s}\nterm={s}\nduration_ms={d}\nmax_output_bytes={d}\ntimeout_policy_ms={d}\ntimeout_enforced=false\ncommand={s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}",
+        "{s}\ntool={s}\nterm={s}\nduration_ms={d}\nmax_output_bytes={d}\ntimeout_policy_ms={d}\ntimeout_enforced=true\ntimeout_exceeded={s}\ncode={s}\ncommand={s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}",
         .{
             status_tag,
             tool_name,
@@ -139,13 +200,24 @@ pub fn execute(
             duration_ms,
             app_config.tool_exec_max_output_bytes,
             app_config.tool_exec_timeout_ms,
+            timeout_exceeded_text,
+            if (timed_out) "command_timeout" else "command_completed",
             command,
-            run_result.stdout,
-            run_result.stderr,
+            stdout_text,
+            stderr_text,
         },
     );
 
     return try makeToolResponse(allocator, tool_name, output);
+}
+
+fn capturePipeMain(capture: *PipeCapture, file: std.fs.File, max_bytes: usize) void {
+    defer capture.done.store(true, .release);
+    capture.bytes = file.readToEndAlloc(std.heap.page_allocator, max_bytes) catch |err| {
+        capture.err_name = @errorName(err);
+        capture.bytes = &.{};
+        return;
+    };
 }
 
 pub fn extractCommandFromPromptAlloc(
@@ -620,4 +692,40 @@ test "execute cmd tool blocks dangerous denylist command" {
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "denylist") != null);
+}
+
+test "execute cmd tool enforces timeout and kills process" {
+    if (@import("builtin").os.tag != .windows) return;
+
+    const allocator = std.testing.allocator;
+    var cfg = try buildTestConfig(allocator, true);
+    defer cfg.deinit(allocator);
+    cfg.tool_exec_timeout_ms = 200;
+
+    const messages = try allocator.alloc(types.Message, 1);
+    messages[0] = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = try allocator.dupe(u8, "powershell -NoProfile -Command Start-Sleep -Seconds 3"),
+    };
+
+    const req = types.Request{
+        .prompt = try allocator.dupe(u8, "powershell -NoProfile -Command Start-Sleep -Seconds 3"),
+        .messages = messages,
+        .provider = null,
+        .model = null,
+        .session_id = null,
+        .tenant_id = null,
+        .max_context_tokens = null,
+        .tools = try allocator.alloc(types.Tool, 0),
+        .tool_choice = null,
+    };
+    defer req.deinit(allocator);
+
+    var result = try execute(allocator, &cfg, req, .cmd);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeout_enforced=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeout_exceeded=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "code=command_timeout") != null);
 }
