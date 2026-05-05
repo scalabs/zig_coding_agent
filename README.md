@@ -180,16 +180,16 @@ Loop controls:
 
 ## ReAct Mode
 
-ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn. Both CLI prompt loops and request-level loops support loop_mode=react.
+ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn.
 
 ### Available Actions
 
-| Action    | Description                       | Requirements                             |
-| --------- | --------------------------------- | ---------------------------------------- |
-| Search[q] | Search for information (stub)     | None (future: wire to search tool/API)   |
-| Lookup[t] | Look up a term in context (stub)  | None (future: wire to retrieval backend) |
-| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`         |
-| Finish[a] | Return final answer and stop loop | None                                     |
+| Action | Description | Requirements |
+| --------- | -------------------------------- | --------------------------------------- |
+| Search[q] | Search for information (stub) | None (future: wire to search tool/API) |
+| Lookup[t] | Look up a term in context (stub) | None (future: wire to retrieval backend) |
+| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`       |
+| Finish[a] | Return final answer and stop loop | None                                    |
 
 > [!NOTE]
 > Search and Lookup return stub responses. They are designed as extension points for future tool/API integration.
@@ -204,12 +204,7 @@ zig build run -- --react --prompt "What is the elevation range of the High Plain
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": "What is the elevation range of the High Plains?"
-    }
-  ],
+  "messages": [{ "role": "user", "content": "What is the elevation range of the High Plains?" }],
   "loop_mode": "react",
   "loop_max_turns": 10
 }
@@ -229,8 +224,6 @@ Observation 1: <result from action execution>
 ```
 
 This continues until the model emits `Action N: Finish[answer]` or the turn budget is exhausted.
-
-ReAct parsing scans the last Action line in the model output. The turn number is optional, action names are case-insensitive, and arguments must be wrapped in brackets. Finish must contain only the final answer text, for example `Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]`.
 
 ## Tools
 

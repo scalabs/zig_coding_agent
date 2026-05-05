@@ -1,8 +1,3 @@
-//! HTTP request parsing and validation for the chat completions endpoint.
-//!
-//! Deserializes incoming JSON into typed request structs, validates required
-//! fields, and normalizes provider aliases to canonical IDs.
-
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -495,61 +490,9 @@ pub fn parseChatRequest(
                     else
                         "";
 
-                    const input_schema_json = if (tool_obj.get("input_schema")) |input_schema_value|
-                        switch (input_schema_value) {
-                            .string => |value| input_schema_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :input_schema_blk null;
-                                break :input_schema_blk try allocator.dupe(u8, trimmed);
-                            },
-                            else => return .{ .err = errors.validationError(
-                                "tool.input_schema must be a string when provided",
-                                "tools",
-                                "invalid_tools",
-                            ) },
-                        }
-                    else if (tool_obj.get("parameters")) |parameters_value|
-                        switch (parameters_value) {
-                            .string => |value| parameters_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :parameters_blk null;
-                                break :parameters_blk try allocator.dupe(u8, trimmed);
-                            },
-                            else => return .{ .err = errors.validationError(
-                                "tool.parameters must be a string when provided",
-                                "tools",
-                                "invalid_tools",
-                            ) },
-                        }
-                    else if (tool_obj.get("schema")) |schema_value|
-                        switch (schema_value) {
-                            .string => |value| schema_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :schema_blk null;
-                                break :schema_blk try allocator.dupe(u8, trimmed);
-                            },
-                            else => return .{ .err = errors.validationError(
-                                "tool.schema must be a string when provided",
-                                "tools",
-                                "invalid_tools",
-                            ) },
-                        }
-                    else
-                        null;
-
-                    if (input_schema_json) |schema| {
-                        const schema_parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return .{ .err = errors.validationError(
-                            "tool input_schema must be valid JSON",
-                            "tools",
-                            "invalid_tools",
-                        ) };
-                        schema_parsed.deinit();
-                    }
-
                     try tools.append(allocator, .{
                         .name = try allocator.dupe(u8, trimmed_name),
                         .description = try allocator.dupe(u8, description),
-                        .input_schema_json = input_schema_json,
                     });
                 }
 

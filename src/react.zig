@@ -3,7 +3,7 @@
 //! Implements the Thought → Action → Observation paradigm from Yao et al., 2022.
 //! The model produces structured Thought/Action pairs, the harness executes the
 //! action and injects the result as an Observation, and the cycle repeats until
-//! the model emits Finish[its final answer] or the turn budget is exhausted.
+//! the model emits Finish[answer] or the turn budget is exhausted.
 const std = @import("std");
 const config = @import("config.zig");
 const types = @import("types.zig");
@@ -22,13 +22,11 @@ pub const system_prompt =
     "  Search[query]   - search for information\n" ++
     "  Lookup[term]    - look up a term in the current context\n" ++
     "  Cmd[command]    - execute a shell command (only if tools are enabled)\n" ++
-    "  Finish[your final answer]  - return the final answer and end the loop\n" ++
-    "    Example: Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]\n" ++
-    "    Syntax: Finish[place ONLY your answer here, no extra text]\n\n" ++
+    "  Finish[answer]  - return the final answer and end the loop\n\n" ++
     "Rules:\n" ++
     "- Always start with a Thought, then an Action.\n" ++
     "- Never produce an Observation yourself; the system provides them.\n" ++
-    "- Use Finish[answer] when complete. Replace 'answer' with your actual result, not the word 'answer'.\n" ++
+    "- Use Finish[answer] when you have the final answer.\n" ++
     "- Be concrete: use specific names, values, steps, and short outputs instead of vague summaries.\n" ++
     "- If you need information, ask for the exact term or command that will resolve it.\n" ++
     "- If an action fails, adjust your approach in the next Thought.\n";
@@ -52,6 +50,7 @@ pub const ReactAction = union(enum) {
 /// - Greedy bracket matching: takes everything up to the last `]` on the line.
 /// - Returns `null` when no action line is found.
 pub fn parseReactAction(output: []const u8) ?ReactAction {
+    // Scan backwards through lines to find the last Action directive.
     var last_action_line: ?[]const u8 = null;
     var lines = std.mem.splitAny(u8, output, "\n\r");
     while (lines.next()) |raw_line| {
