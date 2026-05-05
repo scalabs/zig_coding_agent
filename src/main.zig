@@ -1,10 +1,12 @@
 //! CLI entrypoint for running the router in server mode or prompt-loop mode.
 const std = @import("std");
 const root = @import("root.zig");
+const react = @import("react.zig");
 
 const LoopMode = enum {
     basic,
     agent,
+    react,
 };
 
 /// Parsed CLI options with owned heap-allocated string fields.
@@ -83,6 +85,11 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--agent-loop")) {
             cli.loop_mode = .agent;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--react")) {
+            cli.loop_mode = .react;
             continue;
         }
 
@@ -198,6 +205,7 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
 fn parseLoopMode(value: []const u8) !LoopMode {
     if (std.ascii.eqlIgnoreCase(value, "basic")) return .basic;
     if (std.ascii.eqlIgnoreCase(value, "agent")) return .agent;
+    if (std.ascii.eqlIgnoreCase(value, "react")) return .react;
     return error.InvalidLoopMode;
 }
 
@@ -290,11 +298,19 @@ fn runPromptLoop(
             "system",
             "You are running in an iterative agent loop. Improve the solution every turn. Use concise self-critique before each improvement. When the task is complete, include the completion marker exactly.",
         );
+    } else if (loop_mode == .react) {
+        try appendConversationMessage(
+            allocator,
+            &conversation,
+            "system",
+            react.system_prompt,
+        );
     }
 
     try appendConversationMessage(allocator, &conversation, "user", initial_prompt);
 
-    var latest_user_prompt = initial_prompt;
+    var latest_user_prompt = try allocator.dupe(u8, initial_prompt);
+    defer allocator.free(latest_user_prompt);
     var turn: usize = 0;
     var repeated_count: usize = 0;
     var previous_output: ?[]u8 = null;
@@ -346,7 +362,7 @@ fn runPromptLoop(
         }
         previous_output = try allocator.dupe(u8, normalized_output);
 
-        if (loop_mode == .agent and repeated_count >= 1) {
+        if ((loop_mode == .agent or loop_mode == .react) and repeated_count >= 1) {
             std.debug.print("Loop stopped early: model repeated output without progress.\n", .{});
             return;
         }
@@ -356,11 +372,55 @@ fn runPromptLoop(
             return;
         }
 
-        latest_user_prompt = switch (loop_mode) {
-            .basic => "Continue.",
-            .agent => "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result.",
-        };
-        try appendConversationMessage(allocator, &conversation, "user", latest_user_prompt);
+        if (loop_mode == .react) {
+            // ReAct mode: parse the Action, execute it, inject the Observation.
+            const parsed_action = react.parseReactAction(result.output);
+            if (parsed_action) |action| {
+                switch (action) {
+                    .finish => |answer| {
+                        std.debug.print("ReAct finished:\n{s}\n", .{answer});
+                        return;
+                    },
+                    else => {
+                        const observation_raw = try react.executeReactAction(allocator, action, app_config);
+                        defer allocator.free(observation_raw);
+
+                        const observation = try react.formatObservation(allocator, turn + 1, observation_raw);
+                        defer allocator.free(observation);
+
+                        std.debug.print("{s}\n\n", .{observation});
+
+                        allocator.free(latest_user_prompt);
+                        latest_user_prompt = observation;
+                        try appendConversationMessage(allocator, &conversation, "user", observation);
+                    },
+                }
+            } else {
+                // No parseable action found. Give the model a hint.
+                const hint = try react.formatObservation(
+                    allocator,
+                    turn + 1,
+                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                );
+                defer allocator.free(hint);
+
+                std.debug.print("{s}\n\n", .{hint});
+                allocator.free(latest_user_prompt);
+                latest_user_prompt = hint;
+                try appendConversationMessage(allocator, &conversation, "user", hint);
+            }
+        } else {
+            allocator.free(latest_user_prompt);
+            latest_user_prompt = try allocator.dupe(
+                u8,
+                switch (loop_mode) {
+                    .basic => "Continue.",
+                    .agent => "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result.",
+                    .react => unreachable,
+                },
+            );
+            try appendConversationMessage(allocator, &conversation, "user", latest_user_prompt);
+        }
     }
 }
 
