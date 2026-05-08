@@ -5,6 +5,7 @@ zig-out
 .env
 __pycache__/
 logs/*
+tmp/
 # General
 .DS_Store
 __MACOSX/

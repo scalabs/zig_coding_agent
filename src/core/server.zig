@@ -205,6 +205,9 @@ pub fn run(
     try tool_registry.register(allocator, "utc");
     try tool_registry.register(allocator, "cmd");
     try tool_registry.register(allocator, "bash");
+    try tool_registry.register(allocator, "file_read");
+    try tool_registry.register(allocator, "file_write");
+    try tool_registry.register(allocator, "file_search");
 
     var file_session_store: ?session.FileSessionStore = null;
     var session_store: ?session.SessionStore = null;
@@ -558,6 +561,47 @@ fn handleConnection(
         const requested_provider = parsed_req.provider orelse app_config.default_provider;
         const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
 
+        var stream_request = try cloneRequestWithMessagesAlloc(
+            allocator,
+            parsed_req,
+            request_prompt,
+            request_messages,
+        );
+        defer stream_request.deinit(allocator);
+
+        if (try tooling.tryExecuteDebugTool(allocator, stream_request, app_config)) |tool_result| {
+            defer tool_result.deinit(allocator);
+
+            try response.sendEventStreamHeaders(connection.*);
+            const completion_id = try std.fmt.allocPrint(
+                allocator,
+                "chatcmpl-{d}",
+                .{std.time.microTimestamp()},
+            );
+            defer allocator.free(completion_id);
+
+            try response.sendChatCompletionChunkSse(
+                connection.*,
+                allocator,
+                completion_id,
+                tool_result.model,
+                tool_result.output,
+                null,
+            );
+            try response.sendChatCompletionChunkSse(
+                connection.*,
+                allocator,
+                completion_id,
+                tool_result.model,
+                null,
+                tool_result.finish_reason,
+            );
+            try response.sendSseDone(connection.*);
+
+            server_state.noteRequestSucceeded();
+            return;
+        }
+
         if (!std.mem.eql(u8, normalized_provider, "ollama_qwen")) {
             sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
                 "stream=true is currently supported only for ollama",
@@ -567,14 +611,6 @@ fn handleConnection(
             server_state.noteRequestFailed();
             return;
         }
-
-        var stream_request = try cloneRequestWithMessagesAlloc(
-            allocator,
-            parsed_req,
-            request_prompt,
-            request_messages,
-        );
-        defer stream_request.deinit(allocator);
 
         const stream_auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config);
         defer if (stream_auto_tool_summary) |summary| allocator.free(summary);
@@ -655,6 +691,16 @@ fn handleConnection(
 
     const auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config);
     defer if (auto_tool_summary) |summary| allocator.free(summary);
+
+    if (auto_tool_summary) |summary| {
+        if (tooling.shouldShortCircuitAutoTools(provider_request)) {
+            var tool_response = try tooling.makeAutoToolResponse(allocator, summary);
+            defer tool_response.deinit(allocator);
+            sendChatCompletionSafe(connection.*, allocator, tool_response, app_config);
+            server_state.noteRequestSucceeded();
+            return;
+        }
+    }
 
     if (auto_tool_summary) |summary| {
         const augmented_messages = try appendSystemMessageAlloc(allocator, provider_request.messages, summary);

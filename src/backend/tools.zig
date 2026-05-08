@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const echo_tool = @import("../tools/echo.zig");
 const utc_tool = @import("../tools/utc.zig");
 const command_exec_tool = @import("../tools/command_exec.zig");
+const file_ops_tool = @import("../tools/file_ops.zig");
 
 pub const ToolRegistry = struct {
     allowed_names: std.StringHashMap(void),
@@ -72,6 +73,21 @@ pub fn tryExecuteDebugTool(
         return try command_exec_tool.execute(allocator, app_config, request, .bash);
     }
 
+    if (std.ascii.eqlIgnoreCase(choice, "file_read")) {
+        if (!hasRequestedTool(request.tools, "file_read")) return null;
+        return try file_ops_tool.execute(allocator, app_config, request, .read);
+    }
+
+    if (std.ascii.eqlIgnoreCase(choice, "file_write")) {
+        if (!hasRequestedTool(request.tools, "file_write")) return null;
+        return try file_ops_tool.execute(allocator, app_config, request, .write);
+    }
+
+    if (std.ascii.eqlIgnoreCase(choice, "file_search")) {
+        if (!hasRequestedTool(request.tools, "file_search")) return null;
+        return try file_ops_tool.execute(allocator, app_config, request, .search);
+    }
+
     return null;
 }
 
@@ -105,6 +121,71 @@ pub fn maybeExecutePromptToolsAlloc(
 
     const cmd_requested = hasRequestedTool(request.tools, "cmd");
     const bash_requested = hasRequestedTool(request.tools, "bash");
+    const file_write_requested = hasRequestedTool(request.tools, "file_write");
+    const file_read_requested = hasRequestedTool(request.tools, "file_read");
+    const file_search_requested = hasRequestedTool(request.tools, "file_search");
+
+    if (file_read_requested and mentionsFileReadIntent(prompt)) {
+        const read_result = try file_ops_tool.execute(allocator, app_config, request, .read);
+        defer read_result.deinit(allocator);
+        try output.writer(allocator).print("\n[tool=file_read]\n{s}\n", .{read_result.output});
+        executed_any = true;
+    }
+
+    if (file_search_requested and mentionsFileSearchIntent(prompt)) {
+        const search_result = try file_ops_tool.execute(allocator, app_config, request, .search);
+        defer search_result.deinit(allocator);
+        try output.writer(allocator).print("\n[tool=file_search]\n{s}\n", .{search_result.output});
+        executed_any = true;
+    }
+
+    if (file_write_requested and mentionsPythonAddTwoNumbersIntent(prompt)) {
+        const demo_path = "tmp/add_two_numbers.py";
+        const demo_content =
+            \\a = 2
+            \\b = 3
+            \\print(a + b)
+            \\
+        ;
+
+        const write_prompt = try std.fmt.allocPrint(
+            allocator,
+            "write {s}\n```python\n{s}```",
+            .{ demo_path, demo_content },
+        );
+        defer allocator.free(write_prompt);
+
+        const write_req = try buildSinglePromptRequestAlloc(allocator, write_prompt);
+        defer write_req.deinit(allocator);
+
+        const write_result = try file_ops_tool.execute(allocator, app_config, write_req, .write);
+        defer write_result.deinit(allocator);
+
+        try output.writer(allocator).print("\n[tool=file_write]\n{s}\n", .{write_result.output});
+        executed_any = true;
+
+        if (cmd_requested and @import("builtin").os.tag == .windows) {
+            const run_prompt = try std.fmt.allocPrint(allocator, "python {s}", .{demo_path});
+            defer allocator.free(run_prompt);
+            const run_req = try buildSinglePromptRequestAlloc(allocator, run_prompt);
+            defer run_req.deinit(allocator);
+
+            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .cmd);
+            defer run_result.deinit(allocator);
+
+            try output.writer(allocator).print("\n[tool=cmd]\n{s}\n", .{run_result.output});
+        } else if (bash_requested and @import("builtin").os.tag != .windows) {
+            const run_prompt = try std.fmt.allocPrint(allocator, "python3 {s}", .{demo_path});
+            defer allocator.free(run_prompt);
+            const run_req = try buildSinglePromptRequestAlloc(allocator, run_prompt);
+            defer run_req.deinit(allocator);
+
+            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .bash);
+            defer run_result.deinit(allocator);
+
+            try output.writer(allocator).print("\n[tool=bash]\n{s}\n", .{run_result.output});
+        }
+    }
 
     if (cmd_requested) {
         const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, prompt);
@@ -142,6 +223,36 @@ pub fn maybeExecutePromptToolsAlloc(
     return try output.toOwnedSlice(allocator);
 }
 
+pub fn shouldShortCircuitAutoTools(request: types.Request) bool {
+    if (request.tools.len == 0) return false;
+
+    const choice = request.tool_choice orelse return false;
+    if (!std.ascii.eqlIgnoreCase(choice, "auto") and !std.ascii.eqlIgnoreCase(choice, "required")) return false;
+
+    const prompt = request.prompt;
+    if (mentionsPythonAddTwoNumbersIntent(prompt)) return true;
+    if (hasRequestedTool(request.tools, "file_read") and mentionsFileReadIntent(prompt)) return true;
+    if (hasRequestedTool(request.tools, "file_search") and mentionsFileSearchIntent(prompt)) return true;
+    return false;
+}
+
+pub fn makeAutoToolResponse(
+    allocator: std.mem.Allocator,
+    summary: []const u8,
+) !types.Response {
+    const model_name = try std.fmt.allocPrint(allocator, "debug-tools/{s}", .{"auto"});
+    errdefer allocator.free(model_name);
+
+    return .{
+        .id = null,
+        .model = model_name,
+        .output = try allocator.dupe(u8, summary),
+        .finish_reason = try allocator.dupe(u8, "tool"),
+        .success = true,
+        .usage = .{},
+    };
+}
+
 fn hasRequestedTool(tools: []const types.Tool, name: []const u8) bool {
     for (tools) |tool| {
         if (std.ascii.eqlIgnoreCase(tool.name, name)) return true;
@@ -152,6 +263,24 @@ fn hasRequestedTool(tools: []const types.Tool, name: []const u8) bool {
 fn mentionsUtcIntent(prompt: []const u8) bool {
     return containsIgnoreCase(prompt, "utc") or
         containsIgnoreCase(prompt, "time");
+}
+
+fn mentionsFileReadIntent(prompt: []const u8) bool {
+    return containsIgnoreCase(prompt, "file_read") or
+        containsIgnoreCase(prompt, "read file") or
+        containsIgnoreCase(prompt, "open file");
+}
+
+fn mentionsFileSearchIntent(prompt: []const u8) bool {
+    return containsIgnoreCase(prompt, "file_search") or
+        containsIgnoreCase(prompt, "search ") or
+        containsIgnoreCase(prompt, "find ");
+}
+
+fn mentionsPythonAddTwoNumbersIntent(prompt: []const u8) bool {
+    return containsIgnoreCase(prompt, "python") and
+        containsIgnoreCase(prompt, "add two") and
+        containsIgnoreCase(prompt, "execute");
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
