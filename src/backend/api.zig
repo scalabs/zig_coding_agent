@@ -548,9 +548,9 @@ pub fn parseChatRequest(
                     ) };
                 }
 
-                if (!std.ascii.eqlIgnoreCase(trimmed, "basic") and !std.ascii.eqlIgnoreCase(trimmed, "agent")) {
+                if (!std.ascii.eqlIgnoreCase(trimmed, "basic") and !std.ascii.eqlIgnoreCase(trimmed, "agent") and !std.ascii.eqlIgnoreCase(trimmed, "react")) {
                     return .{ .err = errors.validationError(
-                        "loop_mode must be one of: basic, agent",
+                        "loop_mode must be one of: basic, agent, react",
                         "loop_mode",
                         "invalid_loop_mode",
                     ) };

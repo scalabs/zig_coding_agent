@@ -163,10 +163,58 @@ Loop controls:
 - --provider <name> provider override
 - --until <marker> completion marker (default: DONE)
 - --max-turns <n> loop safety cap (default: 8)
-- --loop-mode <basic|agent> loop style
+- --loop-mode <basic|agent|react> loop style
 - --agent-loop shorthand for agent mode
+- --react shorthand for ReAct reasoning mode
 - --use-env load .env
 - --env-file <path> load a custom dotenv file
+
+## ReAct Mode
+
+ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn.
+
+### Available Actions
+
+| Action | Description | Requirements |
+| --------- | -------------------------------- | --------------------------------------- |
+| Search[q] | Search for information (stub) | None (future: wire to search tool/API) |
+| Lookup[t] | Look up a term in context (stub) | None (future: wire to retrieval backend) |
+| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`       |
+| Finish[a] | Return final answer and stop loop | None                                    |
+
+> [!NOTE]
+> Search and Lookup return stub responses. They are designed as extension points for future tool/API integration.
+
+### CLI Example
+
+```bash
+zig build run -- --react --prompt "What is the elevation range of the High Plains?" --provider ollama
+```
+
+### API Example
+
+```json
+{
+  "messages": [{ "role": "user", "content": "What is the elevation range of the High Plains?" }],
+  "loop_mode": "react",
+  "loop_max_turns": 10
+}
+```
+
+The model will produce output like:
+
+```
+Thought 1: I need to search for the High Plains elevation range.
+Action 1: Search[High Plains elevation]
+```
+
+The system injects:
+
+```
+Observation 1: <result from action execution>
+```
+
+This continues until the model emits `Action N: Finish[answer]` or the turn budget is exhausted.
 
 ## Tools
 
@@ -330,6 +378,7 @@ zig_coding_agent
     │   ├── openai.zig
     │   ├── openai_compatible.zig
     │   └── openrouter.zig
+    ├── react.zig
     ├── root.zig
     ├── tools
     │   ├── command_exec.zig

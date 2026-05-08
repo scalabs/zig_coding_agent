@@ -9,6 +9,7 @@ const backend = @import("../backend/api.zig");
 const auth = @import("../backend/auth.zig");
 const tooling = @import("../backend/tools.zig");
 const session = @import("../backend/session.zig");
+const react = @import("../react.zig");
 
 const ServerState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -964,6 +965,18 @@ fn streamLoopRequestToSse(
         }
         allocator.free(working_messages);
         working_messages = with_guidance;
+    } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
+        const with_react = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            react.system_prompt,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_react;
     }
 
     var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
@@ -1032,10 +1045,38 @@ fn streamLoopRequestToSse(
         }
         previous_output = try allocator.dupe(u8, normalized_output);
 
+        const is_react_mode = std.ascii.eqlIgnoreCase(loop_mode, "react");
         const reached_until = std.mem.indexOf(u8, turn_result.output, loop_until) != null;
         const reached_max = (turn + 1) >= loop_max_turns;
-        const repeated_stop = std.ascii.eqlIgnoreCase(loop_mode, "agent") and repeated_count >= 1;
-        const should_stop = reached_until or reached_max or repeated_stop or !turn_result.success;
+        const repeated_stop = (std.ascii.eqlIgnoreCase(loop_mode, "agent") or is_react_mode) and repeated_count >= 1;
+
+        // ReAct: check for Finish action before standard stop checks.
+        var react_finished = false;
+        var react_observation: ?[]u8 = null;
+        defer if (react_observation) |obs| allocator.free(obs);
+
+        if (is_react_mode) {
+            if (react.parseReactAction(turn_result.output)) |action| {
+                switch (action) {
+                    .finish => {
+                        react_finished = true;
+                    },
+                    else => {
+                        const obs_raw = try react.executeReactAction(allocator, action, app_config);
+                        defer allocator.free(obs_raw);
+                        react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
+                    },
+                }
+            } else {
+                react_observation = try react.formatObservation(
+                    allocator,
+                    turn + 1,
+                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                );
+            }
+        }
+
+        const should_stop = react_finished or reached_until or reached_max or repeated_stop or !turn_result.success;
 
         if (should_stop) {
             if (!emit_progress and turn_result.output.len > 0) {
@@ -1062,13 +1103,32 @@ fn streamLoopRequestToSse(
         }
 
         allocator.free(latest_user_prompt);
-        latest_user_prompt = try allocator.dupe(
-            u8,
-            if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
-                "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
-            else
-                "Continue.",
-        );
+
+        if (is_react_mode) {
+            // Inject the observation as the next user prompt.
+            const obs = react_observation orelse try allocator.dupe(u8, "Continue.");
+            react_observation = null; // Transfer ownership.
+            latest_user_prompt = obs;
+
+            if (emit_progress) {
+                try response.sendChatCompletionChunkSse(
+                    connection,
+                    allocator,
+                    completion_id,
+                    turn_result.model,
+                    latest_user_prompt,
+                    null,
+                );
+            }
+        } else {
+            latest_user_prompt = try allocator.dupe(
+                u8,
+                if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
+                    "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
+                else
+                    "Continue.",
+            );
+        }
 
         const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
         for (working_messages) |message| {
@@ -1110,6 +1170,18 @@ fn executeLoopRequestAlloc(
         }
         allocator.free(working_messages);
         working_messages = with_guidance;
+    } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
+        const with_react = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            react.system_prompt,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_react;
     }
 
     var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
@@ -1175,16 +1247,58 @@ fn executeLoopRequestAlloc(
             return .{ .response = turn_result, .messages = working_messages };
         }
 
+        // ReAct mode: parse action, execute, inject observation.
+        const is_react_mode = std.ascii.eqlIgnoreCase(loop_mode, "react");
+        var react_observation: ?[]u8 = null;
+        var react_finished = false;
+        defer if (react_observation) |obs| allocator.free(obs);
+
+        if (is_react_mode) {
+            if (repeated_count >= 1) {
+                return .{ .response = turn_result, .messages = working_messages };
+            }
+
+            if (react.parseReactAction(turn_result.output)) |action| {
+                switch (action) {
+                    .finish => {
+                        react_finished = true;
+                    },
+                    else => {
+                        const obs_raw = try react.executeReactAction(allocator, action, app_config);
+                        defer allocator.free(obs_raw);
+                        react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
+                    },
+                }
+            } else {
+                react_observation = try react.formatObservation(
+                    allocator,
+                    turn + 1,
+                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                );
+            }
+
+            if (react_finished) {
+                return .{ .response = turn_result, .messages = working_messages };
+            }
+        }
+
         turn_result.deinit(allocator);
 
         allocator.free(latest_user_prompt);
-        latest_user_prompt = try allocator.dupe(
-            u8,
-            if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
-                "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
-            else
-                "Continue.",
-        );
+
+        if (is_react_mode) {
+            const obs = react_observation orelse try allocator.dupe(u8, "Continue.");
+            react_observation = null; // Transfer ownership.
+            latest_user_prompt = obs;
+        } else {
+            latest_user_prompt = try allocator.dupe(
+                u8,
+                if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
+                    "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
+                else
+                    "Continue.",
+            );
+        }
 
         const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
         for (working_messages) |message| {
