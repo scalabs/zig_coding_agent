@@ -1,5 +1,6 @@
 import json
-from typing import Dict, Generator
+from dataclasses import dataclass
+from typing import Dict, Generator, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -8,6 +9,14 @@ import streamlit as st
 st.set_page_config(page_title="Zig Agent Test Client", layout="wide")
 st.title("Zig AI Harness Test Client")
 st.caption("Debug and test harness behavior: chat routing, tool execution, sessions, streaming, and diagnostics.")
+
+CHAT_STATE_KEY = "chat_messages"
+
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
 
 
 def build_headers(api_key: str) -> Dict[str, str]:
@@ -75,6 +84,31 @@ def stream_probe_lines(response: requests.Response) -> Generator[str, None, None
             yield token
 
 
+def ensure_chat_state() -> None:
+    if CHAT_STATE_KEY not in st.session_state:
+        st.session_state[CHAT_STATE_KEY] = [
+            ChatMessage(role="system", content="You are a helpful assistant. Keep replies concise."),
+        ]
+
+
+def chat_state() -> List[ChatMessage]:
+    ensure_chat_state()
+    return st.session_state[CHAT_STATE_KEY]
+
+
+def add_chat_message(role: str, content: str) -> None:
+    ensure_chat_state()
+    st.session_state[CHAT_STATE_KEY].append(ChatMessage(role=role, content=content))
+
+
+def render_chat(messages: List[ChatMessage]) -> None:
+    for msg in messages:
+        if msg.role == "system":
+            continue
+        with st.chat_message(msg.role):
+            st.markdown(msg.content)
+
+
 with st.sidebar:
     st.header("Connection")
     endpoint = st.text_input(
@@ -134,41 +168,34 @@ with st.sidebar:
     st.header("Tools (debug)")
     selected_tools = st.multiselect(
         "Available tools to send",
-        options=["echo", "utc", "cmd", "bash"],
-        default=["utc", "cmd"],
+        options=["echo", "utc", "cmd", "bash", "file_read", "file_write", "file_search"],
+        default=["utc", "cmd", "file_write"],
         help="Multiple tools can be sent in one request. cmd/bash require server env LLM_ROUTER_TOOL_EXEC_ENABLED=1.",
     )
 
     tool_choice = st.selectbox(
         "tool_choice",
-        options=["auto", "none", "required", "echo", "utc", "cmd", "bash"],
+        options=[
+            "auto",
+            "none",
+            "required",
+            "echo",
+            "utc",
+            "cmd",
+            "bash",
+            "file_read",
+            "file_write",
+            "file_search",
+        ],
         index=0,
         help="Use auto for prompt-driven tool execution with multiple tools.",
     )
 
-st.subheader("Prompt")
-prompt = st.text_area(
-    "Message",
-    value="Get time using utc tool and run the ping google.com command.",
-    height=120,
-)
 
-col1, col2 = st.columns(2)
-send_clicked = col1.button("Send POST request", use_container_width=True)
-stream_clicked = col2.button("Probe streaming", use_container_width=True)
-
-diag_col1, diag_col2, diag_col3 = st.columns(3)
-health_clicked = diag_col1.button("GET /health", use_container_width=True)
-metrics_clicked = diag_col2.button("GET /metrics", use_container_width=True)
-providers_clicked = diag_col3.button("GET /diagnostics/providers", use_container_width=True)
-
-
-def build_payload(force_stream: bool) -> Dict:
-    message_content = prompt
-
+def build_payload(messages: List[ChatMessage], force_stream: bool) -> Dict:
     payload: Dict = {
         "provider": provider.strip() or "ollama",
-        "messages": [{"role": "user", "content": message_content}],
+        "messages": [{"role": m.role, "content": m.content} for m in messages if m.content.strip()],
         "think": bool(thinking),
         "temperature": float(temperature),
     }
@@ -198,15 +225,14 @@ def build_payload(force_stream: bool) -> Dict:
             "utc": "Return current UTC timestamp for deterministic tool-path checks.",
             "cmd": "Execute a Windows cmd command from prompt text (debug use).",
             "bash": "Execute a bash command from prompt text (debug use).",
+            "file_read": "Read a relative file path and return its content (debug use).",
+            "file_write": "Write a relative file path from a fenced code block (debug use).",
+            "file_search": "Search a substring under a relative directory (debug use).",
         }
         payload["tools"] = [
-            {
-                "name": tool_name,
-                "description": tool_descriptions.get(tool_name, "debug tool"),
-            }
+            {"name": tool_name, "description": tool_descriptions.get(tool_name, "debug tool")}
             for tool_name in selected_tools
         ]
-
         if tool_choice != "none":
             payload["tool_choice"] = tool_choice
 
@@ -220,7 +246,6 @@ def request_timeout_seconds(force_stream: bool) -> int:
     timeout = 120 if force_stream else 60
 
     if loop_mode != "none":
-        # Loop mode can require multiple provider turns in one HTTP request.
         timeout = max(timeout, 240)
 
     if ("cmd" in selected_tools) or ("bash" in selected_tools):
@@ -229,82 +254,100 @@ def request_timeout_seconds(force_stream: bool) -> int:
     return timeout
 
 
-if send_clicked:
+def send_chat_request(force_stream: bool) -> Optional[Dict]:
     if not endpoint.strip():
         st.error("Endpoint is required.")
-    elif not prompt.strip():
-        st.error("Prompt is required.")
-    else:
-        payload = build_payload(force_stream=False)
-        st.code(json.dumps(payload, indent=2), language="json")
+        return None
 
-        try:
-            timeout_sec = request_timeout_seconds(force_stream=False)
-            response = requests.post(
-                endpoint.strip(),
-                headers=build_headers(api_key),
-                json=payload,
-                timeout=timeout_sec,
-            )
-        except requests.Timeout:
-            st.error(
-                "Request timed out. Increase timeout by disabling loop mode, reducing loop_max_turns, "
-                "or simplifying tool usage in the prompt."
-            )
-        except requests.RequestException as exc:
-            st.error(f"Request failed: {exc}")
-        else:
-            st.write(f"HTTP {response.status_code}")
-            try:
-                data = response.json()
-            except ValueError:
-                st.error("Response is not valid JSON.")
-                st.code(response.text)
-            else:
-                st.json(data)
-                assistant = parse_assistant_content(data)
-                if assistant:
-                    st.success("Assistant output")
-                    st.write(assistant)
+    payload = build_payload(chat_state(), force_stream=force_stream)
+    st.code(json.dumps(payload, indent=2), language="json")
 
-if stream_clicked:
-    if not endpoint.strip():
-        st.error("Endpoint is required.")
-    elif not prompt.strip():
-        st.error("Prompt is required.")
-    else:
+    try:
+        timeout_sec = request_timeout_seconds(force_stream=force_stream)
+        resp = requests.post(
+            endpoint.strip(),
+            headers=build_headers(api_key),
+            json=payload,
+            timeout=timeout_sec,
+            stream=force_stream,
+        )
+    except requests.Timeout:
+        st.error(
+            "Request timed out. Increase timeout by disabling loop mode, reducing loop_max_turns, "
+            "or simplifying tool usage in the prompt."
+        )
+        return None
+    except requests.RequestException as exc:
+        st.error(f"Request failed: {exc}")
+        return None
+
+    st.write(f"HTTP {resp.status_code}")
+
+    if force_stream:
+        if resp.status_code >= 400:
+            st.error("Server returned an error status during stream.")
+            st.code(resp.text)
+            return None
+
+        with st.chat_message("assistant"):
+            streamed_text = st.write_stream(stream_probe_lines(resp))
+        add_chat_message("assistant", str(streamed_text))
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        st.error("Response is not valid JSON.")
+        st.code(resp.text)
+        return None
+
+    st.json(data)
+    assistant = parse_assistant_content(data)
+    if assistant:
+        with st.chat_message("assistant"):
+            st.markdown(assistant)
+        add_chat_message("assistant", assistant)
+    return data
+
+
+st.subheader("Chat")
+ensure_chat_state()
+
+chat_controls_col1, chat_controls_col2, chat_controls_col3 = st.columns(3)
+with chat_controls_col1:
+    if st.button("Clear chat", use_container_width=True):
+        st.session_state.pop(CHAT_STATE_KEY, None)
+        ensure_chat_state()
+with chat_controls_col2:
+    if st.button("Add demo prompt", use_container_width=True):
+        add_chat_message(
+            "user",
+            "write a python script to add two numbers then execute and print it's output",
+        )
+with chat_controls_col3:
+    stream_mode = st.checkbox("Stream responses (SSE)", value=False)
+
+render_chat(chat_state())
+
+user_input = st.chat_input("Type a message and press Enter…")
+if user_input and user_input.strip():
+    add_chat_message("user", user_input.strip())
+    if stream_mode:
         if loop_mode != "none":
             st.info(
                 "Loop progress visibility is controlled by server setting "
                 "LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED (default: enabled)."
             )
+        send_chat_request(force_stream=True)
+    else:
+        send_chat_request(force_stream=False)
 
-        payload = build_payload(force_stream=True)
-        st.code(json.dumps(payload, indent=2), language="json")
 
-        try:
-            timeout_sec = request_timeout_seconds(force_stream=True)
-            response = requests.post(
-                endpoint.strip(),
-                headers=build_headers(api_key),
-                json=payload,
-                timeout=timeout_sec,
-                stream=True,
-            )
-        except requests.Timeout:
-            st.error(
-                "Streaming probe timed out. Try a shorter prompt, fewer loop turns, or disable loop mode."
-            )
-        except requests.RequestException as exc:
-            st.error(f"Streaming probe failed: {exc}")
-        else:
-            st.write(f"HTTP {response.status_code}")
-            if response.status_code >= 400:
-                st.error("Server returned an error status during stream probe.")
-                st.code(response.text)
-            else:
-                st.write("Streaming output")
-                st.write_stream(stream_probe_lines(response))
+st.subheader("Diagnostics")
+diag_col1, diag_col2, diag_col3 = st.columns(3)
+health_clicked = diag_col1.button("GET /health", use_container_width=True)
+metrics_clicked = diag_col2.button("GET /metrics", use_container_width=True)
+providers_clicked = diag_col3.button("GET /diagnostics/providers", use_container_width=True)
 
 if health_clicked or metrics_clicked or providers_clicked:
     base_url = base_url_from_endpoint(endpoint)
@@ -335,3 +378,4 @@ if health_clicked or metrics_clicked or providers_clicked:
                 st.json(resp.json())
             except ValueError:
                 st.code(resp.text)
+
