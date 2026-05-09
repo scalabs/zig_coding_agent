@@ -533,12 +533,12 @@ pub fn parseChatRequest(
                         null;
 
                     if (input_schema_json) |schema| {
-                        const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return .{ .err = errors.validationError(
+                        const schema_parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return .{ .err = errors.validationError(
                             "tool input_schema must be valid JSON",
                             "tools",
                             "invalid_tools",
                         ) };
-                        parsed.deinit();
+                        schema_parsed.deinit();
                     }
 
                     try tools.append(allocator, .{
