@@ -716,9 +716,20 @@ fn renderToolsJsonAlloc(
         const escaped_description = try escapeJsonStringAlloc(allocator, tool.description);
         defer allocator.free(escaped_description);
 
+        if (tool.input_schema_json) |schema| {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return error.InvalidToolSchema;
+            parsed.deinit();
+        }
+
+        var parameters_json: []const u8 = "";
+        if (tool.input_schema_json) |schema| {
+            parameters_json = try std.fmt.allocPrint(allocator, ",\"parameters\":{s}", .{schema});
+        }
+        defer if (tool.input_schema_json != null) allocator.free(parameters_json);
+
         try out.writer(allocator).print(
-            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"}}}}",
-            .{ escaped_name, escaped_description },
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"{s}}}}}",
+            .{ escaped_name, escaped_description, parameters_json },
         );
     }
     try out.append(allocator, ']');
