@@ -386,7 +386,6 @@ fn runPromptLoop(
                         defer allocator.free(observation_raw);
 
                         const observation = try react.formatObservation(allocator, turn + 1, observation_raw);
-                        defer allocator.free(observation);
 
                         std.debug.print("{s}\n\n", .{observation});
 
@@ -402,7 +401,6 @@ fn runPromptLoop(
                     turn + 1,
                     "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
                 );
-                defer allocator.free(hint);
 
                 std.debug.print("{s}\n\n", .{hint});
                 allocator.free(latest_user_prompt);
