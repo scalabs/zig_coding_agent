@@ -22,7 +22,7 @@ pub const system_prompt =
     "  Search[query]   - search for information\n" ++
     "  Lookup[term]    - look up a term in the current context\n" ++
     "  Cmd[command]    - execute a shell command (only if tools are enabled)\n" ++
-    "  Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]  - return the final answer and end the loop\n\n" ++
+    "  Finish[your final answer]  - return the final answer and end the loop\n\n" ++
     "Rules:\n" ++
     "- Always start with a Thought, then an Action.\n" ++
     "- Never produce an Observation yourself; the system provides them.\n" ++

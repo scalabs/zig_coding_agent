@@ -713,6 +713,7 @@ fn cloneRequestWithMessagesAlloc(
         copied_tools[idx] = .{
             .name = try allocator.dupe(u8, tool.name),
             .description = try allocator.dupe(u8, tool.description),
+            .input_schema_json = if (tool.input_schema_json) |schema| try allocator.dupe(u8, schema) else null,
         };
         initialized_tools += 1;
     }
