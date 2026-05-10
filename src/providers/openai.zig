@@ -4,6 +4,9 @@
 //! the OpenAI base URL and API key from configuration.
 
 const std = @import("std");
+const config = @import("../config.zig");
+const types = @import("../types.zig");
+const openai_compatible = @import("openai_compatible.zig");
 
 /// Delegates to `openai_compatible.callChat` with OpenAI credentials.
 /// Returns an error response if the API key is not configured.
