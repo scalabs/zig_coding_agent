@@ -1,6 +1,12 @@
+//! UTC timestamp debug tool.
+//!
+//! Returns the current Unix timestamp and millisecond timestamp
+//! as a diagnostic response.
+
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Returns a debug response with the current UTC Unix and millisecond timestamps.
 pub fn execute(
     allocator: std.mem.Allocator,
     request: types.Request,

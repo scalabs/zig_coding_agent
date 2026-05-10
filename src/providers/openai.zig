@@ -1,8 +1,12 @@
-const std = @import("std");
-const config = @import("../config.zig");
-const types = @import("../types.zig");
-const openai_compatible = @import("openai_compatible.zig");
+//! OpenAI provider adapter.
+//!
+//! Thin wrapper around `openai_compatible.callChat` that injects
+//! the OpenAI base URL and API key from configuration.
 
+const std = @import("std");
+
+/// Delegates to `openai_compatible.callChat` with OpenAI credentials.
+/// Returns an error response if the API key is not configured.
 pub fn callOpenAI(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,

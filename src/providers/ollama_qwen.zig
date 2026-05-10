@@ -13,6 +13,8 @@ const ChatAttempt = struct {
     }
 };
 
+/// Tracks a model fallback suggestion when the requested model
+/// is not installed locally.
 const ModelFallback = struct {
     selected_model: []u8,
     suggested_model: ?[]u8,
@@ -23,6 +25,7 @@ const ModelFallback = struct {
     }
 };
 
+/// Ollama-specific tuning parameters extracted from config and request.
 const OllamaTuning = struct {
     think: bool,
     temperature: f64,
@@ -30,11 +33,16 @@ const OllamaTuning = struct {
     num_predict: u32,
 };
 
+/// Result of a streaming request: either successfully streamed
+/// to the client or a failure response to return directly.
 pub const StreamQwenResult = union(enum) {
     streamed,
     failed: types.Response,
 };
 
+/// Streams a chat completion from Ollama as SSE chunks directly to
+/// the client connection. Handles model fallback if the requested
+/// model is not installed.
 pub fn streamQwenToSse(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
@@ -175,6 +183,9 @@ pub fn streamQwenToSse(
     return .streamed;
 }
 
+/// Sends a non-streaming chat completion request to Ollama.
+/// Automatically falls back to an alternative local model if the
+/// requested model is not found.
 pub fn callQwen(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -299,6 +310,8 @@ pub fn callQwen(
     };
 }
 
+/// Queries Ollama's `/api/tags` endpoint and returns a JSON status
+/// payload describing provider reachability and model availability.
 pub fn buildStatusJsonAlloc(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,

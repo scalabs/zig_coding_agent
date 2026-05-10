@@ -1,8 +1,15 @@
+//! llama.cpp server provider adapter.
+//!
+//! Thin wrapper around `openai_compatible.callChat` that targets a
+//! local llama.cpp server. API key is optional (only sent when configured).
+
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 const openai_compatible = @import("openai_compatible.zig");
 
+/// Delegates to `openai_compatible.callChat` with llama.cpp base URL
+/// and an optional API key. The provider label is "llama.cpp".
 pub fn callLlamaCpp(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,

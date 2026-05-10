@@ -1,6 +1,14 @@
+//! Shared logic for OpenAI-compatible chat completion providers.
+//!
+//! Handles URL construction, request payload rendering, response parsing,
+//! error extraction, and JSON escaping. Used by OpenAI, OpenRouter,
+//! llama.cpp, and any provider that follows the `/v1/chat/completions`
+//! contract.
+
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Sends a chat completion request with no extra headers.
 pub fn callChat(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -20,6 +28,8 @@ pub fn callChat(
     );
 }
 
+/// Sends a chat completion request with provider-specific extra headers.
+/// Handles Bearer auth, payload rendering, HTTP fetch, and response parsing.
 pub fn callChatWithExtraHeaders(
     allocator: std.mem.Allocator,
     base_url: []const u8,

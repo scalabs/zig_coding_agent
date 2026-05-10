@@ -1,3 +1,8 @@
+//! HTTP request parsing and validation for the chat completions endpoint.
+//!
+//! Deserializes incoming JSON into typed request structs, validates required
+//! fields, and normalizes provider aliases to canonical IDs.
+
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
