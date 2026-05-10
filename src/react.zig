@@ -22,11 +22,13 @@ pub const system_prompt =
     "  Search[query]   - search for information\n" ++
     "  Lookup[term]    - look up a term in the current context\n" ++
     "  Cmd[command]    - execute a shell command (only if tools are enabled)\n" ++
-    "  Finish[your final answer]  - return the final answer and end the loop\n\n" ++
+    "  Finish[your final answer]  - return the final answer and end the loop\n" ++
+    "    Example: Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]\n" ++
+    "    Syntax: Finish[place ONLY your answer here, no extra text]\n\n" ++
     "Rules:\n" ++
     "- Always start with a Thought, then an Action.\n" ++
     "- Never produce an Observation yourself; the system provides them.\n" ++
-    "- Use Finish[your final answer] when you have the final answer. Put your actual answer inside the brackets, not the word 'answer'.\n" ++
+    "- Use Finish[answer] when complete. Replace 'answer' with your actual result, not the word 'answer'.\n" ++
     "- Be concrete: use specific names, values, steps, and short outputs instead of vague summaries.\n" ++
     "- If you need information, ask for the exact term or command that will resolve it.\n" ++
     "- If an action fails, adjust your approach in the next Thought.\n";
