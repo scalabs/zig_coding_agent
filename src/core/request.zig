@@ -88,10 +88,9 @@ pub fn readHttpRequest(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
     request_timeout_ms: u32,
+    max_request_size: usize,
+    max_header_size: usize,
 ) ![]u8 {
-    const max_request_size = 1024 * 1024;
-    const max_header_size = 16 * 1024;
-
     const started_ms = std.time.milliTimestamp();
 
     var request = std.ArrayList(u8){};
@@ -133,7 +132,7 @@ pub fn readHttpRequest(
                     error.MissingContentLength => 0,
                     else => return err,
                 };
-                const required_length = header_end.? + content_length;
+                const required_length = try checkedRequiredLength(header_end.?, content_length);
                 if (required_length > max_request_size) {
                     return error.RequestTooLarge;
                 }
@@ -164,6 +163,17 @@ pub fn readHttpRequest(
 
     request.items.len = total_length.?;
     return try request.toOwnedSlice(allocator);
+}
+
+pub fn checkedRequiredLength(header_len: usize, content_length: usize) !usize {
+    return std.math.add(usize, header_len, content_length) catch error.RequestTooLarge;
+}
+
+test "checkedRequiredLength rejects integer overflow" {
+    try std.testing.expectError(
+        error.RequestTooLarge,
+        checkedRequiredLength(std.math.maxInt(usize), 1),
+    );
 }
 
 fn waitForReadable(

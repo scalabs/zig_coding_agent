@@ -19,9 +19,7 @@ This project exposes a chat-completions API, routes requests across multiple pro
 - Optional debug tooling (echo, utc, cmd, bash) with safe defaults.
 - Simple deploy surface: single Zig binary, environment-based configuration.
 
-## Scope freeze (Phase 0)
 
-Phase 0 is **complete**: one canonical chat path and response shape, with deferrals listed in `plan.md` (distributed orchestration, deep tenancy/RBAC, heavy observability, plugin marketplaces). Operational routes (`/health`, `/metrics`, `/diagnostics/*`) stay diagnostics-only.
 
 ## Architecture
 
@@ -93,11 +91,11 @@ zig build test -Dtest-target=all -Dtest-filter=normalizeProviderName
 | GET    | /metrics               | Yes (if API key configured) | Request and connection counters       |
 | GET    | /diagnostics/clients   | Yes (if API key configured) | Connected client diagnostics          |
 | GET    | /diagnostics/requests  | Yes (if API key configured) | Request success/failure diagnostics   |
-| GET    | /diagnostics/providers | No                          | Provider status snapshot              |
+| GET    | /diagnostics/providers | Yes (if API key configured) | Provider status snapshot              |
 | POST   | /v1/chat/completions   | Yes (if API key configured) | OpenAI-compatible chat-completions    |
 
 > [!NOTE]
-> Authentication is enabled when LLM_ROUTER_API_KEY is non-empty. When enabled, all routes require auth except /health and /diagnostics/providers.
+> Authentication is enabled when LLM_ROUTER_API_KEY is non-empty. When enabled, all routes require auth except /health.
 
 ### Chat Request Shape
 
@@ -224,11 +222,15 @@ Registered tool names:
 - utc
 - cmd
 - bash
+- file_read
+- file_write
+- file_search
 
 Tool behavior summary:
 
 - echo and utc are deterministic debug helpers.
 - cmd and bash are guarded command-execution tools.
+- file_read, file_write, and file_search are lightweight filesystem helpers for trusted local workflows.
 - Command execution is disabled by default and must be explicitly enabled.
 
 ```bash
@@ -240,6 +242,7 @@ Related limits:
 
 - LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS (default: 15000)
 - LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES (default: 65536)
+- LLM_ROUTER_MAX_TOOL_CALLS_PER_REQUEST (default: 8)
 
 ## Configuration Reference
 
@@ -256,6 +259,9 @@ Related limits:
 | LLM_ROUTER_REQUEST_TIMEOUT_MS           | 30000          |
 | LLM_ROUTER_PROVIDER_TIMEOUT_MS          | 60000          |
 | LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED | true           |
+| LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS   | 64             |
+| LLM_ROUTER_MAX_REQUEST_BYTES            | 1048576        |
+| LLM_ROUTER_MAX_HEADER_BYTES             | 16384          |
 
 ### Session Storage
 
@@ -342,11 +348,35 @@ Related limits:
    -d '{"messages":[{"role":"user","content":"Say hello from zig-coding-agent"}]}'
    ```
 
-4. Provider Diagnostics
+4. Stateful Session Check
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+   -H "Content-Type: application/json" \
+   -d '{"session_id":"demo-session","messages":[{"role":"user","content":"Remember that my test color is blue."}]}'
+   ```
+
+5. Tool Check
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+   -H "Content-Type: application/json" \
+   -d '{"messages":[{"role":"user","content":"What time is it in UTC?"}],"tools":[{"name":"utc","description":"Current UTC time"}],"tool_choice":"auto"}'
+   ```
+
+6. Provider Diagnostics
 
    ```bash
    curl -s http://127.0.0.1:8081/diagnostics/providers
    ```
+
+## Short Runbook
+
+- 401 Unauthorized: set `LLM_ROUTER_API_KEY` on the server and send either `X-Api-Key: <key>` or `Authorization: Bearer <key>`.
+- 413 request_too_large: lower the prompt size or raise `LLM_ROUTER_MAX_REQUEST_BYTES` for trusted deployments.
+- 504 provider_timeout: check provider reachability and `LLM_ROUTER_PROVIDER_TIMEOUT_MS`.
+- unknown_tool: request only registered tools listed above.
+- provider_not_configured: set the provider API key or switch to a local provider.
 
 ## Project Layout
 
@@ -361,6 +391,7 @@ zig_coding_agent
     │   ├── api.zig
     │   ├── auth.zig
     │   ├── errors.zig
+    │   ├── mcp.zig
     │   ├── session.zig
     │   └── tools.zig
     ├── config.zig
@@ -383,6 +414,7 @@ zig_coding_agent
     ├── tools
     │   ├── command_exec.zig
     │   ├── echo.zig
+    │   ├── file_ops.zig
     │   └── utc.zig
     └── types.zig
 ```

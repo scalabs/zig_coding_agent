@@ -11,6 +11,10 @@ st.title("Zig AI Harness Test Client")
 st.caption("Debug and test harness behavior: chat routing, tool execution, sessions, streaming, and diagnostics.")
 
 CHAT_STATE_KEY = "chat_messages"
+PENDING_CMD_CONFIRMATION_KEY = "pending_cmd_confirmation"
+
+CMD_CONFIRMATION_TAG = "DEBUG_TOOL_CONFIRMATION_REQUIRED"
+CONFIRM_MARKER_PREFIX = "LLM_ROUTER_TOOL_CONFIRM "
 
 
 @dataclass
@@ -109,6 +113,32 @@ def render_chat(messages: List[ChatMessage]) -> None:
             st.markdown(msg.content)
 
 
+def parse_cmd_confirmation(text: str) -> Optional[Dict[str, str]]:
+    if CMD_CONFIRMATION_TAG not in text:
+        return None
+
+    tool: Optional[str] = None
+    command: Optional[str] = None
+    confirm_token: Optional[str] = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("tool="):
+            tool = line[len("tool=") :].strip()
+        elif line.startswith("command="):
+            command = line[len("command=") :].strip()
+        elif line.startswith("confirm_token="):
+            confirm_token = line[len("confirm_token=") :].strip()
+
+    if tool and command and confirm_token:
+        return {"tool": tool, "command": command, "confirm_token": confirm_token}
+    return None
+
+
+def set_pending_cmd_confirmation(value: Optional[Dict[str, str]]) -> None:
+    st.session_state[PENDING_CMD_CONFIRMATION_KEY] = value
+
+
 with st.sidebar:
     st.header("Connection")
     endpoint = st.text_input(
@@ -151,7 +181,7 @@ with st.sidebar:
     st.header("Loop")
     loop_mode = st.selectbox(
         "loop_mode",
-        options=["none", "basic", "agent"],
+        options=["none", "basic", "agent", "react"],
         index=0,
         help="Server-side iterative loop mode usable from any frontend client.",
     )
@@ -166,10 +196,25 @@ with st.sidebar:
     )
 
     st.header("Tools (debug)")
+
+    import platform as _platform
+    _is_windows = _platform.system().lower().startswith("win")
+    _shell_tool = "cmd" if _is_windows else "bash"
+    CODING_TOOLS = [_shell_tool, "file_read", "file_write", "file_search"]
+
+    auto_tools_for_react = st.checkbox(
+        "Auto-attach coding tools when loop_mode=react",
+        value=True,
+        help=(
+            "When enabled and loop_mode is 'react', send the full coding tool set "
+            f"({', '.join(CODING_TOOLS)}) with tool_choice=auto. Overrides the manual selection below."
+        ),
+    )
+
     selected_tools = st.multiselect(
-        "Available tools to send",
+        "Available tools to send (manual selection)",
         options=["echo", "utc", "cmd", "bash", "file_read", "file_write", "file_search"],
-        default=["utc", "cmd", "file_write"],
+        default=CODING_TOOLS,
         help="Multiple tools can be sent in one request. cmd/bash require server env LLM_ROUTER_TOOL_EXEC_ENABLED=1.",
     )
 
@@ -191,8 +236,20 @@ with st.sidebar:
         help="Use auto for prompt-driven tool execution with multiple tools.",
     )
 
+    if auto_tools_for_react and loop_mode == "react":
+        selected_tools = CODING_TOOLS
+        tool_choice = "auto"
+        st.caption(
+            f"react mode active — sending tools={CODING_TOOLS} with tool_choice=auto."
+        )
 
-def build_payload(messages: List[ChatMessage], force_stream: bool) -> Dict:
+
+def build_payload(
+    messages: List[ChatMessage],
+    force_stream: bool,
+    tool_choice_override: Optional[str] = None,
+    tools_override: Optional[List[str]] = None,
+) -> Dict:
     payload: Dict = {
         "provider": provider.strip() or "ollama",
         "messages": [{"role": m.role, "content": m.content} for m in messages if m.content.strip()],
@@ -219,7 +276,9 @@ def build_payload(messages: List[ChatMessage], force_stream: bool) -> Dict:
         if loop_max_turns > 0:
             payload["loop_max_turns"] = int(loop_max_turns)
 
-    if selected_tools:
+    tools_to_send = tools_override if tools_override is not None else selected_tools
+
+    if tools_to_send:
         tool_descriptions = {
             "echo": "Return a deterministic echo response for harness debugging.",
             "utc": "Return current UTC timestamp for deterministic tool-path checks.",
@@ -231,9 +290,11 @@ def build_payload(messages: List[ChatMessage], force_stream: bool) -> Dict:
         }
         payload["tools"] = [
             {"name": tool_name, "description": tool_descriptions.get(tool_name, "debug tool")}
-            for tool_name in selected_tools
+            for tool_name in tools_to_send
         ]
-        if tool_choice != "none":
+        if tool_choice_override is not None:
+            payload["tool_choice"] = tool_choice_override
+        elif tool_choice != "none":
             payload["tool_choice"] = tool_choice
 
     if force_stream:
@@ -254,12 +315,21 @@ def request_timeout_seconds(force_stream: bool) -> int:
     return timeout
 
 
-def send_chat_request(force_stream: bool) -> Optional[Dict]:
+def send_chat_request(
+    force_stream: bool,
+    tool_choice_override: Optional[str] = None,
+    tools_override: Optional[List[str]] = None,
+) -> Optional[Dict]:
     if not endpoint.strip():
         st.error("Endpoint is required.")
         return None
 
-    payload = build_payload(chat_state(), force_stream=force_stream)
+    payload = build_payload(
+        chat_state(),
+        force_stream=force_stream,
+        tool_choice_override=tool_choice_override,
+        tools_override=tools_override,
+    )
     st.code(json.dumps(payload, indent=2), language="json")
 
     try:
@@ -291,7 +361,9 @@ def send_chat_request(force_stream: bool) -> Optional[Dict]:
 
         with st.chat_message("assistant"):
             streamed_text = st.write_stream(stream_probe_lines(resp))
-        add_chat_message("assistant", str(streamed_text))
+        assistant_text = str(streamed_text)
+        add_chat_message("assistant", assistant_text)
+        set_pending_cmd_confirmation(parse_cmd_confirmation(assistant_text))
         return None
 
     try:
@@ -307,6 +379,7 @@ def send_chat_request(force_stream: bool) -> Optional[Dict]:
         with st.chat_message("assistant"):
             st.markdown(assistant)
         add_chat_message("assistant", assistant)
+        set_pending_cmd_confirmation(parse_cmd_confirmation(assistant))
     return data
 
 
@@ -341,6 +414,29 @@ if user_input and user_input.strip():
         send_chat_request(force_stream=True)
     else:
         send_chat_request(force_stream=False)
+
+pending_cmd = st.session_state.get(PENDING_CMD_CONFIRMATION_KEY)
+if pending_cmd:
+    tool = pending_cmd["tool"]
+    st.warning(f"Backend requested confirmation to execute `{tool}`.")
+    st.code(pending_cmd["command"])
+    if st.button("Confirm command execution", use_container_width=True):
+        confirm_prompt = (
+            f"{pending_cmd['command']}\n{CONFIRM_MARKER_PREFIX}{pending_cmd['confirm_token']}"
+        )
+        add_chat_message("user", confirm_prompt)
+
+        tools_override = selected_tools if isinstance(selected_tools, list) else []
+        if tool not in tools_override:
+            tools_override = tools_override + [tool]
+
+        # Force the tool choice so the backend executes immediately after confirmation.
+        set_pending_cmd_confirmation(None)
+        send_chat_request(
+            force_stream=stream_mode,
+            tool_choice_override=tool,
+            tools_override=tools_override,
+        )
 
 
 st.subheader("Diagnostics")

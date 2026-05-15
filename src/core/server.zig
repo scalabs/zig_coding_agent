@@ -11,12 +11,19 @@ const tooling = @import("../backend/tools.zig");
 const session = @import("../backend/session.zig");
 const react = @import("../react.zig");
 
+const context_compaction_keep_messages = 8;
+const length_continue_prompt =
+    "The previous assistant message was cut off by the generation limit. " ++
+    "Continue the same answer from the exact next token. Output only the continuation text; " ++
+    "do not mention truncation, continuation, the previous message, or these instructions.";
+
 const ServerState = struct {
     mutex: std.Thread.Mutex = .{},
     total_requests: u64 = 0,
     successful_requests: u64 = 0,
     failed_requests: u64 = 0,
     active_connections: u64 = 0,
+    provider_latency_buckets: [4]u64 = .{ 0, 0, 0, 0 },
     connected_clients: std.ArrayList([]u8),
 
     fn init() ServerState {
@@ -70,6 +77,20 @@ const ServerState = struct {
         self.active_connections -= 1;
     }
 
+    fn noteProviderLatency(self: *ServerState, elapsed_ms: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const idx: usize = if (elapsed_ms < 50)
+            0
+        else if (elapsed_ms < 200)
+            1
+        else if (elapsed_ms < 1000)
+            2
+        else
+            3;
+        self.provider_latency_buckets[idx] += 1;
+    }
+
     fn snapshot(self: *ServerState) Snapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -78,6 +99,7 @@ const ServerState = struct {
             .successful_requests = self.successful_requests,
             .failed_requests = self.failed_requests,
             .active_connections = self.active_connections,
+            .provider_latency_buckets = self.provider_latency_buckets,
         };
     }
 
@@ -105,6 +127,7 @@ const Snapshot = struct {
     successful_requests: u64,
     failed_requests: u64,
     active_connections: u64,
+    provider_latency_buckets: [4]u64,
 };
 
 const ConnectionGate = struct {
@@ -295,7 +318,13 @@ fn handleConnection(
     session_store_guard: *SessionStoreGuard,
 ) !void {
     // Translate transport-level parsing failures into OpenAI-style API errors.
-    const request_raw = request.readHttpRequest(allocator, connection, app_config.request_timeout_ms) catch |err| switch (err) {
+    const request_raw = request.readHttpRequest(
+        allocator,
+        connection,
+        app_config.request_timeout_ms,
+        app_config.max_request_bytes,
+        app_config.max_header_bytes,
+    ) catch |err| switch (err) {
         error.ClientDisconnected => {
             debugLog(app_config, "client disconnected before full request", .{});
             return;
@@ -396,13 +425,17 @@ fn handleConnection(
             const snapshot = server_state.snapshot();
             const metrics_json = try std.fmt.allocPrint(
                 allocator,
-                "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d},\"active_connections\":{d}}}",
+                "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d},\"active_connections\":{d},\"provider_latency_buckets_ms\":{{\"lt_50\":{d},\"lt_200\":{d},\"lt_1000\":{d},\"gte_1000\":{d}}}}}",
                 .{
                     app_config.instance_id,
                     snapshot.total_requests,
                     snapshot.successful_requests,
                     snapshot.failed_requests,
                     snapshot.active_connections,
+                    snapshot.provider_latency_buckets[0],
+                    snapshot.provider_latency_buckets[1],
+                    snapshot.provider_latency_buckets[2],
+                    snapshot.provider_latency_buckets[3],
                 },
             );
             defer allocator.free(metrics_json);
@@ -539,10 +572,26 @@ fn handleConnection(
     if (parsed_req.max_context_tokens) |max_tokens| {
         const estimated = session.estimateTokenCount(request_messages);
         if (session.shouldCompressContext(estimated, max_tokens)) {
+            const compacted_messages = try session.compactContextToBudgetAlloc(
+                allocator,
+                request_messages,
+                max_tokens,
+                context_compaction_keep_messages,
+            );
+
+            for (request_messages) |message| {
+                message.deinit(allocator);
+            }
+            allocator.free(request_messages);
+            request_messages = compacted_messages;
+
+            allocator.free(request_prompt);
+            request_prompt = try extractLastUserPromptAlloc(allocator, request_messages);
+
             debugLog(
                 app_config,
-                "context compression suggested estimated_tokens={d} max_context_tokens={d}",
-                .{ estimated, max_tokens },
+                "context compacted estimated_tokens={d} compacted_tokens={d} max_context_tokens={d}",
+                .{ estimated, session.estimateTokenCount(request_messages), max_tokens },
             );
         }
     }
@@ -613,10 +662,51 @@ fn handleConnection(
             return;
         }
 
-        const stream_auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config);
+        const stream_auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config) catch |err| switch (err) {
+            error.ToolCallLimitExceeded => {
+                sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
+                    "Tool call limit exceeded",
+                    "tools",
+                    "tool_call_limit_exceeded",
+                ), app_config);
+                server_state.noteRequestFailed();
+                return;
+            },
+            else => return err,
+        };
         defer if (stream_auto_tool_summary) |summary| allocator.free(summary);
 
         if (stream_auto_tool_summary) |summary| {
+            if (tooling.shouldShortCircuitAutoTools(stream_request)) {
+                try response.sendEventStreamHeaders(connection.*);
+                const completion_id = try std.fmt.allocPrint(
+                    allocator,
+                    "chatcmpl-{d}",
+                    .{std.time.microTimestamp()},
+                );
+                defer allocator.free(completion_id);
+
+                try response.sendChatCompletionChunkSse(
+                    connection.*,
+                    allocator,
+                    completion_id,
+                    "debug-tools/auto",
+                    summary,
+                    null,
+                );
+                try response.sendChatCompletionChunkSse(
+                    connection.*,
+                    allocator,
+                    completion_id,
+                    "debug-tools/auto",
+                    null,
+                    "tool",
+                );
+                try response.sendSseDone(connection.*);
+                server_state.noteRequestSucceeded();
+                return;
+            }
+
             const augmented_messages = try appendSystemMessageAlloc(allocator, stream_request.messages, summary);
             for (stream_request.messages) |message| {
                 message.deinit(allocator);
@@ -690,7 +780,18 @@ fn handleConnection(
     );
     defer provider_request.deinit(allocator);
 
-    const auto_tool_summary = try tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config);
+    const auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config) catch |err| switch (err) {
+        error.ToolCallLimitExceeded => {
+            sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
+                "Tool call limit exceeded",
+                "tools",
+                "tool_call_limit_exceeded",
+            ), app_config);
+            server_state.noteRequestFailed();
+            return;
+        },
+        else => return err,
+    };
     defer if (auto_tool_summary) |summary| allocator.free(summary);
 
     if (auto_tool_summary) |summary| {
@@ -730,6 +831,16 @@ fn handleConnection(
     const provider_started_ms = std.time.milliTimestamp();
     if (loop_enabled) {
         const loop_execution = executeLoopRequestAlloc(allocator, app_config, provider_request) catch |err| {
+            if (err == error.ToolCallLimitExceeded) {
+                sendApiErrorSafe(
+                    connection.*,
+                    allocator,
+                    backend.errors.validationError("Tool call limit exceeded", "tools", "tool_call_limit_exceeded"),
+                    app_config,
+                );
+                server_state.noteRequestFailed();
+                return;
+            }
             logError("Provider loop request error: {}", .{err});
             sendApiErrorSafe(
                 connection.*,
@@ -760,6 +871,7 @@ fn handleConnection(
     }
 
     const provider_elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - provider_started_ms, 0));
+    server_state.noteProviderLatency(provider_elapsed_ms);
     // Log a warning when the provider exceeded the configured timeout budget, but
     // do NOT discard the already-completed response.  A post-hoc check cannot
     // cancel an in-flight HTTP call; discarding a valid result would only confuse
@@ -786,6 +898,12 @@ fn handleConnection(
         );
         server_state.noteRequestFailed();
         return;
+    }
+
+    if (!loop_enabled and isLengthFinishReason(result.finish_reason)) {
+        continueLengthResponseAlloc(allocator, app_config, provider_request, &result) catch |err| {
+            logError("Provider continuation failed: {s}", .{@errorName(err)});
+        };
     }
 
     if (std.mem.trim(u8, result.output, " \t\r\n").len == 0) {
@@ -925,6 +1043,43 @@ const LoopExecution = struct {
     messages: []types.Message,
 };
 
+fn executeReactActionForRequest(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    turn_request: types.Request,
+    tool_messages: []const types.Message,
+    action: react.ReactAction,
+) ![]u8 {
+    return switch (action) {
+        .tool => |tool_action| blk: {
+            var tool_request = try cloneRequestWithMessagesAlloc(
+                allocator,
+                turn_request,
+                tool_action.argument,
+                tool_messages,
+            );
+            defer tool_request.deinit(allocator);
+
+            if (tool_request.tool_choice) |value| {
+                allocator.free(value);
+            }
+            tool_request.tool_choice = try allocator.dupe(u8, tool_action.name);
+
+            if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config)) |tool_result| {
+                defer tool_result.deinit(allocator);
+                break :blk try allocator.dupe(u8, tool_result.output);
+            }
+
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "Tool action {s} was not requested or its input could not be parsed.",
+                .{tool_action.name},
+            );
+        },
+        else => try react.executeReactAction(allocator, action, app_config),
+    };
+}
+
 fn streamLoopRequestToSse(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
@@ -966,11 +1121,13 @@ fn streamLoopRequestToSse(
         allocator.free(working_messages);
         working_messages = with_guidance;
     } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
+        const react_prompt = try react.buildSystemPromptAlloc(allocator, base_request.tools);
+        defer allocator.free(react_prompt);
         const with_react = try appendRoleMessageAlloc(
             allocator,
             working_messages,
             "system",
-            react.system_prompt,
+            react_prompt,
         );
         for (working_messages) |message| {
             message.deinit(allocator);
@@ -985,6 +1142,7 @@ fn streamLoopRequestToSse(
     var previous_output: ?[]u8 = null;
     defer if (previous_output) |value| allocator.free(value);
     var repeated_count: usize = 0;
+    var react_tool_calls: usize = 0;
 
     var turn: usize = 0;
     while (turn < loop_max_turns) : (turn += 1) {
@@ -1001,8 +1159,28 @@ fn streamLoopRequestToSse(
         }
         turn_request.loop_max_turns = null;
 
-        var turn_result = try backend.callProvider(allocator, app_config, turn_request);
+        // In ReAct mode the tool catalog is advertised inside the system
+        // prompt and parsed locally; we must NOT forward `tools` upstream or
+        // providers like Ollama activate their XML tool-calling template and
+        // choke on prior assistant messages containing markdown or <think>
+        // (manifests as "internal_server_error ... element <function> closed
+        // by </parameter>"). We strip tools on a shallow alias so the original
+        // turn_request keeps them for local action dispatch.
+        const empty_tools: []types.Tool = &.{};
+        const provider_request: types.Request = if (std.ascii.eqlIgnoreCase(loop_mode, "react")) blk: {
+            var r = turn_request;
+            r.tools = empty_tools;
+            r.tool_choice = null;
+            break :blk r;
+        } else turn_request;
+
+        var turn_result = try backend.callProvider(allocator, app_config, provider_request);
         defer turn_result.deinit(allocator);
+        if (turn_result.success and isLengthFinishReason(turn_result.finish_reason)) {
+            continueLengthResponseAlloc(allocator, app_config, provider_request, &turn_result) catch |err| {
+                logError("Provider loop continuation failed: {s}", .{@errorName(err)});
+            };
+        }
 
         const with_assistant = try appendRoleMessageAlloc(
             allocator,
@@ -1062,7 +1240,8 @@ fn streamLoopRequestToSse(
                         react_finished = true;
                     },
                     else => {
-                        const obs_raw = try react.executeReactAction(allocator, action, app_config);
+                        try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
+                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
                     },
@@ -1171,11 +1350,13 @@ fn executeLoopRequestAlloc(
         allocator.free(working_messages);
         working_messages = with_guidance;
     } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
+        const react_prompt = try react.buildSystemPromptAlloc(allocator, base_request.tools);
+        defer allocator.free(react_prompt);
         const with_react = try appendRoleMessageAlloc(
             allocator,
             working_messages,
             "system",
-            react.system_prompt,
+            react_prompt,
         );
         for (working_messages) |message| {
             message.deinit(allocator);
@@ -1190,6 +1371,7 @@ fn executeLoopRequestAlloc(
     var previous_output: ?[]u8 = null;
     defer if (previous_output) |value| allocator.free(value);
     var repeated_count: usize = 0;
+    var react_tool_calls: usize = 0;
 
     var turn: usize = 0;
     while (turn < loop_max_turns) : (turn += 1) {
@@ -1206,7 +1388,22 @@ fn executeLoopRequestAlloc(
         }
         turn_request.loop_max_turns = null;
 
-        var turn_result = try backend.callProvider(allocator, app_config, turn_request);
+        // See streamLoopRequestToSse: strip tools/tool_choice from the
+        // upstream call in ReAct mode to avoid provider-side tool templates.
+        const empty_tools: []types.Tool = &.{};
+        const provider_request: types.Request = if (std.ascii.eqlIgnoreCase(loop_mode, "react")) blk: {
+            var r = turn_request;
+            r.tools = empty_tools;
+            r.tool_choice = null;
+            break :blk r;
+        } else turn_request;
+
+        var turn_result = try backend.callProvider(allocator, app_config, provider_request);
+        if (turn_result.success and isLengthFinishReason(turn_result.finish_reason)) {
+            continueLengthResponseAlloc(allocator, app_config, provider_request, &turn_result) catch |err| {
+                logError("Provider loop continuation failed: {s}", .{@errorName(err)});
+            };
+        }
 
         const with_assistant = try appendRoleMessageAlloc(
             allocator,
@@ -1264,7 +1461,8 @@ fn executeLoopRequestAlloc(
                         react_finished = true;
                     },
                     else => {
-                        const obs_raw = try react.executeReactAction(allocator, action, app_config);
+                        try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
+                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
                     },
@@ -1383,6 +1581,69 @@ fn appendRoleMessageAlloc(
     return try out.toOwnedSlice(allocator);
 }
 
+fn continueLengthResponseAlloc(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    base_request: types.Request,
+    result: *types.Response,
+) !void {
+    const max_continuations: usize = 4;
+    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    defer {
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+    }
+
+    const with_first_assistant = try appendRoleMessageAlloc(allocator, working_messages, "assistant", result.output);
+    for (working_messages) |message| {
+        message.deinit(allocator);
+    }
+    allocator.free(working_messages);
+    working_messages = with_first_assistant;
+
+    var turn: usize = 0;
+    while (turn < max_continuations and isLengthFinishReason(result.finish_reason)) : (turn += 1) {
+        const continue_prompt = length_continue_prompt;
+        const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", continue_prompt);
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_continue;
+
+        var turn_request = try cloneRequestWithMessagesAlloc(allocator, base_request, continue_prompt, working_messages);
+        defer turn_request.deinit(allocator);
+
+        var turn_result = try backend.callProvider(allocator, app_config, turn_request);
+        defer turn_result.deinit(allocator);
+        if (!turn_result.success) return;
+        if (std.mem.trim(u8, turn_result.output, " \t\r\n").len == 0) return;
+
+        const joined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ result.output, turn_result.output });
+        allocator.free(result.output);
+        result.output = joined;
+
+        allocator.free(result.finish_reason);
+        result.finish_reason = try allocator.dupe(u8, turn_result.finish_reason);
+        result.usage.prompt_tokens += turn_result.usage.prompt_tokens;
+        result.usage.completion_tokens += turn_result.usage.completion_tokens;
+        result.usage.total_tokens += turn_result.usage.total_tokens;
+
+        const with_assistant = try appendRoleMessageAlloc(allocator, working_messages, "assistant", turn_result.output);
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_assistant;
+    }
+}
+
+fn isLengthFinishReason(finish_reason: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(finish_reason, "length");
+}
+
 fn sendApiErrorSafe(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
@@ -1434,7 +1695,6 @@ fn swallowSocketWriteError(
 fn requiresAuth(route: router.Route) bool {
     return switch (route) {
         .health => false,
-        .diagnostics_providers => false,
         else => true,
     };
 }
@@ -1468,4 +1728,44 @@ test "connection gate enforces bounded capacity" {
 
     gate.release();
     try std.testing.expect(gate.tryAcquire());
+}
+
+test "connection gate recovers capacity after releases" {
+    var gate = ConnectionGate{ .max_active = 1 };
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(!gate.tryAcquire());
+
+    gate.release();
+    try std.testing.expect(gate.tryAcquire());
+    gate.release();
+    try std.testing.expect(gate.tryAcquire());
+}
+
+test "requiresAuth allows only health without an API key" {
+    try std.testing.expect(!requiresAuth(.health));
+    try std.testing.expect(requiresAuth(.metrics));
+    try std.testing.expect(requiresAuth(.diagnostics_providers));
+    try std.testing.expect(requiresAuth(.chat_completions));
+}
+
+test "server state tracks provider latency buckets" {
+    var state = ServerState.init();
+    defer state.deinit(std.testing.allocator);
+
+    state.noteProviderLatency(10);
+    state.noteProviderLatency(75);
+    state.noteProviderLatency(500);
+    state.noteProviderLatency(1500);
+
+    const snapshot = state.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.provider_latency_buckets[0]);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.provider_latency_buckets[1]);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.provider_latency_buckets[2]);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.provider_latency_buckets[3]);
+}
+
+test "isLengthFinishReason detects provider length stops" {
+    try std.testing.expect(isLengthFinishReason("length"));
+    try std.testing.expect(isLengthFinishReason("LENGTH"));
+    try std.testing.expect(!isLengthFinishReason("stop"));
 }
