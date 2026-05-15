@@ -212,6 +212,57 @@ pub fn shouldCompressContext(estimated_tokens: usize, max_context_tokens: usize)
     return estimated_tokens > max_context_tokens;
 }
 
+pub fn compactContextToBudgetAlloc(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    max_context_tokens: usize,
+    keep_last_messages: usize,
+) ![]types.Message {
+    if (!shouldCompressContext(estimateTokenCount(messages), max_context_tokens)) {
+        return try cloneMessagesAlloc(allocator, messages);
+    }
+
+    const keep_count = @min(keep_last_messages, messages.len);
+    const summary = try compressContextSummaryAlloc(allocator, messages, keep_count);
+    defer allocator.free(summary);
+
+    var out = std.ArrayList(types.Message){};
+    errdefer {
+        for (out.items) |message| {
+            message.deinit(allocator);
+        }
+        out.deinit(allocator);
+    }
+
+    if (summary.len > 0) {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, "system"),
+            .content = try allocator.dupe(u8, summary),
+        });
+    }
+
+    const start = messages.len - keep_count;
+    for (messages[start..]) |message| {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, message.role),
+            .content = try allocator.dupe(u8, message.content),
+        });
+    }
+
+    while (out.items.len > 2 and estimateTokenCount(out.items) > max_context_tokens) {
+        const drop_index: usize = if (std.mem.eql(u8, out.items[0].role, "system")) 1 else 0;
+        var dropped = out.orderedRemove(drop_index);
+        dropped.deinit(allocator);
+    }
+
+    if (out.items.len > 1 and estimateTokenCount(out.items) > max_context_tokens and std.mem.eql(u8, out.items[0].role, "system")) {
+        var dropped = out.orderedRemove(0);
+        dropped.deinit(allocator);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn compressContextSummaryAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -227,7 +278,13 @@ pub fn compressContextSummaryAlloc(
 
     try out.appendSlice(allocator, "Summary of previous context:\n");
     for (messages[0..summarize_until]) |message| {
-        try out.writer(allocator).print("- {s}: {s}\n", .{ message.role, message.content });
+        const max_content_bytes = 80;
+        const content = message.content[0..@min(message.content.len, max_content_bytes)];
+        try out.writer(allocator).print("- {s}: {s}{s}\n", .{
+            message.role,
+            content,
+            if (message.content.len > max_content_bytes) "..." else "",
+        });
     }
 
     return try out.toOwnedSlice(allocator);
@@ -516,4 +573,105 @@ test "trimToRetentionAlloc keeps latest messages" {
     try std.testing.expectEqual(@as(usize, 2), trimmed.len);
     try std.testing.expectEqualStrings("two", trimmed[0].content);
     try std.testing.expectEqualStrings("three", trimmed[1].content);
+}
+
+test "mergeMessagesAlloc preserves history before incoming messages" {
+    const allocator = std.testing.allocator;
+    const history = [_]types.Message{
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "two" },
+    };
+    const incoming = [_]types.Message{
+        .{ .role = "user", .content = "three" },
+    };
+
+    const merged = try mergeMessagesAlloc(allocator, history[0..], incoming[0..]);
+    defer {
+        for (merged) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(merged);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("one", merged[0].content);
+    try std.testing.expectEqualStrings("two", merged[1].content);
+    try std.testing.expectEqualStrings("three", merged[2].content);
+}
+
+test "FileSessionStore roundtrips state and enforces retention" {
+    const allocator = std.testing.allocator;
+    const store_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/session-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    defer allocator.free(store_path);
+    defer std.fs.cwd().deleteTree(store_path) catch {};
+
+    var file_store = try FileSessionStore.init(allocator, store_path, 2);
+    defer file_store.deinit(allocator);
+    var store = file_store.asStore();
+
+    var messages = try allocator.alloc(types.Message, 3);
+    messages[0] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "one") };
+    messages[1] = .{ .role = try allocator.dupe(u8, "assistant"), .content = try allocator.dupe(u8, "two") };
+    messages[2] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "three") };
+
+    var state = SessionState{
+        .session_id = try allocator.dupe(u8, "session/a"),
+        .tenant_id = try allocator.dupe(u8, "tenant"),
+        .summary = try allocator.dupe(u8, "kept summary"),
+        .messages = messages,
+        .message_count = messages.len,
+    };
+    defer state.deinit(allocator);
+
+    try store.save(allocator, state);
+
+    const loaded_opt = try store.load(allocator, "session/a", "tenant");
+    try std.testing.expect(loaded_opt != null);
+    const loaded = loaded_opt.?;
+    defer loaded.deinit(allocator);
+
+    try std.testing.expectEqualStrings("session/a", loaded.session_id);
+    try std.testing.expectEqualStrings("tenant", loaded.tenant_id.?);
+    try std.testing.expectEqualStrings("kept summary", loaded.summary);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.len);
+    try std.testing.expectEqualStrings("two", loaded.messages[0].content);
+    try std.testing.expectEqualStrings("three", loaded.messages[1].content);
+}
+
+test "compactContextToBudgetAlloc adds summary and keeps latest messages" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{
+        .{ .role = "user", .content = "older user content that should be summarized because it is intentionally long and no longer needs to remain as raw chat history in the outgoing provider context" },
+        .{ .role = "assistant", .content = "older assistant content that should be summarized because it is intentionally long and no longer needs to remain as raw chat history in the outgoing provider context" },
+        .{ .role = "user", .content = "latest user" },
+        .{ .role = "assistant", .content = "latest assistant" },
+    };
+
+    const compacted = try compactContextToBudgetAlloc(allocator, messages[0..], 70, 2);
+    defer {
+        for (compacted) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(compacted);
+    }
+
+    try std.testing.expect(compacted.len >= 2);
+    try std.testing.expectEqualStrings("system", compacted[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, compacted[0].content, "Summary of previous context") != null);
+    try std.testing.expectEqualStrings("latest assistant", compacted[compacted.len - 1].content);
+}
+
+test "context token estimator triggers compression past budget" {
+    const messages = [_]types.Message{
+        .{ .role = "user", .content = "12345678901234567890" },
+    };
+
+    const estimated = estimateTokenCount(messages[0..]);
+    try std.testing.expect(estimated > 0);
+    try std.testing.expect(shouldCompressContext(estimated, estimated - 1));
+    try std.testing.expect(!shouldCompressContext(estimated, estimated));
 }
