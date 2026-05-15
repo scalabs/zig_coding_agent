@@ -1,15 +1,6 @@
-//! Session persistence layer for chat conversations.
-//!
-//! Provides both an interface-backed `SessionStore` (vtable-based, pluggable)
-//! and a `FileSessionStore` that serializes sessions to JSON files on disk.
-//! Handles message trimming and context compression to stay within
-//! retention limits.
-
 const std = @import("std");
 const types = @import("../types.zig");
 
-/// Vtable-based session store interface. Delegates load/save/deinit
-/// to a concrete backend via function pointers.
 pub const SessionStore = struct {
     ctx: *anyopaque,
     loadFn: *const fn (
@@ -25,8 +16,6 @@ pub const SessionStore = struct {
     ) anyerror!void,
     deinitFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
 
-        /// Loads a session by ID, optionally scoped to a tenant.
-        /// Returns `null` if the session does not exist.
     pub fn load(
         self: *SessionStore,
         allocator: std.mem.Allocator,
@@ -36,8 +25,6 @@ pub const SessionStore = struct {
         return try self.loadFn(self.ctx, allocator, session_id, tenant_id);
     }
 
-        /// Persists a session state. Overwrites any existing session
-        /// with the same ID.
     pub fn save(
         self: *SessionStore,
         allocator: std.mem.Allocator,
@@ -46,14 +33,11 @@ pub const SessionStore = struct {
         try self.saveFn(self.ctx, allocator, state);
     }
 
-        /// Frees backend-specific resources. Does not free the `SessionStore` itself.
     pub fn deinit(self: *SessionStore, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ctx, allocator);
     }
 };
 
-/// In-memory representation of a chat session, including message history
-/// and an optional tenant scope.
 pub const SessionState = struct {
     session_id: []const u8,
     tenant_id: ?[]const u8,
@@ -61,7 +45,6 @@ pub const SessionState = struct {
     messages: []types.Message,
     message_count: usize,
 
-        /// Creates an empty session with no messages and a nil summary.
     pub fn initEmpty(
         allocator: std.mem.Allocator,
         session_id: []const u8,
@@ -76,7 +59,6 @@ pub const SessionState = struct {
         };
     }
 
-        /// Frees all owned slices (session_id, tenant_id, summary, messages).
     pub fn deinit(self: SessionState, allocator: std.mem.Allocator) void {
         allocator.free(self.session_id);
         if (self.tenant_id) |tenant_id| allocator.free(tenant_id);
@@ -88,13 +70,10 @@ pub const SessionState = struct {
     }
 };
 
-/// File-backed session store. Serializes sessions as JSON files under
-/// `base_path/<tenant>__<session_id>.json`.
 pub const FileSessionStore = struct {
     base_path: []u8,
     retention_messages: usize,
 
-        /// Opens or creates the base directory and returns a ready-to-use store.
     pub fn init(
         allocator: std.mem.Allocator,
         base_path: []const u8,
@@ -111,7 +90,6 @@ pub const FileSessionStore = struct {
         };
     }
 
-        /// Wraps this file store in the vtable-based `SessionStore` interface.
     pub fn asStore(self: *FileSessionStore) SessionStore {
         return .{
             .ctx = self,
@@ -121,13 +99,11 @@ pub const FileSessionStore = struct {
         };
     }
 
-        /// Frees the owned base_path string.
     pub fn deinit(self: *FileSessionStore, allocator: std.mem.Allocator) void {
         allocator.free(self.base_path);
     }
 };
 
-/// Deep-clones a slice of messages, duplicating role and content strings.
 pub fn cloneMessagesAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -152,7 +128,6 @@ pub fn cloneMessagesAlloc(
     return out;
 }
 
-/// Concatenates history and incoming messages into a single owned slice.
 pub fn mergeMessagesAlloc(
     allocator: std.mem.Allocator,
     history: []const types.Message,
@@ -183,7 +158,6 @@ pub fn mergeMessagesAlloc(
     return try merged.toOwnedSlice(allocator);
 }
 
-/// Appends an assistant message to a cloned copy of the existing slice.
 pub fn appendAssistantMessageAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -212,7 +186,6 @@ pub fn appendAssistantMessageAlloc(
     return try out.toOwnedSlice(allocator);
 }
 
-/// Keeps only the last `retention_messages` entries. Pass 0 to keep all.
 pub fn trimToRetentionAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -226,7 +199,6 @@ pub fn trimToRetentionAlloc(
     return try cloneMessagesAlloc(allocator, messages[start..]);
 }
 
-/// Rough token estimate: ~4 chars per token.
 pub fn estimateTokenCount(messages: []const types.Message) usize {
     var chars: usize = 0;
     for (messages) |message| {
@@ -236,13 +208,61 @@ pub fn estimateTokenCount(messages: []const types.Message) usize {
     return chars / 4;
 }
 
-/// Returns true when estimated tokens exceed the maximum context window.
 pub fn shouldCompressContext(estimated_tokens: usize, max_context_tokens: usize) bool {
     return estimated_tokens > max_context_tokens;
 }
 
-/// Produces a text summary of messages before `keep_last_messages`,
-/// intended as a context-compression header for future prompts.
+pub fn compactContextToBudgetAlloc(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    max_context_tokens: usize,
+    keep_last_messages: usize,
+) ![]types.Message {
+    if (!shouldCompressContext(estimateTokenCount(messages), max_context_tokens)) {
+        return try cloneMessagesAlloc(allocator, messages);
+    }
+
+    const keep_count = @min(keep_last_messages, messages.len);
+    const summary = try compressContextSummaryAlloc(allocator, messages, keep_count);
+    defer allocator.free(summary);
+
+    var out = std.ArrayList(types.Message){};
+    errdefer {
+        for (out.items) |message| {
+            message.deinit(allocator);
+        }
+        out.deinit(allocator);
+    }
+
+    if (summary.len > 0) {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, "system"),
+            .content = try allocator.dupe(u8, summary),
+        });
+    }
+
+    const start = messages.len - keep_count;
+    for (messages[start..]) |message| {
+        try out.append(allocator, .{
+            .role = try allocator.dupe(u8, message.role),
+            .content = try allocator.dupe(u8, message.content),
+        });
+    }
+
+    while (out.items.len > 2 and estimateTokenCount(out.items) > max_context_tokens) {
+        const drop_index: usize = if (std.mem.eql(u8, out.items[0].role, "system")) 1 else 0;
+        var dropped = out.orderedRemove(drop_index);
+        dropped.deinit(allocator);
+    }
+
+    if (out.items.len > 1 and estimateTokenCount(out.items) > max_context_tokens and std.mem.eql(u8, out.items[0].role, "system")) {
+        var dropped = out.orderedRemove(0);
+        dropped.deinit(allocator);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn compressContextSummaryAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -258,7 +278,13 @@ pub fn compressContextSummaryAlloc(
 
     try out.appendSlice(allocator, "Summary of previous context:\n");
     for (messages[0..summarize_until]) |message| {
-        try out.writer(allocator).print("- {s}: {s}\n", .{ message.role, message.content });
+        const max_content_bytes = 80;
+        const content = message.content[0..@min(message.content.len, max_content_bytes)];
+        try out.writer(allocator).print("- {s}: {s}{s}\n", .{
+            message.role,
+            content,
+            if (message.content.len > max_content_bytes) "..." else "",
+        });
     }
 
     return try out.toOwnedSlice(allocator);
@@ -547,4 +573,105 @@ test "trimToRetentionAlloc keeps latest messages" {
     try std.testing.expectEqual(@as(usize, 2), trimmed.len);
     try std.testing.expectEqualStrings("two", trimmed[0].content);
     try std.testing.expectEqualStrings("three", trimmed[1].content);
+}
+
+test "mergeMessagesAlloc preserves history before incoming messages" {
+    const allocator = std.testing.allocator;
+    const history = [_]types.Message{
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "two" },
+    };
+    const incoming = [_]types.Message{
+        .{ .role = "user", .content = "three" },
+    };
+
+    const merged = try mergeMessagesAlloc(allocator, history[0..], incoming[0..]);
+    defer {
+        for (merged) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(merged);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("one", merged[0].content);
+    try std.testing.expectEqualStrings("two", merged[1].content);
+    try std.testing.expectEqualStrings("three", merged[2].content);
+}
+
+test "FileSessionStore roundtrips state and enforces retention" {
+    const allocator = std.testing.allocator;
+    const store_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/session-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    defer allocator.free(store_path);
+    defer std.fs.cwd().deleteTree(store_path) catch {};
+
+    var file_store = try FileSessionStore.init(allocator, store_path, 2);
+    defer file_store.deinit(allocator);
+    var store = file_store.asStore();
+
+    var messages = try allocator.alloc(types.Message, 3);
+    messages[0] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "one") };
+    messages[1] = .{ .role = try allocator.dupe(u8, "assistant"), .content = try allocator.dupe(u8, "two") };
+    messages[2] = .{ .role = try allocator.dupe(u8, "user"), .content = try allocator.dupe(u8, "three") };
+
+    var state = SessionState{
+        .session_id = try allocator.dupe(u8, "session/a"),
+        .tenant_id = try allocator.dupe(u8, "tenant"),
+        .summary = try allocator.dupe(u8, "kept summary"),
+        .messages = messages,
+        .message_count = messages.len,
+    };
+    defer state.deinit(allocator);
+
+    try store.save(allocator, state);
+
+    const loaded_opt = try store.load(allocator, "session/a", "tenant");
+    try std.testing.expect(loaded_opt != null);
+    const loaded = loaded_opt.?;
+    defer loaded.deinit(allocator);
+
+    try std.testing.expectEqualStrings("session/a", loaded.session_id);
+    try std.testing.expectEqualStrings("tenant", loaded.tenant_id.?);
+    try std.testing.expectEqualStrings("kept summary", loaded.summary);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.len);
+    try std.testing.expectEqualStrings("two", loaded.messages[0].content);
+    try std.testing.expectEqualStrings("three", loaded.messages[1].content);
+}
+
+test "compactContextToBudgetAlloc adds summary and keeps latest messages" {
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{
+        .{ .role = "user", .content = "older user content that should be summarized because it is intentionally long and no longer needs to remain as raw chat history in the outgoing provider context" },
+        .{ .role = "assistant", .content = "older assistant content that should be summarized because it is intentionally long and no longer needs to remain as raw chat history in the outgoing provider context" },
+        .{ .role = "user", .content = "latest user" },
+        .{ .role = "assistant", .content = "latest assistant" },
+    };
+
+    const compacted = try compactContextToBudgetAlloc(allocator, messages[0..], 70, 2);
+    defer {
+        for (compacted) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(compacted);
+    }
+
+    try std.testing.expect(compacted.len >= 2);
+    try std.testing.expectEqualStrings("system", compacted[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, compacted[0].content, "Summary of previous context") != null);
+    try std.testing.expectEqualStrings("latest assistant", compacted[compacted.len - 1].content);
+}
+
+test "context token estimator triggers compression past budget" {
+    const messages = [_]types.Message{
+        .{ .role = "user", .content = "12345678901234567890" },
+    };
+
+    const estimated = estimateTokenCount(messages[0..]);
+    try std.testing.expect(estimated > 0);
+    try std.testing.expect(shouldCompressContext(estimated, estimated - 1));
+    try std.testing.expect(!shouldCompressContext(estimated, estimated));
 }
