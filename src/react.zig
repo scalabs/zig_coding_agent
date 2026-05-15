@@ -21,7 +21,7 @@ pub const system_prompt =
     "Available actions:\n" ++
     "  Search[query]   - search for information\n" ++
     "  Lookup[term]    - look up a term in the current context\n" ++
-    "  Cmd[command]    - execute a shell command (only if tools are enabled)\n" ++
+    "  Cmd[command]    - execute a shell command (may require confirmation)\n" ++
     "  Finish[answer]  - return the final answer and end the loop\n\n" ++
     "Rules:\n" ++
     "- Always start with a Thought, then an Action.\n" ++
@@ -31,12 +31,48 @@ pub const system_prompt =
     "- If you need information, ask for the exact term or command that will resolve it.\n" ++
     "- If an action fails, adjust your approach in the next Thought.\n";
 
+pub fn buildSystemPromptAlloc(allocator: std.mem.Allocator, tools: []const types.Tool) ![]u8 {
+    if (tools.len == 0) return try allocator.dupe(u8, system_prompt);
+
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, system_prompt);
+    try out.appendSlice(
+        allocator,
+        "\nRequested API tools are also valid Actions when named exactly:\n",
+    );
+
+    for (tools) |tool| {
+        try out.writer(allocator).print(
+            "  {s}[argument] - {s}\n",
+            .{ tool.name, tool.description },
+        );
+    }
+
+    try out.appendSlice(
+        allocator,
+        "\nTool rules:\n" ++
+            "- For file_write, include the path and fenced code block inside the brackets, for example:\n" ++
+            "  Action N: file_write[write relative/path\n```lang\n...\n```]\n" ++
+            "- Put the full tool input inside the brackets.\n",
+    );
+
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Parsed action extracted from a model response.
+pub const ToolAction = struct {
+    name: []const u8,
+    argument: []const u8,
+};
+
 pub const ReactAction = union(enum) {
     search: []const u8,
     lookup: []const u8,
     cmd: []const u8,
     finish: []const u8,
+    tool: ToolAction,
     unknown: []const u8,
 };
 
@@ -47,32 +83,72 @@ pub const ReactAction = union(enum) {
 /// - Case-insensitive match on the `Action` keyword.
 /// - The turn number after `Action` is optional (the harness tracks turns).
 /// - Brackets are mandatory for the argument.
-/// - Greedy bracket matching: takes everything up to the last `]` on the line.
+/// - Greedy bracket matching: takes everything up to the last `]` after the
+///   action, allowing multi-line tool inputs such as fenced code blocks.
 /// - Returns `null` when no action line is found.
 pub fn parseReactAction(output: []const u8) ?ReactAction {
-    // Scan backwards through lines to find the last Action directive.
-    var last_action_line: ?[]const u8 = null;
-    var lines = std.mem.splitAny(u8, output, "\n\r");
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t");
-        if (line.len == 0) continue;
+    // Scan for the FIRST Action directive that lives outside a
+    // <think>...</think> block. Returning the first action (rather than the
+    // last) lets the loop drive multi-step plans one observation at a time:
+    // if the model speculatively emits Action 2 before seeing Observation 1,
+    // we execute Action 1 and let Observation 1 inform Action 2 on the next
+    // turn.
+    var first_action_start: ?usize = null;
+    var inside_think = false;
+    var cursor: usize = 0;
+    while (cursor < output.len) {
+        if (!inside_think and startsWithIgnoreCase(output[cursor..], "<think>")) {
+            inside_think = true;
+            cursor += "<think>".len;
+            continue;
+        }
+        if (inside_think and startsWithIgnoreCase(output[cursor..], "</think>")) {
+            inside_think = false;
+            cursor += "</think>".len;
+            continue;
+        }
+
+        if (inside_think) {
+            cursor += 1;
+            continue;
+        }
+
+        const line_start = cursor;
+        var line_end = cursor;
+        while (line_end < output.len and output[line_end] != '\n' and output[line_end] != '\r') {
+            line_end += 1;
+        }
+
+        const raw_line = output[line_start..line_end];
+        const line = std.mem.trimLeft(u8, raw_line, " \t");
         if (startsWithActionDirective(line)) {
-            last_action_line = line;
+            first_action_start = line_start + (raw_line.len - line.len);
+            break;
+        }
+
+        cursor = line_end;
+        while (cursor < output.len and (output[cursor] == '\n' or output[cursor] == '\r')) {
+            cursor += 1;
         }
     }
 
-    const action_line = last_action_line orelse return null;
+    const action_start = first_action_start orelse return null;
+    // For multi-line bracket arguments (fenced code blocks) we need to
+    // bound the search for the closing `]` to the FIRST action only, not
+    // any later actions the model may have over-eagerly emitted. We do this
+    // by clipping the search window at the next `Action ` directive line.
+    const action_text = clipAtNextActionDirective(output[action_start..]);
 
     // Extract the part after "Action" (and optional number + colon).
-    const after_keyword = action_line[6..]; // "Action" is 6 chars
+    const after_keyword = action_text[6..]; // "Action" is 6 chars
     const after_prefix = skipActionPrefix(after_keyword);
-    const trimmed = std.mem.trim(u8, after_prefix, " \t");
+    const trimmed = std.mem.trimLeft(u8, after_prefix, " \t");
 
     if (trimmed.len == 0) return null;
 
     // Find the bracket pair: Type[arg]
     const open_bracket = std.mem.indexOfScalar(u8, trimmed, '[') orelse return null;
-    // Greedy: find the last ']' on the line.
+    // Greedy: find the last ']' after the action.
     const close_bracket = std.mem.lastIndexOfScalar(u8, trimmed, ']') orelse return null;
     if (close_bracket <= open_bracket) return null;
 
@@ -85,8 +161,11 @@ pub fn parseReactAction(output: []const u8) ?ReactAction {
     if (eqlIgnoreCase(action_type, "lookup")) return .{ .lookup = argument };
     if (eqlIgnoreCase(action_type, "cmd")) return .{ .cmd = argument };
     if (eqlIgnoreCase(action_type, "finish")) return .{ .finish = argument };
+    if (isKnownApiToolAction(action_type)) {
+        return .{ .tool = .{ .name = action_type, .argument = argument } };
+    }
 
-    return .{ .unknown = trimmed };
+    return .{ .unknown = trimmed[0 .. close_bracket + 1] };
 }
 
 /// Executes a parsed ReAct action and returns the observation text.
@@ -95,6 +174,8 @@ pub fn parseReactAction(output: []const u8) ?ReactAction {
 /// - `Cmd` delegates to the existing command_exec tool infrastructure.
 /// - `Finish` should be handled by the caller before reaching this function,
 ///   but returns the answer content as a fallback.
+/// - `Tool` is only executable by API loop callers that have a request tool
+///   list; the standalone executor returns a hint.
 /// - `Unknown` returns an error hint listing available actions.
 pub fn executeReactAction(
     allocator: std.mem.Allocator,
@@ -114,6 +195,11 @@ pub fn executeReactAction(
         ),
         .cmd => |command| try executeReactCmd(allocator, command, app_config),
         .finish => |answer| try allocator.dupe(u8, answer),
+        .tool => |tool| try std.fmt.allocPrint(
+            allocator,
+            "Tool action {s} is only available in API loop mode when requested by the client.",
+            .{tool.name},
+        ),
         .unknown => |text| try std.fmt.allocPrint(
             allocator,
             "Unknown action: {s}. Available actions: Search, Lookup, Cmd, Finish.",
@@ -221,6 +307,48 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (prefix.len > value.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+/// Returns a prefix of `text` that ends just before the next line starting
+/// with `Action ` (case-insensitive). The first line is always kept since it
+/// is itself the Action directive being parsed.
+fn clipAtNextActionDirective(text: []const u8) []const u8 {
+    var cursor: usize = 0;
+    // Skip the directive's own first line.
+    while (cursor < text.len and text[cursor] != '\n' and text[cursor] != '\r') {
+        cursor += 1;
+    }
+
+    while (cursor < text.len) {
+        while (cursor < text.len and (text[cursor] == '\n' or text[cursor] == '\r')) {
+            cursor += 1;
+        }
+        const line_start = cursor;
+        while (cursor < text.len and text[cursor] != '\n' and text[cursor] != '\r') {
+            cursor += 1;
+        }
+
+        const raw_line = text[line_start..cursor];
+        const line = std.mem.trimLeft(u8, raw_line, " \t");
+        if (startsWithActionDirective(line)) {
+            return text[0..line_start];
+        }
+    }
+    return text;
+}
+
+fn isKnownApiToolAction(action_type: []const u8) bool {
+    return eqlIgnoreCase(action_type, "echo") or
+        eqlIgnoreCase(action_type, "utc") or
+        eqlIgnoreCase(action_type, "bash") or
+        eqlIgnoreCase(action_type, "file_read") or
+        eqlIgnoreCase(action_type, "file_write") or
+        eqlIgnoreCase(action_type, "file_search");
+}
+
 // ── tests ─────────────────────────────────────────────────────────────
 
 test "parseReactAction extracts Search action" {
@@ -273,6 +401,32 @@ test "parseReactAction returns unknown for unrecognized action type" {
     }
 }
 
+test "parseReactAction extracts requested API tool action" {
+    const action = parseReactAction("Thought 1: write the file\nAction 1: file_write[write app.cpp\n```cpp\nint main() { return 0; }\n```]");
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .tool => |tool| {
+            try std.testing.expectEqualStrings("file_write", tool.name);
+            try std.testing.expect(std.mem.indexOf(u8, tool.argument, "app.cpp") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tool.argument, "int main()") != null);
+        },
+        else => return error.UnexpectedActionType,
+    }
+}
+
+test "buildSystemPromptAlloc includes requested tools" {
+    const allocator = std.testing.allocator;
+    const tools = [_]types.Tool{
+        .{ .name = "file_write", .description = "write files" },
+    };
+
+    const prompt = try buildSystemPromptAlloc(allocator, tools[0..]);
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "file_write[argument]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "file_write[write relative/path") != null);
+}
+
 test "parseReactAction handles nested brackets greedily" {
     const action = parseReactAction("Action 5: Finish[1,800 to 7,000 ft]");
     try std.testing.expect(action != null);
@@ -305,7 +459,7 @@ test "parseReactAction tolerates missing turn number" {
     }
 }
 
-test "parseReactAction uses last action line when multiple exist" {
+test "parseReactAction returns first action when model emits multiple" {
     const output =
         "Thought 1: first thought\n" ++
         "Action 1: Search[first]\n" ++
@@ -314,7 +468,37 @@ test "parseReactAction uses last action line when multiple exist" {
     const action = parseReactAction(output);
     try std.testing.expect(action != null);
     switch (action.?) {
-        .finish => |answer| try std.testing.expectEqualStrings("final answer", answer),
+        .search => |query| try std.testing.expectEqualStrings("first", query),
+        else => return error.UnexpectedActionType,
+    }
+}
+
+test "parseReactAction ignores Action mentions inside <think> block" {
+    const output =
+        "<think>I should probably emit Action 1: Search[bad]\nsomething</think>\n" ++
+        "Action 1: Finish[real answer]";
+    const action = parseReactAction(output);
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .finish => |answer| try std.testing.expectEqualStrings("real answer", answer),
+        else => return error.UnexpectedActionType,
+    }
+}
+
+test "parseReactAction parses multi-line first action when a second follows" {
+    const output =
+        "Thought 1: write the file\n" ++
+        "Action 1: file_write[calculator.cpp\n```cpp\nint main(){}\n```]\n" ++
+        "Action 2: cmd[g++ -o calculator calculator.cpp]";
+    const action = parseReactAction(output);
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .tool => |tool| {
+            try std.testing.expectEqualStrings("file_write", tool.name);
+            try std.testing.expect(std.mem.indexOf(u8, tool.argument, "calculator.cpp") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tool.argument, "int main(){}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, tool.argument, "g++") == null);
+        },
         else => return error.UnexpectedActionType,
     }
 }
