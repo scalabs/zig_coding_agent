@@ -40,6 +40,8 @@ fn executeRead(
 ) !types.Response {
     const path_raw = parseSingleArgAfterPrefix(prompt, "read ") orelse
         parseSingleArgAfterPrefix(prompt, "file_read ") orelse
+        parseSingleArgAfterPrefix(prompt, "exists ") orelse
+        parseSingleArgAfterPrefix(prompt, "file_exists ") orelse
         parseSingleArgAfterPrefix(prompt, "open ") orelse
         prompt;
 
@@ -96,7 +98,7 @@ fn executeWrite(
     prompt: []const u8,
 ) !types.Response {
     const parsed = parseWritePrompt(allocator, prompt) catch blk: {
-        const inferred_path = inferPyFilenameFromPromptAlloc(allocator, prompt) orelse break :blk null;
+        const inferred_path = inferWriteFilenameFromPromptAlloc(allocator, prompt) orelse break :blk null;
         errdefer allocator.free(inferred_path);
 
         const inferred_content = extractLastFencedCodeBlockAlloc(allocator, request.messages) orelse {
@@ -180,8 +182,8 @@ fn executeWrite(
 
     const out = try std.fmt.allocPrint(
         allocator,
-        "DEBUG_TOOL_OK\ntool={s}\npath={s}\nbytes_written={d}\nduration_ms={d}",
-        .{ tool_name, tmp_rel_path, parsed.content.len, duration_ms },
+        "DEBUG_TOOL_OK\ntool={s}\npath={s}\nbytes_written={d}\nduration_ms={d}\n--- content ---\n{s}",
+        .{ tool_name, tmp_rel_path, parsed.content.len, duration_ms, parsed.content },
     );
     return try makeToolResponse(allocator, tool_name, out);
 }
@@ -279,7 +281,7 @@ fn executeSearch(
     return try makeToolResponse(allocator, tool_name, try out.toOwnedSlice(allocator));
 }
 
-fn inferPyFilenameFromPromptAlloc(allocator: std.mem.Allocator, prompt: []const u8) ?[]u8 {
+fn inferWriteFilenameFromPromptAlloc(allocator: std.mem.Allocator, prompt: []const u8) ?[]u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     if (trimmed.len == 0) return null;
 
@@ -287,7 +289,7 @@ fn inferPyFilenameFromPromptAlloc(allocator: std.mem.Allocator, prompt: []const 
     var last_match: ?[]const u8 = null;
     while (it.next()) |tok| {
         if (tok.len < 4) continue;
-        if (!std.ascii.endsWithIgnoreCase(tok, ".py")) continue;
+        if (!isSupportedWriteFilename(tok)) continue;
         last_match = tok;
     }
 
@@ -295,6 +297,19 @@ fn inferPyFilenameFromPromptAlloc(allocator: std.mem.Allocator, prompt: []const 
         return allocator.dupe(u8, m) catch null;
     }
     return null;
+}
+
+fn isSupportedWriteFilename(path: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(path, ".py") or
+        std.ascii.endsWithIgnoreCase(path, ".cpp") or
+        std.ascii.endsWithIgnoreCase(path, ".cc") or
+        std.ascii.endsWithIgnoreCase(path, ".cxx") or
+        std.ascii.endsWithIgnoreCase(path, ".c") or
+        std.ascii.endsWithIgnoreCase(path, ".h") or
+        std.ascii.endsWithIgnoreCase(path, ".hpp") or
+        std.ascii.endsWithIgnoreCase(path, ".js") or
+        std.ascii.endsWithIgnoreCase(path, ".ts") or
+        std.ascii.endsWithIgnoreCase(path, ".zig");
 }
 
 fn extractLastFencedCodeBlockAlloc(allocator: std.mem.Allocator, messages: []const types.Message) ?[]u8 {
@@ -455,5 +470,18 @@ fn makeToolResponse(
         .success = true,
         .usage = .{},
     };
+}
+
+test "inferWriteFilenameFromPromptAlloc supports C++ filenames" {
+    const allocator = std.testing.allocator;
+    const path = inferWriteFilenameFromPromptAlloc(allocator, "file_write app.cpp") orelse return error.ExpectedFilename;
+    defer allocator.free(path);
+
+    try std.testing.expectEqualStrings("app.cpp", path);
+}
+
+test "isSupportedWriteFilename keeps Python inference" {
+    try std.testing.expect(isSupportedWriteFilename("count.py"));
+    try std.testing.expect(!isSupportedWriteFilename("notes.txt"));
 }
 
