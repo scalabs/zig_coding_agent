@@ -46,10 +46,14 @@ pub const Config = struct {
     session_store_path: []const u8,
     session_retention_messages: usize,
     tool_exec_enabled: bool,
+    tool_exec_confirmation_required: bool,
     tool_exec_timeout_ms: u32,
     tool_exec_max_output_bytes: usize,
+    max_tool_calls_per_request: usize,
     loop_stream_progress_enabled: bool,
     max_concurrent_connections: usize,
+    max_request_bytes: usize,
+    max_header_bytes: usize,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         return try loadWithOverrides(allocator, null);
@@ -111,8 +115,8 @@ pub const Config = struct {
                 "qwen3.5:9b",
                 env_overrides,
             ),
-            .ollama_think = try getEnvFlag(allocator, "OLLAMA_THINK", env_overrides),
-            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 128, env_overrides),
+            .ollama_think = try getEnvFlagOrDefault(allocator, "OLLAMA_THINK", true, env_overrides),
+            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 2048, env_overrides),
             .ollama_temperature = try getEnvF64OrDefault(allocator, "OLLAMA_TEMPERATURE", 0.7, env_overrides),
             .ollama_repeat_penalty = try getEnvF64OrDefault(allocator, "OLLAMA_REPEAT_PENALTY", 1.05, env_overrides),
             .openai_base_url = try getEnvOrDefault(
@@ -247,10 +251,19 @@ pub const Config = struct {
                 env_overrides,
             ),
             .tool_exec_enabled = try getEnvFlag(allocator, "LLM_ROUTER_TOOL_EXEC_ENABLED", env_overrides),
+            .tool_exec_confirmation_required = try getEnvFlagOrDefault(
+                allocator,
+                "LLM_ROUTER_TOOL_EXEC_CONFIRM_REQUIRED",
+                true,
+                env_overrides,
+            ),
             .tool_exec_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS", 15_000, env_overrides),
             .tool_exec_max_output_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES", 65_536, env_overrides),
+            .max_tool_calls_per_request = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_TOOL_CALLS_PER_REQUEST", 8, env_overrides),
             .loop_stream_progress_enabled = try getEnvFlagOrDefault(allocator, "LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED", true, env_overrides),
             .max_concurrent_connections = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS", 64, env_overrides),
+            .max_request_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_REQUEST_BYTES", 1024 * 1024, env_overrides),
+            .max_header_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_HEADER_BYTES", 16 * 1024, env_overrides),
         };
     }
 
@@ -499,7 +512,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
         .ollama_model = try allocator.dupe(u8, "qwen:7b"),
         .ollama_think = false,
-        .ollama_num_predict = 512,
+        .ollama_num_predict = 1024,
         .ollama_temperature = 0.7,
         .ollama_repeat_penalty = 1.05,
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
@@ -525,10 +538,14 @@ test "setDefaultProvider stores canonical provider alias" {
         .session_store_path = try allocator.dupe(u8, "logs/sessions"),
         .session_retention_messages = 24,
         .tool_exec_enabled = false,
+        .tool_exec_confirmation_required = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .max_tool_calls_per_request = 8,
         .loop_stream_progress_enabled = true,
         .max_concurrent_connections = 64,
+        .max_request_bytes = 1024 * 1024,
+        .max_header_bytes = 16 * 1024,
     };
     defer cfg.deinit(allocator);
 
