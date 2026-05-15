@@ -42,6 +42,11 @@ pub fn validateRequestedTools(
     return true;
 }
 
+pub fn noteToolCall(max_calls: usize, used_calls: *usize) !void {
+    if (used_calls.* >= max_calls) return error.ToolCallLimitExceeded;
+    used_calls.* += 1;
+}
+
 /// Executes simple built-in debug tools directly in the harness.
 ///
 /// This is intentionally minimal and deterministic so UI clients can verify
@@ -65,11 +70,17 @@ pub fn tryExecuteDebugTool(
 
     if (std.ascii.eqlIgnoreCase(choice, "cmd")) {
         if (!hasRequestedTool(request.tools, "cmd")) return null;
+        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, request.prompt);
+        defer if (command) |value| allocator.free(value);
+        if (command == null) return null;
         return try command_exec_tool.execute(allocator, app_config, request, .cmd);
     }
 
     if (std.ascii.eqlIgnoreCase(choice, "bash")) {
         if (!hasRequestedTool(request.tools, "bash")) return null;
+        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, request.prompt);
+        defer if (command) |value| allocator.free(value);
+        if (command == null) return null;
         return try command_exec_tool.execute(allocator, app_config, request, .bash);
     }
 
@@ -109,9 +120,11 @@ pub fn maybeExecutePromptToolsAlloc(
     defer output.deinit(allocator);
 
     var executed_any = false;
+    var tool_calls: usize = 0;
     try output.appendSlice(allocator, "Tool execution results:\n");
 
     if (hasRequestedTool(request.tools, "utc") and mentionsUtcIntent(prompt)) {
+        try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
         const utc_result = try utc_tool.execute(allocator, request);
         defer utc_result.deinit(allocator);
 
@@ -126,6 +139,7 @@ pub fn maybeExecutePromptToolsAlloc(
     const file_search_requested = hasRequestedTool(request.tools, "file_search");
 
     if (file_read_requested and mentionsFileReadIntent(prompt)) {
+        try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
         const read_result = try file_ops_tool.execute(allocator, app_config, request, .read);
         defer read_result.deinit(allocator);
         try output.writer(allocator).print("\n[tool=file_read]\n{s}\n", .{read_result.output});
@@ -133,6 +147,7 @@ pub fn maybeExecutePromptToolsAlloc(
     }
 
     if (file_search_requested and mentionsFileSearchIntent(prompt)) {
+        try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
         const search_result = try file_ops_tool.execute(allocator, app_config, request, .search);
         defer search_result.deinit(allocator);
         try output.writer(allocator).print("\n[tool=file_search]\n{s}\n", .{search_result.output});
@@ -158,6 +173,7 @@ pub fn maybeExecutePromptToolsAlloc(
         const write_req = try buildSinglePromptRequestAlloc(allocator, write_prompt);
         defer write_req.deinit(allocator);
 
+        try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
         const write_result = try file_ops_tool.execute(allocator, app_config, write_req, .write);
         defer write_result.deinit(allocator);
 
@@ -170,6 +186,7 @@ pub fn maybeExecutePromptToolsAlloc(
             const run_req = try buildSinglePromptRequestAlloc(allocator, run_prompt);
             defer run_req.deinit(allocator);
 
+            try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
             const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .cmd);
             defer run_result.deinit(allocator);
 
@@ -180,6 +197,7 @@ pub fn maybeExecutePromptToolsAlloc(
             const run_req = try buildSinglePromptRequestAlloc(allocator, run_prompt);
             defer run_req.deinit(allocator);
 
+            try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
             const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .bash);
             defer run_result.deinit(allocator);
 
@@ -195,6 +213,7 @@ pub fn maybeExecutePromptToolsAlloc(
             const cmd_request = try buildSinglePromptRequestAlloc(allocator, command);
             defer cmd_request.deinit(allocator);
 
+            try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
             const cmd_result = try command_exec_tool.execute(allocator, app_config, cmd_request, .cmd);
             defer cmd_result.deinit(allocator);
 
@@ -211,6 +230,7 @@ pub fn maybeExecutePromptToolsAlloc(
             const bash_request = try buildSinglePromptRequestAlloc(allocator, command);
             defer bash_request.deinit(allocator);
 
+            try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
             const bash_result = try command_exec_tool.execute(allocator, app_config, bash_request, .bash);
             defer bash_result.deinit(allocator);
 
@@ -492,4 +512,46 @@ test "maybeExecutePromptToolsAlloc extracts command for cmd" {
     try std.testing.expect(summary != null);
     try std.testing.expect(std.mem.indexOf(u8, summary.?, "[tool=cmd]") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary.?, "command=zig build test") != null);
+}
+
+test "tryExecuteDebugTool ignores natural language cmd selection" {
+    const allocator = std.testing.allocator;
+
+    const messages = try allocator.alloc(types.Message, 1);
+    messages[0] = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = try allocator.dupe(u8, "Please write a small C++ program"),
+    };
+
+    const tools = try allocator.alloc(types.Tool, 1);
+    tools[0] = .{
+        .name = try allocator.dupe(u8, "cmd"),
+        .description = try allocator.dupe(u8, "windows command tool"),
+    };
+
+    const req = types.Request{
+        .prompt = try allocator.dupe(u8, "Please write a small C++ program"),
+        .messages = messages,
+        .provider = null,
+        .model = null,
+        .session_id = null,
+        .tenant_id = null,
+        .max_context_tokens = null,
+        .tools = tools,
+        .tool_choice = try allocator.dupe(u8, "cmd"),
+    };
+    defer req.deinit(allocator);
+
+    var cfg = try command_exec_tool.buildTestConfig(allocator, true);
+    defer cfg.deinit(allocator);
+
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg);
+    try std.testing.expect(maybe_result == null);
+}
+
+test "noteToolCall enforces configured tool call cap" {
+    var used: usize = 0;
+    try noteToolCall(1, &used);
+    try std.testing.expectEqual(@as(usize, 1), used);
+    try std.testing.expectError(error.ToolCallLimitExceeded, noteToolCall(1, &used));
 }

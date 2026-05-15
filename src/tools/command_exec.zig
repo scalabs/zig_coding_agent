@@ -23,6 +23,47 @@ const PipeCapture = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+const tool_confirm_prefix = "LLM_ROUTER_TOOL_CONFIRM ";
+
+fn parseHexU64(input: []const u8) ?u64 {
+    var value: u64 = 0;
+    if (input.len == 0) return null;
+    for (input) |c| {
+        const digit: u8 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return null,
+        };
+        value = (value << 4) | @as(u64, @intCast(digit));
+    }
+    return value;
+}
+
+fn findToolConfirmToken(prompt: []const u8) ?u64 {
+    const idx = std.mem.indexOf(u8, prompt, tool_confirm_prefix) orelse return null;
+    const after = prompt[idx + tool_confirm_prefix.len ..];
+    const token_end = std.mem.indexOfAny(u8, after, " \t\r\n") orelse after.len;
+    const token_str = after[0..token_end];
+    return parseHexU64(token_str);
+}
+
+fn stripToolConfirmMarkerSuffix(prompt: []const u8) []const u8 {
+    const idx = std.mem.indexOf(u8, prompt, tool_confirm_prefix) orelse return prompt;
+    return prompt[0..idx];
+}
+
+fn computeToolConfirmHash(flavor: ShellFlavor, command: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const flavor_bytes = switch (flavor) {
+        .cmd => "cmd",
+        .bash => "bash",
+    };
+    h.update(flavor_bytes);
+    h.update(command);
+    return h.final();
+}
+
 pub fn execute(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -46,8 +87,8 @@ pub fn execute(
         );
     }
 
-    const prompt = std.mem.trim(u8, request.prompt, " \t\r\n");
-    if (prompt.len == 0) {
+    const raw_prompt = std.mem.trim(u8, request.prompt, " \t\r\n");
+    if (raw_prompt.len == 0) {
         return try makeToolResponse(
             allocator,
             tool_name,
@@ -58,6 +99,16 @@ pub fn execute(
             ),
         );
     }
+
+    const maybe_confirm_token = if (app_config.tool_exec_confirmation_required)
+        findToolConfirmToken(raw_prompt)
+    else
+        null;
+
+    const prompt = if (app_config.tool_exec_confirmation_required)
+        stripToolConfirmMarkerSuffix(raw_prompt)
+    else
+        raw_prompt;
 
     const command = blk: {
         if (looksLikeCommandPrompt(prompt)) {
@@ -93,6 +144,41 @@ pub fn execute(
         );
     };
     defer allocator.free(command);
+
+    if (app_config.tool_exec_confirmation_required) {
+        const expected = computeToolConfirmHash(flavor, command);
+        if (maybe_confirm_token == null) {
+            const token_hex = try std.fmt.allocPrint(allocator, "{x}", .{expected});
+            defer allocator.free(token_hex);
+
+            const out = try std.fmt.allocPrint(
+                allocator,
+                "DEBUG_TOOL_CONFIRMATION_REQUIRED\n" ++
+                    "tool={s}\n" ++
+                    "command={s}\n" ++
+                    "confirm_token={s}\n" ++
+                    "message=tool execution requires confirmation. Re-send the same command with a line containing: LLM_ROUTER_TOOL_CONFIRM {s}\n",
+                .{ tool_name, command, token_hex, token_hex },
+            );
+            return try makeToolResponse(allocator, tool_name, out);
+        }
+
+        if (maybe_confirm_token.? != expected) {
+            const token_hex = try std.fmt.allocPrint(allocator, "{x}", .{expected});
+            defer allocator.free(token_hex);
+
+            const out = try std.fmt.allocPrint(
+                allocator,
+                "DEBUG_TOOL_CONFIRMATION_REQUIRED\n" ++
+                    "tool={s}\n" ++
+                    "command={s}\n" ++
+                    "confirm_token={s}\n" ++
+                    "message=tool execution requires confirmation. Re-send the same command with a line containing: LLM_ROUTER_TOOL_CONFIRM {s}\n",
+                .{ tool_name, command, token_hex, token_hex },
+            );
+            return try makeToolResponse(allocator, tool_name, out);
+        }
+    }
 
     const start_ms = std.time.milliTimestamp();
 
@@ -225,7 +311,8 @@ pub fn extractCommandFromPromptAlloc(
     flavor: ShellFlavor,
     prompt: []const u8,
 ) !?[]u8 {
-    const trimmed = std.mem.trim(u8, prompt, " \t\r\n\"'");
+    const without_confirm = stripToolConfirmMarkerSuffix(prompt);
+    const trimmed = std.mem.trim(u8, without_confirm, " \t\r\n\"'");
     if (trimmed.len == 0) return null;
 
     if (extractQuotedCommandSlice(trimmed)) |quoted| {
@@ -454,6 +541,8 @@ fn extractQuotedCommandSlice(text: []const u8) ?[]const u8 {
 fn isLikelyNaturalLanguageLeadToken(token: []const u8) bool {
     const words = [_][]const u8{
         "what",
+        "i",
+        "we",
         "why",
         "how",
         "when",
@@ -467,6 +556,10 @@ fn isLikelyNaturalLanguageLeadToken(token: []const u8) bool {
         "tell",
         "show",
         "explain",
+        "write",
+        "create",
+        "build",
+        "make",
         "get",
     };
 
@@ -548,7 +641,7 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
         .ollama_model = try allocator.dupe(u8, "qwen:7b"),
         .ollama_think = false,
-        .ollama_num_predict = 128,
+        .ollama_num_predict = 1024,
         .ollama_temperature = 0.7,
         .ollama_repeat_penalty = 1.05,
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
@@ -574,10 +667,14 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .session_store_path = try allocator.dupe(u8, "logs/sessions"),
         .session_retention_messages = 24,
         .tool_exec_enabled = enable_exec,
+        .tool_exec_confirmation_required = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .max_tool_calls_per_request = 8,
         .loop_stream_progress_enabled = true,
         .max_concurrent_connections = 64,
+        .max_request_bytes = 1024 * 1024,
+        .max_header_bytes = 16 * 1024,
     };
 }
 
@@ -626,6 +723,18 @@ test "extractCommandFromPromptAlloc extracts from run prefix" {
 
     try std.testing.expect(maybe_cmd != null);
     try std.testing.expectEqualStrings("zig build test", maybe_cmd.?);
+}
+
+test "extractCommandFromPromptAlloc ignores natural language requests" {
+    const allocator = std.testing.allocator;
+    const maybe_cmd = try extractCommandFromPromptAlloc(
+        allocator,
+        .cmd,
+        "Please write a small C++ program",
+    );
+    defer if (maybe_cmd) |cmd| allocator.free(cmd);
+
+    try std.testing.expect(maybe_cmd == null);
 }
 
 test "execute cmd tool rejects unsafe chaining" {
