@@ -17,6 +17,7 @@ This project exposes a chat-completions API, routes requests across multiple pro
 - Provider routing behind one endpoint with alias normalization.
 - CLI and request-level loop primitives for multi-turn agent execution.
 - Optional debug tooling (echo, utc, cmd, bash) with safe defaults.
+- Tool declarations with optional JSON Schema input metadata for compatible providers.
 - Simple deploy surface: single Zig binary, environment-based configuration.
 
 ## Architecture
@@ -111,7 +112,13 @@ At least one of messages or prompt is required, but not both.
   "session_id": "session-123",
   "tenant_id": "tenant-a",
   "max_context_tokens": 4096,
-  "tools": [{ "name": "utc", "description": "Current UTC time" }],
+  "tools": [
+    {
+      "name": "utc",
+      "description": "Current UTC time",
+      "input_schema": "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}"
+    }
+  ],
   "tool_choice": "auto",
   "loop_mode": "agent",
   "loop_until": "DONE",
@@ -120,6 +127,8 @@ At least one of messages or prompt is required, but not both.
 ```
 
 Supported message roles: system, user, assistant, tool.
+
+Tool declarations require a unique name and may include description plus schema metadata. The schema is supplied as a JSON string in input_schema, parameters, or schema; the router validates that the string is valid JSON and renders it as function parameters for Ollama and OpenAI-compatible providers. tool_choice accepts auto, none, required, or the name of a requested tool.
 
 ### Streaming
 
@@ -167,7 +176,7 @@ Loop controls:
 
 ## ReAct Mode
 
-ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn.
+ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn. Both CLI prompt loops and request-level loops support loop_mode=react.
 
 ### Available Actions
 
@@ -216,6 +225,8 @@ Observation 1: <result from action execution>
 ```
 
 This continues until the model emits `Action N: Finish[answer]` or the turn budget is exhausted.
+
+ReAct parsing scans the last Action line in the model output. The turn number is optional, action names are case-insensitive, and arguments must be wrapped in brackets. Finish must contain only the final answer text, for example `Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]`.
 
 ## Tools
 
