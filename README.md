@@ -17,6 +17,7 @@ This project exposes a chat-completions API, routes requests across multiple pro
 - Provider routing behind one endpoint with alias normalization.
 - CLI and request-level loop primitives for multi-turn agent execution.
 - Optional debug tooling (echo, utc, cmd, bash) with safe defaults.
+- Tool declarations with optional JSON Schema input metadata for compatible providers.
 - Simple deploy surface: single Zig binary, environment-based configuration.
 
 ## Architecture
@@ -111,7 +112,13 @@ At least one of messages or prompt is required, but not both.
   "session_id": "session-123",
   "tenant_id": "tenant-a",
   "max_context_tokens": 4096,
-  "tools": [{ "name": "utc", "description": "Current UTC time" }],
+  "tools": [
+    {
+      "name": "utc",
+      "description": "Current UTC time",
+      "input_schema": "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}"
+    }
+  ],
   "tool_choice": "auto",
   "loop_mode": "agent",
   "loop_until": "DONE",
@@ -120,6 +127,8 @@ At least one of messages or prompt is required, but not both.
 ```
 
 Supported message roles: system, user, assistant, tool.
+
+Tool declarations require a unique name and may include description plus schema metadata. The schema is supplied as a JSON string in input_schema, parameters, or schema; the router validates that the string is valid JSON and renders it as function parameters for Ollama and OpenAI-compatible providers. tool_choice accepts auto, none, required, or the name of a requested tool.
 
 ### Streaming
 
@@ -159,10 +168,65 @@ Loop controls:
 - --provider <name> provider override
 - --until <marker> completion marker (default: DONE)
 - --max-turns <n> loop safety cap (default: 8)
-- --loop-mode <basic|agent> loop style
+- --loop-mode <basic|agent|react> loop style
 - --agent-loop shorthand for agent mode
+- --react shorthand for ReAct reasoning mode
 - --use-env load .env
 - --env-file <path> load a custom dotenv file
+
+## ReAct Mode
+
+ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn. Both CLI prompt loops and request-level loops support loop_mode=react.
+
+### Available Actions
+
+| Action    | Description                       | Requirements                             |
+| --------- | --------------------------------- | ---------------------------------------- |
+| Search[q] | Search for information (stub)     | None (future: wire to search tool/API)   |
+| Lookup[t] | Look up a term in context (stub)  | None (future: wire to retrieval backend) |
+| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`         |
+| Finish[a] | Return final answer and stop loop | None                                     |
+
+> [!NOTE]
+> Search and Lookup return stub responses. They are designed as extension points for future tool/API integration.
+
+### CLI Example
+
+```bash
+zig build run -- --react --prompt "What is the elevation range of the High Plains?" --provider ollama
+```
+
+### API Example
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the elevation range of the High Plains?"
+    }
+  ],
+  "loop_mode": "react",
+  "loop_max_turns": 10
+}
+```
+
+The model will produce output like:
+
+```
+Thought 1: I need to search for the High Plains elevation range.
+Action 1: Search[High Plains elevation]
+```
+
+The system injects:
+
+```
+Observation 1: <result from action execution>
+```
+
+This continues until the model emits `Action N: Finish[answer]` or the turn budget is exhausted.
+
+ReAct parsing scans the last Action line in the model output. The turn number is optional, action names are case-insensitive, and arguments must be wrapped in brackets. Finish must contain only the final answer text, for example `Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]`.
 
 ## Tools
 
@@ -326,6 +390,7 @@ zig_coding_agent
     │   ├── openai.zig
     │   ├── openai_compatible.zig
     │   └── openrouter.zig
+    ├── react.zig
     ├── root.zig
     ├── tools
     │   ├── command_exec.zig

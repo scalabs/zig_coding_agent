@@ -1,6 +1,15 @@
+//! Session persistence layer for chat conversations.
+//!
+//! Provides both an interface-backed `SessionStore` (vtable-based, pluggable)
+//! and a `FileSessionStore` that serializes sessions to JSON files on disk.
+//! Handles message trimming and context compression to stay within
+//! retention limits.
+
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Vtable-based session store interface. Delegates load/save/deinit
+/// to a concrete backend via function pointers.
 pub const SessionStore = struct {
     ctx: *anyopaque,
     loadFn: *const fn (
@@ -16,6 +25,8 @@ pub const SessionStore = struct {
     ) anyerror!void,
     deinitFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
 
+        /// Loads a session by ID, optionally scoped to a tenant.
+        /// Returns `null` if the session does not exist.
     pub fn load(
         self: *SessionStore,
         allocator: std.mem.Allocator,
@@ -25,6 +36,8 @@ pub const SessionStore = struct {
         return try self.loadFn(self.ctx, allocator, session_id, tenant_id);
     }
 
+        /// Persists a session state. Overwrites any existing session
+        /// with the same ID.
     pub fn save(
         self: *SessionStore,
         allocator: std.mem.Allocator,
@@ -33,11 +46,14 @@ pub const SessionStore = struct {
         try self.saveFn(self.ctx, allocator, state);
     }
 
+        /// Frees backend-specific resources. Does not free the `SessionStore` itself.
     pub fn deinit(self: *SessionStore, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ctx, allocator);
     }
 };
 
+/// In-memory representation of a chat session, including message history
+/// and an optional tenant scope.
 pub const SessionState = struct {
     session_id: []const u8,
     tenant_id: ?[]const u8,
@@ -45,6 +61,7 @@ pub const SessionState = struct {
     messages: []types.Message,
     message_count: usize,
 
+        /// Creates an empty session with no messages and a nil summary.
     pub fn initEmpty(
         allocator: std.mem.Allocator,
         session_id: []const u8,
@@ -59,6 +76,7 @@ pub const SessionState = struct {
         };
     }
 
+        /// Frees all owned slices (session_id, tenant_id, summary, messages).
     pub fn deinit(self: SessionState, allocator: std.mem.Allocator) void {
         allocator.free(self.session_id);
         if (self.tenant_id) |tenant_id| allocator.free(tenant_id);
@@ -70,10 +88,13 @@ pub const SessionState = struct {
     }
 };
 
+/// File-backed session store. Serializes sessions as JSON files under
+/// `base_path/<tenant>__<session_id>.json`.
 pub const FileSessionStore = struct {
     base_path: []u8,
     retention_messages: usize,
 
+        /// Opens or creates the base directory and returns a ready-to-use store.
     pub fn init(
         allocator: std.mem.Allocator,
         base_path: []const u8,
@@ -90,6 +111,7 @@ pub const FileSessionStore = struct {
         };
     }
 
+        /// Wraps this file store in the vtable-based `SessionStore` interface.
     pub fn asStore(self: *FileSessionStore) SessionStore {
         return .{
             .ctx = self,
@@ -99,11 +121,13 @@ pub const FileSessionStore = struct {
         };
     }
 
+        /// Frees the owned base_path string.
     pub fn deinit(self: *FileSessionStore, allocator: std.mem.Allocator) void {
         allocator.free(self.base_path);
     }
 };
 
+/// Deep-clones a slice of messages, duplicating role and content strings.
 pub fn cloneMessagesAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -128,6 +152,7 @@ pub fn cloneMessagesAlloc(
     return out;
 }
 
+/// Concatenates history and incoming messages into a single owned slice.
 pub fn mergeMessagesAlloc(
     allocator: std.mem.Allocator,
     history: []const types.Message,
@@ -158,6 +183,7 @@ pub fn mergeMessagesAlloc(
     return try merged.toOwnedSlice(allocator);
 }
 
+/// Appends an assistant message to a cloned copy of the existing slice.
 pub fn appendAssistantMessageAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -186,6 +212,7 @@ pub fn appendAssistantMessageAlloc(
     return try out.toOwnedSlice(allocator);
 }
 
+/// Keeps only the last `retention_messages` entries. Pass 0 to keep all.
 pub fn trimToRetentionAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -199,6 +226,7 @@ pub fn trimToRetentionAlloc(
     return try cloneMessagesAlloc(allocator, messages[start..]);
 }
 
+/// Rough token estimate: ~4 chars per token.
 pub fn estimateTokenCount(messages: []const types.Message) usize {
     var chars: usize = 0;
     for (messages) |message| {
@@ -208,10 +236,13 @@ pub fn estimateTokenCount(messages: []const types.Message) usize {
     return chars / 4;
 }
 
+/// Returns true when estimated tokens exceed the maximum context window.
 pub fn shouldCompressContext(estimated_tokens: usize, max_context_tokens: usize) bool {
     return estimated_tokens > max_context_tokens;
 }
 
+/// Produces a text summary of messages before `keep_last_messages`,
+/// intended as a context-compression header for future prompts.
 pub fn compressContextSummaryAlloc(
     allocator: std.mem.Allocator,
     messages: []const types.Message,

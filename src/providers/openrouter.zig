@@ -1,8 +1,16 @@
+//! OpenRouter provider adapter.
+//!
+//! Proxies requests through OpenRouter using the OpenAI-compatible
+//! endpoint, injecting `http-referer` and `x-openrouter-title` headers
+//! when configured.
+
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 const openai_compatible = @import("openai_compatible.zig");
 
+/// Delegates to `openai_compatible.callChatWithExtraHeaders` with
+/// OpenRouter credentials and optional referer/app-name headers.
 pub fn callOpenRouter(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -35,6 +43,7 @@ pub fn callOpenRouter(
     );
 }
 
+/// Returns a JSON status payload describing the OpenRouter provider config.
 pub fn buildStatusJsonAlloc(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,

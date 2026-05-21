@@ -1,3 +1,9 @@
+//! Tool registration, validation, and execution harness.
+//!
+//! Manages the set of allowed tool names and dispatches tool invocations
+//! to the appropriate backend (echo, UTC, cmd, bash). Includes
+//! intent detection for prompt-based tool triggering.
+
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -5,13 +11,16 @@ const echo_tool = @import("../tools/echo.zig");
 const utc_tool = @import("../tools/utc.zig");
 const command_exec_tool = @import("../tools/command_exec.zig");
 
+/// Registry of tool names allowed for the current request.
 pub const ToolRegistry = struct {
     allowed_names: std.StringHashMap(void),
 
+        /// Creates an empty registry.
     pub fn init(allocator: std.mem.Allocator) ToolRegistry {
         return .{ .allowed_names = std.StringHashMap(void).init(allocator) };
     }
 
+        /// Frees all registered name strings.
     pub fn deinit(self: *ToolRegistry, allocator: std.mem.Allocator) void {
         var iterator = self.allowed_names.keyIterator();
         while (iterator.next()) |key| {
@@ -20,17 +29,20 @@ pub const ToolRegistry = struct {
         self.allowed_names.deinit();
     }
 
+        /// Adds a tool name to the allowed set.
     pub fn register(self: *ToolRegistry, allocator: std.mem.Allocator, name: []const u8) !void {
         const key = try allocator.dupe(u8, name);
         errdefer allocator.free(key);
         try self.allowed_names.put(key, {});
     }
 
+        /// Checks whether a tool name is in the allowed set.
     pub fn isAllowed(self: *const ToolRegistry, name: []const u8) bool {
         return self.allowed_names.contains(name);
     }
 };
 
+/// Returns true only if every tool in `tools` is present in the registry.
 pub fn validateRequestedTools(
     registry: *const ToolRegistry,
     tools: []const types.Tool,
@@ -75,6 +87,8 @@ pub fn tryExecuteDebugTool(
     return null;
 }
 
+/// Attempts to execute tools based on prompt intent when tool_choice
+/// is "auto" or "required". Returns null if no tools were triggered.
 pub fn maybeExecutePromptToolsAlloc(
     allocator: std.mem.Allocator,
     request: types.Request,

@@ -12,6 +12,7 @@ pub const tools = @import("backend/tools.zig");
 pub const core = @import("core/server.zig");
 pub const config = @import("config.zig");
 pub const types = @import("types.zig");
+pub const react = @import("react.zig");
 
 // Re-export common error types.
 pub const ApiError = backend.errors.ApiError;
@@ -42,4 +43,8 @@ test "providers: external provider adapters" {
 
 test "types: normalization" {
     _ = @import("types.zig");
+}
+
+test "react: action parsing and observation formatting" {
+    _ = @import("react.zig");
 }

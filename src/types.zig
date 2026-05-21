@@ -61,6 +61,41 @@ pub const Request = struct {
     }
 };
 
+/// Structured tool call emitted by a provider or parsed from model output.
+pub const ToolCall = struct {
+    id: ?[]const u8 = null,
+    name: []const u8,
+    arguments_json: []const u8,
+
+    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
+        if (self.id) |id| {
+            allocator.free(id);
+        }
+        allocator.free(self.name);
+        allocator.free(self.arguments_json);
+    }
+};
+
+/// Result produced after executing a tool call.
+pub const ToolCallResult = struct {
+    call_id: ?[]const u8 = null,
+    name: []const u8,
+    output: []const u8,
+    success: bool = true,
+    error_message: ?[]const u8 = null,
+
+    pub fn deinit(self: ToolCallResult, allocator: std.mem.Allocator) void {
+        if (self.call_id) |call_id| {
+            allocator.free(call_id);
+        }
+        allocator.free(self.name);
+        allocator.free(self.output);
+        if (self.error_message) |message| {
+            allocator.free(message);
+        }
+    }
+};
+
 /// One chat message in conversation order.
 pub const Message = struct {
     role: []const u8, // OpenAI-compatible role (system, user, assistant, tool).
@@ -80,10 +115,14 @@ pub const Message = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
+    input_schema_json: ?[]const u8 = null,
 
     pub fn deinit(self: Tool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
+        if (self.input_schema_json) |input_schema_json| {
+            allocator.free(input_schema_json);
+        }
     }
 };
 

@@ -1,6 +1,12 @@
 //! Minimal route matcher for the HTTP request line.
+//!
+//! Parses the request line into method + path and maps it to a
+//! known `Route` enum value. Supports chat completions, health,
+//! metrics, and diagnostics routes.
+
 const std = @import("std");
 
+/// Well-known routes served by this agent.
 pub const Route = enum {
     chat_completions,
     health,
@@ -10,6 +16,9 @@ pub const Route = enum {
     diagnostics_providers,
 };
 
+/// Parses the raw HTTP request line and returns the matching route,
+/// or `null` if no route matches. Returns `error.InvalidHttpRequest`
+/// if the request line is malformed.
 pub fn parseRoute(request_raw: []const u8) !?Route {
     const request_line_end = std.mem.indexOf(u8, request_raw, "\r\n") orelse {
         return error.InvalidHttpRequest;
@@ -47,7 +56,8 @@ pub fn parseRoute(request_raw: []const u8) !?Route {
     return null;
 }
 
-/// Check if request is for POST /v1/chat/completions route
+/// Convenience function: returns true iff the request targets
+/// POST /v1/chat/completions.
 pub fn matchChatCompletionsRoute(request_raw: []const u8) !bool {
     const route = try parseRoute(request_raw);
     return route == .chat_completions;

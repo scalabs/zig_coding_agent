@@ -1,6 +1,14 @@
+//! Shared logic for OpenAI-compatible chat completion providers.
+//!
+//! Handles URL construction, request payload rendering, response parsing,
+//! error extraction, and JSON escaping. Used by OpenAI, OpenRouter,
+//! llama.cpp, and any provider that follows the `/v1/chat/completions`
+//! contract.
+
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Sends a chat completion request with no extra headers.
 pub fn callChat(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -20,6 +28,8 @@ pub fn callChat(
     );
 }
 
+/// Sends a chat completion request with provider-specific extra headers.
+/// Handles Bearer auth, payload rendering, HTTP fetch, and response parsing.
 pub fn callChatWithExtraHeaders(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -341,9 +351,20 @@ fn renderToolsJsonAlloc(
         const escaped_description = try escapeJsonStringAlloc(allocator, tool.description);
         defer allocator.free(escaped_description);
 
+        if (tool.input_schema_json) |schema| {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return error.InvalidToolSchema;
+            parsed.deinit();
+        }
+
+        var parameters_json: []const u8 = "";
+        if (tool.input_schema_json) |schema| {
+            parameters_json = try std.fmt.allocPrint(allocator, ",\"parameters\":{s}", .{schema});
+        }
+        defer if (tool.input_schema_json != null) allocator.free(parameters_json);
+
         try out.writer(allocator).print(
-            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"}}}}",
-            .{ escaped_name, escaped_description },
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"{s}}}}}",
+            .{ escaped_name, escaped_description, parameters_json },
         );
     }
 

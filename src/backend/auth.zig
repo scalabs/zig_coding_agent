@@ -1,10 +1,20 @@
+//! Bearer-token authentication for incoming API requests.
+//!
+//! Compares the Authorization header value against the configured API key.
+//! When no key is configured, all requests are allowed.
+
 const std = @import("std");
 
+/// Result of authenticating a request: allowed or denied.
 pub const AuthResult = enum {
     allowed,
     denied,
 };
 
+/// Authenticates a raw HTTP request against the configured API key.
+/// Returns `.allowed` when the key matches or no key is configured;
+/// returns `.denied` otherwise. Supports both `X-Api-Key` and
+/// `Authorization: Bearer <key>` headers.
 pub fn authorizeRequest(
     required_api_key: []const u8,
     request_raw: []const u8,
@@ -33,6 +43,8 @@ fn timingSafeEql(a: []const u8, b: []const u8) bool {
     return std.crypto.timing_safe.eql([Hmac.mac_length]u8, mac_a, mac_b);
 }
 
+/// Extracts the API key from raw HTTP headers.
+/// Checks `X-Api-Key` first, then `Authorization: Bearer <key>`.
 pub fn findApiKeyFromRequest(request_raw: []const u8) ?[]const u8 {
     if (findHeaderValue(request_raw, "x-api-key")) |value| {
         return value;

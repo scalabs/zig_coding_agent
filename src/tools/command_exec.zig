@@ -1,14 +1,23 @@
+//! Command execution tool (cmd/bash) for the debug tools harness.
+//!
+//! Validates, sanitizes, and executes shell commands with a denylist of
+//! dangerous commands and patterns. Commands are disabled by default;
+//! enable via `LLM_ROUTER_TOOL_EXEC_ENABLED=1`.
+
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 
+/// Shell flavor: Windows `cmd` or Unix `bash`.
 pub const ShellFlavor = enum {
     cmd,
     bash,
 };
 
+/// Maximum allowed command length in bytes.
 const max_command_len: usize = 1024;
 
+/// Validation errors produced by command sanitization.
 const CommandValidationError = error{
     EmptyCommand,
     CommandTooLong,
@@ -17,6 +26,8 @@ const CommandValidationError = error{
     DangerousPattern,
 };
 
+/// Executes a validated shell command and returns the captured
+/// stdout/stderr. Returns a tool response with status and output.
 pub fn execute(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -148,6 +159,8 @@ pub fn execute(
     return try makeToolResponse(allocator, tool_name, output);
 }
 
+/// Attempts to extract a command from a natural-language prompt.
+/// Returns null if no command-like content is found.
 pub fn extractCommandFromPromptAlloc(
     allocator: std.mem.Allocator,
     flavor: ShellFlavor,
@@ -463,6 +476,7 @@ fn childTermToTextAlloc(
     };
 }
 
+/// Constructs a minimal `Config` for use in unit tests.
 pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.Config {
     return .{
         .listen_host = try allocator.dupe(u8, "127.0.0.1"),

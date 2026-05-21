@@ -1,6 +1,13 @@
+//! Echo debug tool.
+//!
+//! Returns the prompt text and message count as a diagnostic
+//! response to verify tool wiring without relying on upstream
+//! model behavior.
+
 const std = @import("std");
 const types = @import("../types.zig");
 
+/// Returns a debug response echoing the request prompt and message count.
 pub fn execute(
     allocator: std.mem.Allocator,
     request: types.Request,
