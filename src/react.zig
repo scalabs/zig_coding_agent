@@ -52,7 +52,6 @@ pub const ReactAction = union(enum) {
 /// - Greedy bracket matching: takes everything up to the last `]` on the line.
 /// - Returns `null` when no action line is found.
 pub fn parseReactAction(output: []const u8) ?ReactAction {
-    // Scan backwards through lines to find the last Action directive.
     var last_action_line: ?[]const u8 = null;
     var lines = std.mem.splitAny(u8, output, "\n\r");
     while (lines.next()) |raw_line| {
