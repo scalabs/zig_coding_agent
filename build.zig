@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const zig_eval_dep = b.dependency("zig_eval", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zig_eval_mod = zig_eval_dep.module("zig_eval");
+
     // CLI executable entrypoint.
     const app = b.addExecutable(.{
         .name = exe_name,
@@ -42,6 +48,28 @@ pub fn build(b: *std.Build) void {
     app.linkLibC();
 
     b.installArtifact(app);
+
+    const eval_exe = b.addExecutable(.{
+        .name = "zig-coding-agent-eval",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/eval_runner_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig_eval", .module = zig_eval_mod },
+            },
+        }),
+    });
+    eval_exe.linkLibC();
+    b.installArtifact(eval_exe);
+
+    const eval_run_step = b.step("eval-run", "Run eval/registry against a running harness (see eval/registry/services.json)");
+    const eval_run_cmd = b.addRunArtifact(eval_exe);
+    eval_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        eval_run_cmd.addArgs(args);
+    }
+    eval_run_step.dependOn(&eval_run_cmd.step);
 
     // Run command: `zig build run -- [args]`.
     const run_step = b.step("run", "Run the Zig Coding Agent server");
@@ -125,6 +153,7 @@ pub fn build(b: *std.Build) void {
     // Compile-only verification for app and built-in test modules.
     const check_step = b.step("check", "Compile app and built-in test modules without running");
     check_step.dependOn(&app.step);
+    check_step.dependOn(&eval_exe.step);
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&types_unit_tests.step);
