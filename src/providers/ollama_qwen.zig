@@ -58,6 +58,109 @@ pub const StreamQwenResult = union(enum) {
     failed: types.Response,
 };
 
+/// Per-turn streaming variant for use inside multi-turn loops (ReAct, agent).
+///
+/// Differences from `streamQwenToSse`:
+/// - The caller owns SSE headers, the completion id, and the streaming buffers
+///   (`captured_content`, `think_block_open`). Headers and `[DONE]` are NOT
+///   emitted here.
+/// - On success, returns the finish_reason and resolved model name in
+///   `TurnStreamSuccess` so the loop can decide whether to continue, parse
+///   actions, or stop.
+/// - `captured_content` accumulates only the assistant `content` tokens (no
+///   reasoning), giving the loop a clean buffer to feed back into the next
+///   turn or hand to `react.parseReactAction`.
+pub const TurnStreamSuccess = struct {
+    finish_reason: []u8,
+    model: []u8,
+
+    pub fn deinit(self: TurnStreamSuccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.finish_reason);
+        allocator.free(self.model);
+    }
+};
+
+pub const TurnStreamResult = union(enum) {
+    streamed: TurnStreamSuccess,
+    failed: types.Response,
+};
+
+pub fn streamQwenTurnToSse(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    request: types.Request,
+    completion_id: []const u8,
+    captured_content: *std.ArrayList(u8),
+    think_block_open: *bool,
+) !TurnStreamResult {
+    const requested_model = request.model orelse app_config.ollama_model;
+    var model_name = requested_model;
+    var fallback: ?ModelFallback = null;
+    defer if (fallback) |value| value.deinit(allocator);
+
+    if (try pickFallbackModelAlloc(allocator, app_config, requested_model)) |selected| {
+        fallback = selected;
+        model_name = fallback.?.selected_model;
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri_text = try buildChatUrl(allocator, app_config.ollama_base_url);
+    defer allocator.free(uri_text);
+
+    const uri = try std.Uri.parse(uri_text);
+
+    var headers_sent_already = true; // caller already sent headers
+    var final_finish_reason: []const u8 = "stop";
+
+    var turn: usize = 0;
+    while (true) : (turn += 1) {
+        const messages_json = if (turn == 0)
+            try renderMessagesJsonAlloc(allocator, request.messages)
+        else
+            try renderContinuationMessagesJsonAlloc(
+                allocator,
+                request.messages,
+                captured_content.items,
+                stream_continue_prompt,
+            );
+        defer allocator.free(messages_json);
+
+        const attempt_result = try streamChatMessagesToSse(
+            connection,
+            allocator,
+            &client,
+            app_config,
+            request,
+            uri,
+            completion_id,
+            model_name,
+            messages_json,
+            &headers_sent_already,
+            captured_content,
+            think_block_open,
+        );
+
+        switch (attempt_result) {
+            .failed => |failed_response| return .{ .failed = failed_response },
+            .streamed => |attempt| {
+                if (!attempt.stopped_by_length) break;
+                if (turn + 1 >= max_stream_continuations) {
+                    final_finish_reason = "length";
+                    break;
+                }
+            },
+        }
+    }
+
+    return .{ .streamed = .{
+        .finish_reason = try allocator.dupe(u8, final_finish_reason),
+        .model = try allocator.dupe(u8, model_name),
+    } };
+}
+
 pub fn streamQwenToSse(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
