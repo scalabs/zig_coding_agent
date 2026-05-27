@@ -748,6 +748,124 @@ pub fn callProvider(
     return error.UnknownProvider;
 }
 
+/// Outcome of a single ReAct/agent loop turn driven through the streaming
+/// pipeline. `streamed` means tokens were emitted live to the SSE client and
+/// `captured_content` holds the assistant's content text (no reasoning) for
+/// action parsing or context replay.
+pub const TurnStreamOutcome = struct {
+    success: bool,
+    finish_reason: []u8,
+    model: []u8,
+    captured_content: []u8,
+
+    pub fn deinit(self: TurnStreamOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.finish_reason);
+        allocator.free(self.model);
+        allocator.free(self.captured_content);
+    }
+};
+
+/// Streams a single loop turn directly to the SSE client.
+///
+/// For providers with a dedicated SSE adapter (Ollama today) this forwards
+/// tokens as they arrive. For all other providers, falls back to the buffered
+/// `callProvider` path and emits the whole response as one SSE chunk so the
+/// loop semantics remain identical.
+///
+/// `headers_sent` and `think_block_open` are caller-owned across turns so a
+/// single SSE response can carry many turns without re-emitting headers or
+/// leaving an unclosed `<think>` block.
+pub fn streamProviderTurn(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    request: types.Request,
+    completion_id: []const u8,
+    headers_sent: *bool,
+    think_block_open: *bool,
+) !TurnStreamOutcome {
+    const response_mod = @import("../core/response.zig");
+
+    if (!headers_sent.*) {
+        try response_mod.sendEventStreamHeaders(connection);
+        headers_sent.* = true;
+    }
+
+    const requested_provider = request.provider orelse app_config.default_provider;
+    const provider = types.normalizeProviderName(requested_provider) orelse {
+        return error.UnknownProvider;
+    };
+
+    if (std.mem.eql(u8, provider, "ollama_qwen")) {
+        const ollama_qwen = @import("../providers/ollama_qwen.zig");
+
+        var captured = std.ArrayList(u8){};
+        errdefer captured.deinit(allocator);
+
+        const turn_result = try ollama_qwen.streamQwenTurnToSse(
+            connection,
+            allocator,
+            app_config,
+            request,
+            completion_id,
+            &captured,
+            think_block_open,
+        );
+
+        switch (turn_result) {
+            .streamed => |success| {
+                defer success.deinit(allocator);
+                return .{
+                    .success = true,
+                    .finish_reason = try allocator.dupe(u8, success.finish_reason),
+                    .model = try allocator.dupe(u8, success.model),
+                    .captured_content = try captured.toOwnedSlice(allocator),
+                };
+            },
+            .failed => |provider_response| {
+                defer provider_response.deinit(allocator);
+                captured.deinit(allocator);
+                return .{
+                    .success = false,
+                    .finish_reason = try allocator.dupe(u8, provider_response.finish_reason),
+                    .model = try allocator.dupe(u8, provider_response.model),
+                    .captured_content = try allocator.dupe(u8, provider_response.output),
+                };
+            },
+        }
+    }
+
+    // Fallback path for providers without per-token streaming: buffer via
+    // callProvider, then emit the whole response as a single SSE chunk.
+    if (think_block_open.*) {
+        try response_mod.sendChatCompletionChunkSse(
+            connection, allocator, completion_id, "fallback", "</think>", null,
+        );
+        think_block_open.* = false;
+    }
+
+    var buffered = try callProvider(allocator, app_config, request);
+    defer buffered.deinit(allocator);
+
+    if (buffered.output.len > 0) {
+        try response_mod.sendChatCompletionChunkSse(
+            connection,
+            allocator,
+            completion_id,
+            buffered.model,
+            buffered.output,
+            null,
+        );
+    }
+
+    return .{
+        .success = buffered.success,
+        .finish_reason = try allocator.dupe(u8, buffered.finish_reason),
+        .model = try allocator.dupe(u8, buffered.model),
+        .captured_content = try allocator.dupe(u8, buffered.output),
+    };
+}
+
 pub fn buildProviderStatusJson(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
