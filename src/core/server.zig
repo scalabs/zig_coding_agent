@@ -1092,6 +1092,8 @@ fn streamLoopRequestToSse(
     const loop_max_turns = base_request.loop_max_turns orelse 8;
 
     try response.sendEventStreamHeaders(connection);
+    var headers_sent: bool = true;
+    var think_block_open: bool = false;
 
     const completion_id = try std.fmt.allocPrint(
         allocator,
@@ -1174,19 +1176,55 @@ fn streamLoopRequestToSse(
             break :blk r;
         } else turn_request;
 
-        var turn_result = try backend.callProvider(allocator, app_config, provider_request);
-        defer turn_result.deinit(allocator);
-        if (turn_result.success and isLengthFinishReason(turn_result.finish_reason)) {
-            continueLengthResponseAlloc(allocator, app_config, provider_request, &turn_result) catch |err| {
-                logError("Provider loop continuation failed: {s}", .{@errorName(err)});
-            };
+        // Emit the per-turn header BEFORE provider tokens stream in, so the
+        // client can render "[loop turn N/M]\n" then watch tokens arrive live.
+        if (emit_progress) {
+            const progress_prefix = try std.fmt.allocPrint(
+                allocator,
+                "[loop turn {d}/{d}]\n",
+                .{ turn + 1, loop_max_turns },
+            );
+            defer allocator.free(progress_prefix);
+
+            try response.sendChatCompletionChunkSse(
+                connection,
+                allocator,
+                completion_id,
+                provider_request.model orelse app_config.ollama_model,
+                progress_prefix,
+                null,
+            );
+        }
+
+        var turn_outcome = try backend.streamProviderTurn(
+            connection,
+            allocator,
+            app_config,
+            provider_request,
+            completion_id,
+            &headers_sent,
+            &think_block_open,
+        );
+        defer turn_outcome.deinit(allocator);
+
+        // Emit a trailing newline after the turn body so progress text and
+        // the next observation/prefix don't visually collide.
+        if (emit_progress and turn_outcome.captured_content.len > 0) {
+            try response.sendChatCompletionChunkSse(
+                connection,
+                allocator,
+                completion_id,
+                turn_outcome.model,
+                "\n",
+                null,
+            );
         }
 
         const with_assistant = try appendRoleMessageAlloc(
             allocator,
             working_messages,
             "assistant",
-            turn_result.output,
+            turn_outcome.captured_content,
         );
         for (working_messages) |message| {
             message.deinit(allocator);
@@ -1194,25 +1232,7 @@ fn streamLoopRequestToSse(
         allocator.free(working_messages);
         working_messages = with_assistant;
 
-        if (emit_progress) {
-            const progress_text = try std.fmt.allocPrint(
-                allocator,
-                "[loop turn {d}/{d}]\n{s}\n",
-                .{ turn + 1, loop_max_turns, turn_result.output },
-            );
-            defer allocator.free(progress_text);
-
-            try response.sendChatCompletionChunkSse(
-                connection,
-                allocator,
-                completion_id,
-                turn_result.model,
-                progress_text,
-                null,
-            );
-        }
-
-        const normalized_output = std.mem.trim(u8, turn_result.output, " \t\r\n");
+        const normalized_output = std.mem.trim(u8, turn_outcome.captured_content, " \t\r\n");
         if (previous_output) |prev| {
             if (std.mem.eql(u8, prev, normalized_output)) {
                 repeated_count += 1;
@@ -1224,7 +1244,7 @@ fn streamLoopRequestToSse(
         previous_output = try allocator.dupe(u8, normalized_output);
 
         const is_react_mode = std.ascii.eqlIgnoreCase(loop_mode, "react");
-        const reached_until = std.mem.indexOf(u8, turn_result.output, loop_until) != null;
+        const reached_until = std.mem.indexOf(u8, turn_outcome.captured_content, loop_until) != null;
         const reached_max = (turn + 1) >= loop_max_turns;
         const repeated_stop = (std.ascii.eqlIgnoreCase(loop_mode, "agent") or is_react_mode) and repeated_count >= 1;
 
@@ -1234,7 +1254,7 @@ fn streamLoopRequestToSse(
         defer if (react_observation) |obs| allocator.free(obs);
 
         if (is_react_mode) {
-            if (react.parseReactAction(turn_result.output)) |action| {
+            if (react.parseReactAction(turn_outcome.captured_content)) |action| {
                 switch (action) {
                     .finish => {
                         react_finished = true;
@@ -1255,27 +1275,25 @@ fn streamLoopRequestToSse(
             }
         }
 
-        const should_stop = react_finished or reached_until or reached_max or repeated_stop or !turn_result.success;
+        const should_stop = react_finished or reached_until or reached_max or repeated_stop or !turn_outcome.success;
 
         if (should_stop) {
-            if (!emit_progress and turn_result.output.len > 0) {
+            // Close any dangling <think> block from the last turn so the
+            // client doesn't render an unterminated reasoning section.
+            if (think_block_open) {
                 try response.sendChatCompletionChunkSse(
-                    connection,
-                    allocator,
-                    completion_id,
-                    turn_result.model,
-                    turn_result.output,
-                    null,
+                    connection, allocator, completion_id, turn_outcome.model, "</think>", null,
                 );
+                think_block_open = false;
             }
 
             try response.sendChatCompletionChunkSse(
                 connection,
                 allocator,
                 completion_id,
-                turn_result.model,
+                turn_outcome.model,
                 null,
-                turn_result.finish_reason,
+                turn_outcome.finish_reason,
             );
             try response.sendSseDone(connection);
             return;
@@ -1294,7 +1312,7 @@ fn streamLoopRequestToSse(
                     connection,
                     allocator,
                     completion_id,
-                    turn_result.model,
+                    turn_outcome.model,
                     latest_user_prompt,
                     null,
                 );
