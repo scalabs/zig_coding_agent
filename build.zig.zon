@@ -32,6 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .zig_eval = .{
+            .path = "../zig_eval",
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
@@ -73,6 +76,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "eval",
         "src",
         // For example...
         //"LICENSE",

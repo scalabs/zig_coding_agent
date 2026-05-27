@@ -81,6 +81,26 @@ zig build test -Dtest-target=file "-Dtest-file=src/types.zig"
 zig build test -Dtest-target=all -Dtest-filter=normalizeProviderName
 ```
 
+### zig_eval harness (optional)
+
+This repo depends on the sibling **zig_eval** checkout at `../zig_eval` (see `build.zig.zon`). It ships a small **eval registry** under `eval/registry/` (same layout as `zig_eval`: `services.json`, `evals/<group>/*.json`, `data/.../*.jsonl`) and a runner binary **`zig-coding-agent-eval`**.
+
+**Prerequisites:** Ollama (or whatever `services.json` targets) reachable, and this router listening (default `http://127.0.0.1:8081`). If `LLM_ROUTER_API_KEY` is set on the server, set the same variable for the eval client (see `eval/registry/services.json` → `api_key_env`).
+
+```bash
+# Terminal A: router
+zig build run
+
+# Terminal B: from repo root — runs all eval definitions under eval/registry/evals/
+zig build eval-run
+
+# Custom registry directory or JSON run log
+zig build eval-run -- path/to/registry
+zig build eval-run -- --json
+```
+
+There is currently **one** eval definition checked in (`smoke.reply_ok`). Add more by dropping new JSON files under `eval/registry/evals/` and matching datasets under `eval/registry/data/`.
+
 ## API Surface
 
 ### Endpoints
