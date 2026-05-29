@@ -9,6 +9,7 @@ const backend = @import("../backend/api.zig");
 const auth = @import("../backend/auth.zig");
 const tooling = @import("../backend/tools.zig");
 const session = @import("../backend/session.zig");
+const workspace = @import("../backend/workspace.zig");
 const react = @import("../react.zig");
 
 const context_compaction_keep_messages = 8;
@@ -235,6 +236,7 @@ const WorkerContext = struct {
     tool_registry: *tooling.ToolRegistry,
     session_store: ?*session.SessionStore,
     session_store_guard: *SessionStoreGuard,
+    workspace_store: ?*workspace.WorkspaceStore,
     gate: *ConnectionGate,
 };
 
@@ -263,6 +265,7 @@ pub fn run(
         .{ app_config.listen_host, app_config.listen_port },
     );
     logInfo("Default provider: {s}", .{app_config.default_provider});
+    logInfo("Default model: {s}", .{app_config.defaultModel()});
     logInfo(
         "Available providers: ollama (aliases: qwen, ollama_qwen), openai, openrouter, claude (alias: anthropic), bedrock, llama_cpp (alias: llama.cpp)",
         .{},
@@ -329,7 +332,18 @@ pub fn run(
     }
     defer if (session_store) |*store| store.deinit(allocator);
 
+    var workspace_store_impl: ?workspace.WorkspaceStore = null;
+    if (app_config.workspace_mode_enabled) {
+        workspace_store_impl = workspace.WorkspaceStore.init(allocator);
+        logInfo(
+            "Workspace mode enabled root={s} (in-memory; cleared on exit)",
+            .{app_config.workspace_root},
+        );
+    }
+    defer if (workspace_store_impl) |*store| store.deinit();
+
     const active_session_store: ?*session.SessionStore = if (session_store) |*store| store else null;
+    const active_workspace_store: ?*workspace.WorkspaceStore = if (workspace_store_impl) |*store| store else null;
 
     var gate = ConnectionGate{ .max_active = app_config.max_concurrent_connections };
     var session_store_guard = SessionStoreGuard{};
@@ -340,6 +354,7 @@ pub fn run(
         .tool_registry = &tool_registry,
         .session_store = active_session_store,
         .session_store_guard = &session_store_guard,
+        .workspace_store = active_workspace_store,
         .gate = &gate,
     };
 
@@ -377,6 +392,7 @@ fn connectionWorkerMain(context: WorkerContext, connection: std.net.Server.Conne
         context.tool_registry,
         context.session_store,
         context.session_store_guard,
+        context.workspace_store,
     ) catch |err| {
         logError("Request handling error: {s}", .{@errorName(err)});
         context.server_state.noteRequestFailed();
@@ -391,6 +407,7 @@ fn handleConnection(
     tool_registry: *tooling.ToolRegistry,
     session_store: ?*session.SessionStore,
     session_store_guard: *SessionStoreGuard,
+    workspace_store: ?*workspace.WorkspaceStore,
 ) !void {
     const request_started_ms = std.time.milliTimestamp();
     var request_route: []const u8 = "unknown";
@@ -613,7 +630,7 @@ fn handleConnection(
     debugLog(app_config, "request body_len={d}", .{body.len});
 
     const parse_result = try backend.parseChatRequest(allocator, body);
-    const parsed_req = switch (parse_result) {
+    var parsed_req = switch (parse_result) {
         .ok => |parsed_request| parsed_request,
         .err => |api_error| {
             sendApiErrorSafe(connection.*, allocator, api_error, app_config, request_id);
@@ -622,6 +639,19 @@ fn handleConnection(
         },
     };
     defer parsed_req.deinit(allocator);
+
+    react.ensureReactCodingToolsAlloc(allocator, &parsed_req) catch |err| {
+        logError("ReAct tool augmentation failed: {s}", .{@errorName(err)});
+        sendApiErrorSafe(
+            connection.*,
+            allocator,
+            backend.errors.httpError("Failed to prepare ReAct coding tools", "react_tool_setup_failed"),
+            app_config,
+            request_id,
+        );
+        server_state.noteRequestFailed();
+        return;
+    };
 
     if (!tooling.validateRequestedTools(tool_registry, parsed_req.tools)) {
         sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
@@ -636,6 +666,9 @@ fn handleConnection(
     var loaded_session: ?session.SessionState = null;
     defer if (loaded_session) |state| state.deinit(allocator);
 
+    var active_workspace: ?*workspace.WorkspaceState = null;
+    const use_workspace = app_config.workspace_mode_enabled and parsed_req.workspace_id != null;
+
     var request_messages = try session.cloneMessagesAlloc(allocator, parsed_req.messages);
     defer {
         for (request_messages) |message| {
@@ -647,7 +680,37 @@ fn handleConnection(
     var request_prompt = try allocator.dupe(u8, parsed_req.prompt);
     defer allocator.free(request_prompt);
 
-    if (session_store) |store| {
+    if (use_workspace) {
+        if (workspace_store) |store| {
+            active_workspace = try store.getOrCreate(parsed_req.workspace_id.?);
+            if (active_workspace.?.messages.len > 0) {
+                const merged_messages = try workspace.mergeIncomingMessagesAlloc(
+                    allocator,
+                    active_workspace.?.messages,
+                    parsed_req.messages,
+                );
+
+                for (request_messages) |message| {
+                    message.deinit(allocator);
+                }
+                allocator.free(request_messages);
+                request_messages = merged_messages;
+
+                allocator.free(request_prompt);
+                request_prompt = try extractLastUserPromptAlloc(allocator, request_messages);
+            }
+
+            const with_hint = try workspace.prependMemoryHintAlloc(allocator, active_workspace.?, request_messages);
+            for (request_messages) |message| {
+                message.deinit(allocator);
+            }
+            allocator.free(request_messages);
+            request_messages = with_hint;
+
+            allocator.free(request_prompt);
+            request_prompt = try extractLastUserPromptAlloc(allocator, request_messages);
+        }
+    } else if (session_store) |store| {
         if (parsed_req.session_id) |session_id| {
             session_store_guard.mutex.lock();
             loaded_session = store.load(allocator, session_id, parsed_req.tenant_id) catch |err| blk: {
@@ -729,7 +792,7 @@ fn handleConnection(
         );
         defer stream_request.deinit(allocator);
 
-        if (try tooling.tryExecuteDebugTool(allocator, stream_request, app_config, request_id)) |tool_result| {
+        if (try tooling.tryExecuteDebugTool(allocator, stream_request, app_config, request_id, active_workspace)) |tool_result| {
             defer tool_result.deinit(allocator);
 
             try response.sendEventStreamHeaders(connection.*, request_id);
@@ -772,7 +835,7 @@ fn handleConnection(
             return;
         }
 
-        const stream_auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config, request_id) catch |err| switch (err) {
+        const stream_auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config, request_id, active_workspace) catch |err| switch (err) {
             error.ToolCallLimitExceeded => {
                 sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
                     "Tool call limit exceeded",
@@ -868,16 +931,19 @@ fn handleConnection(
         }
     }
 
-    if (try tooling.tryExecuteDebugTool(allocator, parsed_req, app_config, request_id)) |tool_result| {
+    if (try tooling.tryExecuteDebugTool(allocator, parsed_req, app_config, request_id, active_workspace)) |tool_result| {
         defer tool_result.deinit(allocator);
         debugLog(
             app_config,
             "debug tool executed tool_choice={s}",
             .{parsed_req.tool_choice orelse "(none)"},
         );
-        persistSessionState(
+        persistConversationState(
             allocator,
             app_config,
+            use_workspace,
+            workspace_store,
+            active_workspace,
             session_store,
             session_store_guard,
             parsed_req,
@@ -903,7 +969,7 @@ fn handleConnection(
     );
     defer provider_request.deinit(allocator);
 
-    const auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config, request_id) catch |err| switch (err) {
+    const auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config, request_id, active_workspace) catch |err| switch (err) {
         error.ToolCallLimitExceeded => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
                 "Tool call limit exceeded",
@@ -921,9 +987,12 @@ fn handleConnection(
         if (tooling.shouldShortCircuitAutoTools(provider_request)) {
             var tool_response = try tooling.makeAutoToolResponse(allocator, summary);
             defer tool_response.deinit(allocator);
-            persistSessionState(
+            persistConversationState(
                 allocator,
                 app_config,
+                use_workspace,
+                workspace_store,
+                active_workspace,
                 session_store,
                 session_store_guard,
                 parsed_req,
@@ -1079,10 +1148,13 @@ fn handleConnection(
     );
 
     if (session_store) |store| {
-        if (parsed_req.session_id != null) {
-            persistSessionState(
+        if (!use_workspace and parsed_req.session_id != null) {
+            persistConversationState(
                 allocator,
                 app_config,
+                false,
+                workspace_store,
+                active_workspace,
                 store,
                 session_store_guard,
                 parsed_req,
@@ -1092,6 +1164,23 @@ fn handleConnection(
                 result.output,
             );
         }
+    }
+
+    if (use_workspace) {
+        persistConversationState(
+            allocator,
+            app_config,
+            true,
+            workspace_store,
+            active_workspace,
+            session_store,
+            session_store_guard,
+            parsed_req,
+            loaded_session,
+            provider_request.messages,
+            loop_messages_for_persistence,
+            result.output,
+        );
     }
 
     sendChatCompletionSafe(connection.*, allocator, result, app_config, request_id);
@@ -1141,6 +1230,7 @@ fn cloneRequestWithMessagesAlloc(
         .repeat_penalty = parsed_req.repeat_penalty,
         .session_id = if (parsed_req.session_id) |session_id| try allocator.dupe(u8, session_id) else null,
         .tenant_id = if (parsed_req.tenant_id) |tenant_id| try allocator.dupe(u8, tenant_id) else null,
+        .workspace_id = if (parsed_req.workspace_id) |workspace_id| try allocator.dupe(u8, workspace_id) else null,
         .max_context_tokens = parsed_req.max_context_tokens,
         .tools = copied_tools,
         .tool_choice = if (parsed_req.tool_choice) |tool_choice| try allocator.dupe(u8, tool_choice) else null,
@@ -1155,6 +1245,160 @@ const LoopExecution = struct {
     messages: []types.Message,
 };
 
+const agent_loop_guidance =
+    "You are running in API agent loop mode. Improve the answer each turn. Briefly self-critique then improve. Include the completion marker exactly when fully complete.";
+
+const agent_continue_prompt =
+    "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result.";
+
+const react_loop_default_max_turns: usize = 24;
+const react_repeated_stop_threshold: usize = 2;
+
+fn resolveLoopMaxTurns(loop_mode: []const u8, explicit: ?usize) usize {
+    if (explicit) |value| return value;
+    if (std.ascii.eqlIgnoreCase(loop_mode, "react")) return react_loop_default_max_turns;
+    return 8;
+}
+
+fn reactToolCallBudget(app_config: *const config.Config, loop_max_turns: usize) usize {
+    return @max(app_config.max_tool_calls_per_request, loop_max_turns);
+}
+
+fn maybeCompactLoopWorkingMessages(
+    allocator: std.mem.Allocator,
+    working_messages: *[]types.Message,
+    max_context_tokens: ?usize,
+) !void {
+    const max_tokens = max_context_tokens orelse return;
+    const estimated = session.estimateTokenCount(working_messages.*);
+    if (!session.shouldCompressContext(estimated, max_tokens)) return;
+
+    const compacted = try session.compactContextToBudgetAlloc(
+        allocator,
+        working_messages.*,
+        max_tokens,
+        context_compaction_keep_messages,
+    );
+
+    for (working_messages.*) |message| {
+        message.deinit(allocator);
+    }
+    allocator.free(working_messages.*);
+    working_messages.* = compacted;
+}
+
+fn prepareLoopWorkingMessagesAlloc(
+    allocator: std.mem.Allocator,
+    base_request: types.Request,
+    loop_mode: []const u8,
+) ![]types.Message {
+    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    errdefer {
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+    }
+
+    if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) {
+        const with_guidance = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            agent_loop_guidance,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_guidance;
+    } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
+        const react_prompt = try react.buildSystemPromptAlloc(allocator, base_request.tools);
+        defer allocator.free(react_prompt);
+        const with_react = try appendRoleMessageAlloc(
+            allocator,
+            working_messages,
+            "system",
+            react_prompt,
+        );
+        for (working_messages) |message| {
+            message.deinit(allocator);
+        }
+        allocator.free(working_messages);
+        working_messages = with_react;
+    }
+
+    return working_messages;
+}
+
+fn nextBasicLoopPromptAlloc(allocator: std.mem.Allocator, loop_mode: []const u8) ![]u8 {
+    return try allocator.dupe(
+        u8,
+        if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) agent_continue_prompt else "Continue.",
+    );
+}
+
+fn providerRequestForLoopTurn(
+    turn_request: types.Request,
+    loop_mode: []const u8,
+) types.Request {
+    if (!std.ascii.eqlIgnoreCase(loop_mode, "react")) return turn_request;
+
+    // ReAct advertises tools in the system prompt and parses actions locally.
+    // Do not forward tools upstream or providers activate tool templates that
+    // break on prior assistant messages.
+    var r = turn_request;
+    r.tools = &.{};
+    r.tool_choice = null;
+    return r;
+}
+
+fn reactToolPromptAlloc(
+    allocator: std.mem.Allocator,
+    action: react.ReactAction,
+    tools: []const types.Tool,
+) !?[]u8 {
+    return switch (action) {
+        .search => |query| blk: {
+            if (!tooling.hasRequestedTool(tools, "file_search")) break :blk null;
+            break :blk try std.fmt.allocPrint(allocator, "search {s} in .", .{query});
+        },
+        .lookup => |path| blk: {
+            if (!tooling.hasRequestedTool(tools, "file_read")) break :blk null;
+            break :blk try std.fmt.allocPrint(allocator, "read {s}", .{path});
+        },
+        .tool => |tool_action| blk: {
+            if (std.ascii.eqlIgnoreCase(tool_action.name, "file_read")) {
+                const trimmed = std.mem.trim(u8, tool_action.argument, " \t\r\n\"'");
+                if (std.ascii.startsWithIgnoreCase(trimmed, "read ") or
+                    std.ascii.startsWithIgnoreCase(trimmed, "file_read "))
+                {
+                    break :blk try allocator.dupe(u8, trimmed);
+                }
+                break :blk try std.fmt.allocPrint(allocator, "read {s}", .{trimmed});
+            }
+            if (std.ascii.eqlIgnoreCase(tool_action.name, "file_write")) {
+                const trimmed = std.mem.trim(u8, tool_action.argument, " \t\r\n");
+                if (std.ascii.startsWithIgnoreCase(trimmed, "write ")) {
+                    break :blk try allocator.dupe(u8, trimmed);
+                }
+                break :blk try std.fmt.allocPrint(allocator, "write {s}", .{trimmed});
+            }
+            if (std.ascii.eqlIgnoreCase(tool_action.name, "file_search")) {
+                const trimmed = std.mem.trim(u8, tool_action.argument, " \t\r\n\"'");
+                if (std.ascii.startsWithIgnoreCase(trimmed, "search ") or
+                    std.ascii.startsWithIgnoreCase(trimmed, "file_search "))
+                {
+                    break :blk try allocator.dupe(u8, trimmed);
+                }
+                break :blk try std.fmt.allocPrint(allocator, "search {s} in .", .{trimmed});
+            }
+            break :blk try allocator.dupe(u8, tool_action.argument);
+        },
+        else => null,
+    };
+}
+
 fn executeReactActionForRequest(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -1163,6 +1407,41 @@ fn executeReactActionForRequest(
     action: react.ReactAction,
     request_id: []const u8,
 ) ![]u8 {
+    if (try reactToolPromptAlloc(allocator, action, turn_request.tools)) |mapped_prompt| {
+        defer allocator.free(mapped_prompt);
+
+        const tool_name: []const u8 = switch (action) {
+            .search => "file_search",
+            .lookup => "file_read",
+            .tool => |tool_action| tool_action.name,
+            else => unreachable,
+        };
+
+        var tool_request = try cloneRequestWithMessagesAlloc(
+            allocator,
+            turn_request,
+            mapped_prompt,
+            tool_messages,
+        );
+        defer tool_request.deinit(allocator);
+
+        if (tool_request.tool_choice) |value| {
+            allocator.free(value);
+        }
+        tool_request.tool_choice = try allocator.dupe(u8, tool_name);
+
+        if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config, request_id, null)) |tool_result| {
+            defer tool_result.deinit(allocator);
+            return try allocator.dupe(u8, tool_result.output);
+        }
+
+        return try std.fmt.allocPrint(
+            allocator,
+            "Tool action {s} was not requested or its input could not be parsed.",
+            .{tool_name},
+        );
+    }
+
     return switch (action) {
         .tool => |tool_action| blk: {
             var tool_request = try cloneRequestWithMessagesAlloc(
@@ -1178,7 +1457,7 @@ fn executeReactActionForRequest(
             }
             tool_request.tool_choice = try allocator.dupe(u8, tool_action.name);
 
-            if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config, request_id)) |tool_result| {
+            if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config, request_id, null)) |tool_result| {
                 defer tool_result.deinit(allocator);
                 break :blk try allocator.dupe(u8, tool_result.output);
             }
@@ -1203,7 +1482,9 @@ fn streamLoopRequestToSse(
 ) !void {
     const loop_mode = base_request.loop_mode orelse "basic";
     const loop_until = base_request.loop_until orelse "DONE";
-    const loop_max_turns = base_request.loop_max_turns orelse 8;
+    const loop_max_turns = resolveLoopMaxTurns(loop_mode, base_request.loop_max_turns);
+    const effective_max_context_tokens = base_request.max_context_tokens orelse app_config.default_max_context_tokens;
+    const react_tool_budget = reactToolCallBudget(app_config, loop_max_turns);
 
     try response.sendEventStreamHeaders(connection, request_id);
     var headers_sent: bool = true;
@@ -1216,40 +1497,12 @@ fn streamLoopRequestToSse(
     );
     defer allocator.free(completion_id);
 
-    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    var working_messages = try prepareLoopWorkingMessagesAlloc(allocator, base_request, loop_mode);
     defer {
         for (working_messages) |message| {
             message.deinit(allocator);
         }
         allocator.free(working_messages);
-    }
-
-    if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) {
-        const with_guidance = try appendRoleMessageAlloc(
-            allocator,
-            working_messages,
-            "system",
-            "You are running in API agent loop mode. Improve the answer each turn. Briefly self-critique then improve. Include the completion marker exactly when fully complete.",
-        );
-        for (working_messages) |message| {
-            message.deinit(allocator);
-        }
-        allocator.free(working_messages);
-        working_messages = with_guidance;
-    } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
-        const react_prompt = try react.buildSystemPromptAlloc(allocator, base_request.tools);
-        defer allocator.free(react_prompt);
-        const with_react = try appendRoleMessageAlloc(
-            allocator,
-            working_messages,
-            "system",
-            react_prompt,
-        );
-        for (working_messages) |message| {
-            message.deinit(allocator);
-        }
-        allocator.free(working_messages);
-        working_messages = with_react;
     }
 
     var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
@@ -1262,6 +1515,8 @@ fn streamLoopRequestToSse(
 
     var turn: usize = 0;
     while (turn < loop_max_turns) : (turn += 1) {
+        try maybeCompactLoopWorkingMessages(allocator, &working_messages, effective_max_context_tokens);
+
         var turn_request = try cloneRequestWithMessagesAlloc(allocator, base_request, latest_user_prompt, working_messages);
         defer turn_request.deinit(allocator);
 
@@ -1275,20 +1530,7 @@ fn streamLoopRequestToSse(
         }
         turn_request.loop_max_turns = null;
 
-        // In ReAct mode the tool catalog is advertised inside the system
-        // prompt and parsed locally; we must NOT forward `tools` upstream or
-        // providers like Ollama activate their XML tool-calling template and
-        // choke on prior assistant messages containing markdown or <think>
-        // (manifests as "internal_server_error ... element <function> closed
-        // by </parameter>"). We strip tools on a shallow alias so the original
-        // turn_request keeps them for local action dispatch.
-        const empty_tools: []types.Tool = &.{};
-        const provider_request: types.Request = if (std.ascii.eqlIgnoreCase(loop_mode, "react")) blk: {
-            var r = turn_request;
-            r.tools = empty_tools;
-            r.tool_choice = null;
-            break :blk r;
-        } else turn_request;
+        const provider_request = providerRequestForLoopTurn(turn_request, loop_mode);
 
         // Emit the per-turn header BEFORE provider tokens stream in, so the
         // client can render "[loop turn N/M]\n" then watch tokens arrive live.
@@ -1304,7 +1546,9 @@ fn streamLoopRequestToSse(
                 connection,
                 allocator,
                 completion_id,
-                provider_request.model orelse app_config.ollama_model,
+                provider_request.model orelse app_config.modelForProvider(
+                    provider_request.provider orelse app_config.default_provider,
+                ),
                 progress_prefix,
                 null,
             );
@@ -1360,7 +1604,11 @@ fn streamLoopRequestToSse(
         const is_react_mode = std.ascii.eqlIgnoreCase(loop_mode, "react");
         const reached_until = std.mem.indexOf(u8, turn_outcome.captured_content, loop_until) != null;
         const reached_max = (turn + 1) >= loop_max_turns;
-        const repeated_stop = (std.ascii.eqlIgnoreCase(loop_mode, "agent") or is_react_mode) and repeated_count >= 1;
+        const repeated_stop = blk: {
+            if (is_react_mode) break :blk repeated_count >= react_repeated_stop_threshold;
+            if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) break :blk repeated_count >= 1;
+            break :blk false;
+        };
 
         // ReAct: check for Finish action before standard stop checks.
         var react_finished = false;
@@ -1374,7 +1622,7 @@ fn streamLoopRequestToSse(
                         react_finished = true;
                     },
                     else => {
-                        try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
+                        try tooling.noteToolCall(react_tool_budget, &react_tool_calls);
                         const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action, request_id);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
@@ -1384,7 +1632,7 @@ fn streamLoopRequestToSse(
                 react_observation = try react.formatObservation(
                     allocator,
                     turn + 1,
-                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                    react.parse_error_hint,
                 );
             }
         }
@@ -1432,13 +1680,7 @@ fn streamLoopRequestToSse(
                 );
             }
         } else {
-            latest_user_prompt = try allocator.dupe(
-                u8,
-                if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
-                    "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
-                else
-                    "Continue.",
-            );
+            latest_user_prompt = try nextBasicLoopPromptAlloc(allocator, loop_mode);
         }
 
         const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
@@ -1460,42 +1702,16 @@ fn executeLoopRequestAlloc(
 ) !LoopExecution {
     const loop_mode = base_request.loop_mode orelse "basic";
     const loop_until = base_request.loop_until orelse "DONE";
-    const loop_max_turns = base_request.loop_max_turns orelse 8;
+    const loop_max_turns = resolveLoopMaxTurns(loop_mode, base_request.loop_max_turns);
+    const effective_max_context_tokens = base_request.max_context_tokens orelse app_config.default_max_context_tokens;
+    const react_tool_budget = reactToolCallBudget(app_config, loop_max_turns);
 
-    var working_messages = try session.cloneMessagesAlloc(allocator, base_request.messages);
+    var working_messages = try prepareLoopWorkingMessagesAlloc(allocator, base_request, loop_mode);
     errdefer {
         for (working_messages) |message| {
             message.deinit(allocator);
         }
         allocator.free(working_messages);
-    }
-
-    if (std.ascii.eqlIgnoreCase(loop_mode, "agent")) {
-        const with_guidance = try appendRoleMessageAlloc(
-            allocator,
-            working_messages,
-            "system",
-            "You are running in API agent loop mode. Improve the answer each turn. Briefly self-critique then improve. Include the completion marker exactly when fully complete.",
-        );
-        for (working_messages) |message| {
-            message.deinit(allocator);
-        }
-        allocator.free(working_messages);
-        working_messages = with_guidance;
-    } else if (std.ascii.eqlIgnoreCase(loop_mode, "react")) {
-        const react_prompt = try react.buildSystemPromptAlloc(allocator, base_request.tools);
-        defer allocator.free(react_prompt);
-        const with_react = try appendRoleMessageAlloc(
-            allocator,
-            working_messages,
-            "system",
-            react_prompt,
-        );
-        for (working_messages) |message| {
-            message.deinit(allocator);
-        }
-        allocator.free(working_messages);
-        working_messages = with_react;
     }
 
     var latest_user_prompt = try allocator.dupe(u8, base_request.prompt);
@@ -1508,6 +1724,8 @@ fn executeLoopRequestAlloc(
 
     var turn: usize = 0;
     while (turn < loop_max_turns) : (turn += 1) {
+        try maybeCompactLoopWorkingMessages(allocator, &working_messages, effective_max_context_tokens);
+
         var turn_request = try cloneRequestWithMessagesAlloc(allocator, base_request, latest_user_prompt, working_messages);
         defer turn_request.deinit(allocator);
 
@@ -1523,13 +1741,7 @@ fn executeLoopRequestAlloc(
 
         // See streamLoopRequestToSse: strip tools/tool_choice from the
         // upstream call in ReAct mode to avoid provider-side tool templates.
-        const empty_tools: []types.Tool = &.{};
-        const provider_request: types.Request = if (std.ascii.eqlIgnoreCase(loop_mode, "react")) blk: {
-            var r = turn_request;
-            r.tools = empty_tools;
-            r.tool_choice = null;
-            break :blk r;
-        } else turn_request;
+        const provider_request = providerRequestForLoopTurn(turn_request, loop_mode);
 
         var turn_result = try backend.callProvider(allocator, app_config, provider_request);
         if (turn_result.success and isLengthFinishReason(turn_result.finish_reason)) {
@@ -1584,7 +1796,7 @@ fn executeLoopRequestAlloc(
         defer if (react_observation) |obs| allocator.free(obs);
 
         if (is_react_mode) {
-            if (repeated_count >= 1) {
+            if (repeated_count >= react_repeated_stop_threshold) {
                 return .{ .response = turn_result, .messages = working_messages };
             }
 
@@ -1594,7 +1806,7 @@ fn executeLoopRequestAlloc(
                         react_finished = true;
                     },
                     else => {
-                        try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
+                        try tooling.noteToolCall(react_tool_budget, &react_tool_calls);
                         const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action, request_id);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
@@ -1604,7 +1816,7 @@ fn executeLoopRequestAlloc(
                 react_observation = try react.formatObservation(
                     allocator,
                     turn + 1,
-                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                    react.parse_error_hint,
                 );
             }
 
@@ -1622,13 +1834,7 @@ fn executeLoopRequestAlloc(
             react_observation = null; // Transfer ownership.
             latest_user_prompt = obs;
         } else {
-            latest_user_prompt = try allocator.dupe(
-                u8,
-                if (std.ascii.eqlIgnoreCase(loop_mode, "agent"))
-                    "Critique your previous answer briefly, then improve it with concrete next steps. If complete, include the completion marker exactly and return the final result."
-                else
-                    "Continue.",
-            );
+            latest_user_prompt = try nextBasicLoopPromptAlloc(allocator, loop_mode);
         }
 
         const with_continue = try appendRoleMessageAlloc(allocator, working_messages, "user", latest_user_prompt);
@@ -1775,6 +1981,81 @@ fn continueLengthResponseAlloc(
 
 fn isLengthFinishReason(finish_reason: []const u8) bool {
     return std.ascii.eqlIgnoreCase(finish_reason, "length");
+}
+
+fn persistConversationState(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    use_workspace: bool,
+    workspace_store: ?*workspace.WorkspaceStore,
+    active_workspace: ?*workspace.WorkspaceState,
+    session_store: ?*session.SessionStore,
+    session_store_guard: *SessionStoreGuard,
+    parsed_req: types.Request,
+    loaded_session: ?session.SessionState,
+    base_messages: []const types.Message,
+    loop_messages: ?[]types.Message,
+    assistant_output: []const u8,
+) void {
+    if (use_workspace) {
+        persistWorkspaceState(
+            allocator,
+            workspace_store,
+            active_workspace,
+            base_messages,
+            loop_messages,
+            assistant_output,
+        );
+        return;
+    }
+
+    persistSessionState(
+        allocator,
+        app_config,
+        session_store,
+        session_store_guard,
+        parsed_req,
+        loaded_session,
+        base_messages,
+        loop_messages,
+        assistant_output,
+    );
+}
+
+fn persistWorkspaceState(
+    allocator: std.mem.Allocator,
+    workspace_store: ?*workspace.WorkspaceStore,
+    active_workspace: ?*workspace.WorkspaceState,
+    base_messages: []const types.Message,
+    loop_messages: ?[]types.Message,
+    assistant_output: []const u8,
+) void {
+    const store = workspace_store orelse return;
+    const ws = active_workspace orelse return;
+
+    const with_assistant = if (loop_messages) |messages| blk: {
+        break :blk session.cloneMessagesAlloc(allocator, messages) catch |err| blk2: {
+            logError("Workspace append failed: {s}", .{@errorName(err)});
+            break :blk2 null;
+        };
+    } else session.appendAssistantMessageAlloc(
+        allocator,
+        base_messages,
+        assistant_output,
+    ) catch |err| blk: {
+        logError("Workspace append failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+
+    if (with_assistant) |messages| {
+        store.saveMessages(ws, messages) catch |err| {
+            logError("Workspace save failed: {s}", .{@errorName(err)});
+            for (messages) |message| {
+                message.deinit(allocator);
+            }
+            allocator.free(messages);
+        };
+    }
 }
 
 fn persistSessionState(
