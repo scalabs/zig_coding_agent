@@ -6,6 +6,7 @@ const utc_tool = @import("../tools/utc.zig");
 const command_exec_tool = @import("../tools/command_exec.zig");
 const file_ops_tool = @import("../tools/file_ops.zig");
 const tool_output = @import("tool_output.zig");
+const workspace = @import("workspace.zig");
 
 pub const ToolRegistry = struct {
     allowed_names: std.StringHashMap(void),
@@ -57,6 +58,7 @@ pub fn tryExecuteDebugTool(
     request: types.Request,
     app_config: *const config.Config,
     request_id: []const u8,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !?types.Response {
     const choice = request.tool_choice orelse return null;
 
@@ -88,17 +90,17 @@ pub fn tryExecuteDebugTool(
 
     if (std.ascii.eqlIgnoreCase(choice, "file_read")) {
         if (!hasRequestedTool(request.tools, "file_read")) return null;
-        return try file_ops_tool.execute(allocator, app_config, request, .read);
+        return try file_ops_tool.execute(allocator, app_config, request, .read, active_workspace);
     }
 
     if (std.ascii.eqlIgnoreCase(choice, "file_write")) {
         if (!hasRequestedTool(request.tools, "file_write")) return null;
-        return try file_ops_tool.execute(allocator, app_config, request, .write);
+        return try file_ops_tool.execute(allocator, app_config, request, .write, active_workspace);
     }
 
     if (std.ascii.eqlIgnoreCase(choice, "file_search")) {
         if (!hasRequestedTool(request.tools, "file_search")) return null;
-        return try file_ops_tool.execute(allocator, app_config, request, .search);
+        return try file_ops_tool.execute(allocator, app_config, request, .search, active_workspace);
     }
 
     return null;
@@ -109,6 +111,7 @@ pub fn maybeExecutePromptToolsAlloc(
     request: types.Request,
     app_config: *const config.Config,
     request_id: []const u8,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !?[]u8 {
     if (request.tools.len == 0) return null;
 
@@ -143,7 +146,7 @@ pub fn maybeExecutePromptToolsAlloc(
 
     if (file_read_requested and mentionsFileReadIntent(prompt)) {
         try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-        const read_result = try file_ops_tool.execute(allocator, app_config, request, .read);
+        const read_result = try file_ops_tool.execute(allocator, app_config, request, .read, active_workspace);
         defer read_result.deinit(allocator);
         try output.writer(allocator).print("\n[tool=file_read]\n{s}\n", .{read_result.output});
         executed_any = true;
@@ -151,7 +154,7 @@ pub fn maybeExecutePromptToolsAlloc(
 
     if (file_search_requested and mentionsFileSearchIntent(prompt)) {
         try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-        const search_result = try file_ops_tool.execute(allocator, app_config, request, .search);
+        const search_result = try file_ops_tool.execute(allocator, app_config, request, .search, active_workspace);
         defer search_result.deinit(allocator);
         try output.writer(allocator).print("\n[tool=file_search]\n{s}\n", .{search_result.output});
         executed_any = true;
@@ -177,7 +180,7 @@ pub fn maybeExecutePromptToolsAlloc(
         defer write_req.deinit(allocator);
 
         try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-        const write_result = try file_ops_tool.execute(allocator, app_config, write_req, .write);
+        const write_result = try file_ops_tool.execute(allocator, app_config, write_req, .write, active_workspace);
         defer write_result.deinit(allocator);
 
         try output.writer(allocator).print("\n[tool=file_write]\n{s}\n", .{write_result.output});
@@ -276,7 +279,7 @@ pub fn makeAutoToolResponse(
     };
 }
 
-fn hasRequestedTool(tools: []const types.Tool, name: []const u8) bool {
+pub fn hasRequestedTool(tools: []const types.Tool, name: []const u8) bool {
     for (tools) |tool| {
         if (std.ascii.eqlIgnoreCase(tool.name, name)) return true;
     }
@@ -348,6 +351,7 @@ fn buildSinglePromptRequestAlloc(
         .model = null,
         .session_id = null,
         .tenant_id = null,
+        .workspace_id = null,
         .max_context_tokens = null,
         .tools = try allocator.alloc(types.Tool, 0),
         .tool_choice = null,
@@ -385,7 +389,7 @@ test "tryExecuteDebugTool executes echo when explicitly selected" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request", null);
     try std.testing.expect(maybe_result != null);
 
     var result = maybe_result.?;
@@ -427,7 +431,7 @@ test "tryExecuteDebugTool executes utc when explicitly selected" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request", null);
     try std.testing.expect(maybe_result != null);
 
     var result = maybe_result.?;
@@ -469,7 +473,7 @@ test "maybeExecutePromptToolsAlloc runs utc from prompt intent" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request");
+    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request", null);
     defer if (summary) |value| allocator.free(value);
 
     try std.testing.expect(summary != null);
@@ -509,7 +513,7 @@ test "maybeExecutePromptToolsAlloc extracts command for cmd" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, true);
     defer cfg.deinit(allocator);
 
-    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request");
+    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request", null);
     defer if (summary) |value| allocator.free(value);
 
     try std.testing.expect(summary != null);
@@ -548,7 +552,7 @@ test "tryExecuteDebugTool ignores natural language cmd selection" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, true);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request", null);
     try std.testing.expect(maybe_result == null);
 }
 
