@@ -15,6 +15,7 @@ pub const Request = struct {
     repeat_penalty: ?f64 = null,
     session_id: ?[]const u8 = null,
     tenant_id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
     max_context_tokens: ?usize = null,
     tools: []Tool,
     tool_choice: ?[]const u8 = null,
@@ -44,6 +45,9 @@ pub const Request = struct {
         }
         if (self.tenant_id) |tenant_id| {
             allocator.free(tenant_id);
+        }
+        if (self.workspace_id) |workspace_id| {
+            allocator.free(workspace_id);
         }
         for (self.tools) |tool| {
             tool.deinit(allocator);
