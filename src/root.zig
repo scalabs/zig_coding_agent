@@ -27,6 +27,7 @@ test "backend: auth and tool scaffolding" {
     _ = @import("backend/tools.zig");
     _ = @import("backend/session.zig");
     _ = @import("backend/mcp.zig");
+    _ = @import("backend/tool_output.zig");
 }
 
 test "core: HTTP request parsing" {

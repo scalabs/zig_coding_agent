@@ -787,7 +787,7 @@ pub fn streamProviderTurn(
     const response_mod = @import("../core/response.zig");
 
     if (!headers_sent.*) {
-        try response_mod.sendEventStreamHeaders(connection);
+        try response_mod.sendEventStreamHeaders(connection, null);
         headers_sent.* = true;
     }
 

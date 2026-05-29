@@ -27,12 +27,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const zig_eval_dep = b.dependency("zig_eval", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zig_eval_mod = zig_eval_dep.module("zig_eval");
-
     // CLI executable entrypoint.
     const app = b.addExecutable(.{
         .name = exe_name,
@@ -45,30 +39,35 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    app.linkLibC();
+    // No linkLibC(): harness uses std only; avoids glibc/GCC 16 .sframe linker issues on Zig 0.15.2.
 
     b.installArtifact(app);
 
-    const eval_exe = b.addExecutable(.{
-        .name = "zig-coding-agent-eval",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/eval_runner_main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zig_eval", .module = zig_eval_mod },
-            },
-        }),
-    });
-    eval_exe.linkLibC();
-    b.installArtifact(eval_exe);
+    // Optional sibling checkout: ../zig_eval (same parent folder as this repo).
+    const zig_eval_root = "../zig_eval";
+    const zig_eval_registry = "registry";
 
-    const eval_run_step = b.step("eval-run", "Run eval/registry against a running harness (see eval/registry/services.json)");
-    const eval_run_cmd = b.addRunArtifact(eval_exe);
-    eval_run_cmd.step.dependOn(b.getInstallStep());
+    const build_zig_eval = b.addSystemCommand(&.{ "zig", "build" });
+    build_zig_eval.setCwd(b.path(zig_eval_root));
+
+    const eval_build_step = b.step("eval-build", "Build sibling zig_eval checkout (requires ../zig_eval)");
+    eval_build_step.dependOn(&build_zig_eval.step);
+
+    const eval_list_cmd = b.addSystemCommand(&.{ "zig", "build", "run", "--", "list", "--registry", zig_eval_registry });
+    eval_list_cmd.setCwd(b.path(zig_eval_root));
+    eval_list_cmd.step.dependOn(&build_zig_eval.step);
+
+    const eval_list_step = b.step("eval-list", "List evals from sibling zig_eval registry (requires ../zig_eval)");
+    eval_list_step.dependOn(&eval_list_cmd.step);
+
+    const eval_run_cmd = b.addSystemCommand(&.{ "zig", "build", "run", "--", "run", "--registry", zig_eval_registry });
+    eval_run_cmd.setCwd(b.path(zig_eval_root));
+    eval_run_cmd.step.dependOn(&build_zig_eval.step);
     if (b.args) |args| {
         eval_run_cmd.addArgs(args);
     }
+
+    const eval_run_step = b.step("eval-run", "Run sibling zig_eval against this harness (requires ../zig_eval; start harness first)");
     eval_run_step.dependOn(&eval_run_cmd.step);
 
     // Run command: `zig build run -- [args]`.
@@ -153,7 +152,6 @@ pub fn build(b: *std.Build) void {
     // Compile-only verification for app and built-in test modules.
     const check_step = b.step("check", "Compile app and built-in test modules without running");
     check_step.dependOn(&app.step);
-    check_step.dependOn(&eval_exe.step);
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&types_unit_tests.step);

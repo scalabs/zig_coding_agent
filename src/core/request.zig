@@ -169,11 +169,74 @@ pub fn checkedRequiredLength(header_len: usize, content_length: usize) !usize {
     return std.math.add(usize, header_len, content_length) catch error.RequestTooLarge;
 }
 
+/// Returns a trimmed HTTP header value when present.
+pub fn getHeaderValue(headers: []const u8, header_name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    _ = lines.next();
+
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) break;
+
+        const separator_index = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..separator_index], " ");
+        if (!std.ascii.eqlIgnoreCase(name, header_name)) continue;
+
+        return std.mem.trim(u8, line[separator_index + 1 ..], " ");
+    }
+
+    return null;
+}
+
+/// Uses `X-Request-Id` when valid, otherwise generates `req-{micros}`.
+pub fn resolveRequestIdAlloc(
+    allocator: std.mem.Allocator,
+    request_raw: []const u8,
+) ![]u8 {
+    const header_end = std.mem.indexOf(u8, request_raw, "\r\n\r\n") orelse request_raw.len;
+    if (getHeaderValue(request_raw[0..header_end], "X-Request-Id")) |incoming| {
+        if (isValidRequestId(incoming)) {
+            return try allocator.dupe(u8, incoming);
+        }
+    }
+
+    return try std.fmt.allocPrint(allocator, "req-{d}", .{std.time.microTimestamp()});
+}
+
+fn isValidRequestId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 test "checkedRequiredLength rejects integer overflow" {
     try std.testing.expectError(
         error.RequestTooLarge,
         checkedRequiredLength(std.math.maxInt(usize), 1),
     );
+}
+
+test "resolveRequestIdAlloc generates fallback id" {
+    const allocator = std.testing.allocator;
+    const id = try resolveRequestIdAlloc(allocator, "GET /health HTTP/1.1\r\n\r\n");
+    defer allocator.free(id);
+    try std.testing.expect(std.mem.startsWith(u8, id, "req-"));
+}
+
+test "resolveRequestIdAlloc preserves incoming header" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "POST /v1/chat/completions HTTP/1.1\r\n" ++
+        "X-Request-Id: client-trace-42\r\n" ++
+        "\r\n";
+    const id = try resolveRequestIdAlloc(allocator, raw);
+    defer allocator.free(id);
+    try std.testing.expectEqualStrings("client-trace-42", id);
 }
 
 fn waitForReadable(

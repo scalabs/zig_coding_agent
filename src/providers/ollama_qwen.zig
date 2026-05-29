@@ -692,7 +692,7 @@ fn streamChatMessagesToSse(
     }
 
     if (!headers_sent.*) {
-        try response.sendEventStreamHeaders(connection);
+        try response.sendEventStreamHeaders(connection, null);
         headers_sent.* = true;
     }
 

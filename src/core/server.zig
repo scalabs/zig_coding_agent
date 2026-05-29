@@ -12,10 +12,20 @@ const session = @import("../backend/session.zig");
 const react = @import("../react.zig");
 
 const context_compaction_keep_messages = 8;
+const max_recent_requests = 32;
 const length_continue_prompt =
     "The previous assistant message was cut off by the generation limit. " ++
     "Continue the same answer from the exact next token. Output only the continuation text; " ++
     "do not mention truncation, continuation, the previous message, or these instructions.";
+
+const RecentRequest = struct {
+    route: [48]u8 = undefined,
+    route_len: u8 = 0,
+    status_code: u16 = 0,
+    duration_ms: u64 = 0,
+    request_id: [64]u8 = undefined,
+    request_id_len: u8 = 0,
+};
 
 const ServerState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -25,6 +35,9 @@ const ServerState = struct {
     active_connections: u64 = 0,
     provider_latency_buckets: [4]u64 = .{ 0, 0, 0, 0 },
     connected_clients: std.ArrayList([]u8),
+    recent_requests: [max_recent_requests]RecentRequest = undefined,
+    recent_request_idx: usize = 0,
+    recent_request_count: usize = 0,
 
     fn init() ServerState {
         return .{ .connected_clients = .{} };
@@ -89,6 +102,67 @@ const ServerState = struct {
         else
             3;
         self.provider_latency_buckets[idx] += 1;
+    }
+
+    fn noteRecentRequest(
+        self: *ServerState,
+        route: []const u8,
+        status_code: u16,
+        duration_ms: u64,
+        request_id: []const u8,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var entry = &self.recent_requests[self.recent_request_idx];
+        const route_len = @min(route.len, entry.route.len);
+        @memcpy(entry.route[0..route_len], route[0..route_len]);
+        entry.route_len = @intCast(route_len);
+        entry.status_code = status_code;
+        entry.duration_ms = duration_ms;
+
+        const request_id_len = @min(request_id.len, entry.request_id.len);
+        @memcpy(entry.request_id[0..request_id_len], request_id[0..request_id_len]);
+        entry.request_id_len = @intCast(request_id_len);
+
+        self.recent_request_idx = (self.recent_request_idx + 1) % max_recent_requests;
+        if (self.recent_request_count < max_recent_requests) {
+            self.recent_request_count += 1;
+        }
+    }
+
+    fn recentRequestsJsonAlloc(self: *ServerState, allocator: std.mem.Allocator) ![]u8 {
+        var out = std.ArrayList(u8){};
+        errdefer out.deinit(allocator);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try out.append(allocator, '[');
+        var written: usize = 0;
+        var idx = if (self.recent_request_count < max_recent_requests)
+            0
+        else
+            self.recent_request_idx;
+
+        while (written < self.recent_request_count) : ({
+            written += 1;
+            idx = (idx + 1) % max_recent_requests;
+        }) {
+            const entry = self.recent_requests[idx];
+            if (written > 0) try out.append(allocator, ',');
+            try out.writer(allocator).print(
+                "{{\"route\":\"{s}\",\"status\":{d},\"duration_ms\":{d},\"request_id\":\"{s}\"}}",
+                .{
+                    entry.route[0..entry.route_len],
+                    entry.status_code,
+                    entry.duration_ms,
+                    entry.request_id[0..entry.request_id_len],
+                },
+            );
+        }
+        try out.append(allocator, ']');
+        return try out.toOwnedSlice(allocator);
     }
 
     fn snapshot(self: *ServerState) Snapshot {
@@ -277,6 +351,7 @@ pub fn run(
                 503,
                 "{\"error\":{\"message\":\"Server is at connection capacity\",\"type\":\"server_error\",\"param\":null,\"code\":\"connection_capacity\"}}",
                 app_config,
+                null,
             );
             connection.stream.close();
             continue;
@@ -317,6 +392,18 @@ fn handleConnection(
     session_store: ?*session.SessionStore,
     session_store_guard: *SessionStoreGuard,
 ) !void {
+    const request_started_ms = std.time.milliTimestamp();
+    var request_route: []const u8 = "unknown";
+    var request_status: u16 = 500;
+    var request_id_owned: ?[]u8 = null;
+    defer if (request_id_owned) |id| allocator.free(id);
+    defer server_state.noteRecentRequest(
+        request_route,
+        request_status,
+        @intCast(@max(std.time.milliTimestamp() - request_started_ms, 0)),
+        request_id_owned orelse "unknown",
+    );
+
     // Translate transport-level parsing failures into OpenAI-style API errors.
     const request_raw = request.readHttpRequest(
         allocator,
@@ -330,46 +417,46 @@ fn handleConnection(
             return;
         },
         error.RequestTimedOut => {
-            sendApiErrorSafe(connection.*, allocator, backend.errors.requestTimeoutError(), app_config);
+            sendApiErrorSafe(connection.*, allocator, backend.errors.requestTimeoutError(), app_config, null);
             return;
         },
         error.RequestTooLarge => {
-            sendApiErrorSafe(connection.*, allocator, backend.errors.payloadTooLargeError(), app_config);
+            sendApiErrorSafe(connection.*, allocator, backend.errors.payloadTooLargeError(), app_config, null);
             return;
         },
         error.HeadersTooLarge => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "HTTP headers are too large",
                 "headers_too_large",
-            ), app_config);
+            ), app_config, null);
             return;
         },
         error.InvalidHttpRequest => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Malformed HTTP request",
                 "invalid_http_request",
-            ), app_config);
+            ), app_config, null);
             return;
         },
         error.MissingContentLength => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Missing Content-Length header",
                 "missing_content_length",
-            ), app_config);
+            ), app_config, null);
             return;
         },
         error.InvalidContentLength => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Invalid Content-Length header",
                 "invalid_content_length",
-            ), app_config);
+            ), app_config, null);
             return;
         },
         error.IncompleteRequestBody => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
                 "Incomplete request body",
                 "incomplete_body",
-            ), app_config);
+            ), app_config, null);
             return;
         },
         else => {
@@ -378,6 +465,14 @@ fn handleConnection(
         },
     };
     defer allocator.free(request_raw);
+
+    request_id_owned = try request.resolveRequestIdAlloc(allocator, request_raw);
+    const request_id = request_id_owned.?;
+
+    const header_end = std.mem.indexOf(u8, request_raw, "\r\n\r\n") orelse request_raw.len;
+    if (request.getHeaderValue(request_raw[0..header_end], "User-Agent")) |user_agent| {
+        server_state.noteClient(allocator, user_agent) catch {};
+    }
 
     if (request_raw.len == 0) return;
     server_state.noteRequestStarted();
@@ -392,19 +487,28 @@ fn handleConnection(
         sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
             "Malformed HTTP request",
             "invalid_http_request",
-        ), app_config);
+        ), app_config, request_id);
         server_state.noteRequestFailed();
         return;
     };
 
     if (route == null) {
-        sendApiErrorSafe(connection.*, allocator, backend.errors.notFoundError(), app_config);
+        sendApiErrorSafe(connection.*, allocator, backend.errors.notFoundError(), app_config, request_id);
         server_state.noteRequestFailed();
         return;
     }
 
+    request_route = switch (route.?) {
+        .health => "GET /health",
+        .metrics => "GET /metrics",
+        .diagnostics_clients => "GET /diagnostics/clients",
+        .diagnostics_requests => "GET /diagnostics/requests",
+        .diagnostics_providers => "GET /diagnostics/providers",
+        .chat_completions => "POST /v1/chat/completions",
+    };
+
     if (requiresAuth(route.?) and auth.authorizeRequest(app_config.auth_api_key, request_raw) == .denied) {
-        sendJsonSafe(connection.*, 401, "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth_error\",\"param\":null,\"code\":\"unauthorized\"}}", app_config);
+        sendJsonSafe(connection.*, 401, "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth_error\",\"param\":null,\"code\":\"unauthorized\"}}", app_config, request_id);
         server_state.noteRequestFailed();
         return;
     }
@@ -417,7 +521,7 @@ fn handleConnection(
                 .{app_config.instance_id},
             );
             defer allocator.free(health_json);
-            sendJsonSafe(connection.*, 200, health_json, app_config);
+            sendJsonSafe(connection.*, 200, health_json, app_config, request_id);
             server_state.noteRequestSucceeded();
             return;
         },
@@ -439,7 +543,7 @@ fn handleConnection(
                 },
             );
             defer allocator.free(metrics_json);
-            sendJsonSafe(connection.*, 200, metrics_json, app_config);
+            sendJsonSafe(connection.*, 200, metrics_json, app_config, request_id);
             server_state.noteRequestSucceeded();
             return;
         },
@@ -454,25 +558,29 @@ fn handleConnection(
                 .{ app_config.instance_id, snapshot.active_connections, clients_json },
             );
             defer allocator.free(payload);
-            sendJsonSafe(connection.*, 200, payload, app_config);
+            sendJsonSafe(connection.*, 200, payload, app_config, request_id);
             server_state.noteRequestSucceeded();
             return;
         },
         .diagnostics_requests => {
             const snapshot = server_state.snapshot();
+            const recent_json = try server_state.recentRequestsJsonAlloc(allocator);
+            defer allocator.free(recent_json);
             const payload = try std.fmt.allocPrint(
                 allocator,
-                "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d}}}",
+                "{{\"instance_id\":\"{s}\",\"total_requests\":{d},\"successful_requests\":{d},\"failed_requests\":{d},\"recent_requests\":{s}}}",
                 .{
                     app_config.instance_id,
                     snapshot.total_requests,
                     snapshot.successful_requests,
                     snapshot.failed_requests,
+                    recent_json,
                 },
             );
             defer allocator.free(payload);
-            sendJsonSafe(connection.*, 200, payload, app_config);
+            sendJsonSafe(connection.*, 200, payload, app_config, null);
             server_state.noteRequestSucceeded();
+            request_status = 200;
             return;
         },
         .diagnostics_providers => {
@@ -486,7 +594,7 @@ fn handleConnection(
             );
             defer allocator.free(payload);
 
-            sendJsonSafe(connection.*, 200, payload, app_config);
+            sendJsonSafe(connection.*, 200, payload, app_config, request_id);
             server_state.noteRequestSucceeded();
             return;
         },
@@ -497,7 +605,7 @@ fn handleConnection(
         sendApiErrorSafe(connection.*, allocator, backend.errors.httpError(
             "Missing request body",
             "missing_body",
-        ), app_config);
+        ), app_config, request_id);
         server_state.noteRequestFailed();
         return;
     };
@@ -508,7 +616,7 @@ fn handleConnection(
     const parsed_req = switch (parse_result) {
         .ok => |parsed_request| parsed_request,
         .err => |api_error| {
-            sendApiErrorSafe(connection.*, allocator, api_error, app_config);
+            sendApiErrorSafe(connection.*, allocator, api_error, app_config, request_id);
             server_state.noteRequestFailed();
             return;
         },
@@ -520,7 +628,7 @@ fn handleConnection(
             "One or more requested tools are not registered",
             "tools",
             "unknown_tool",
-        ), app_config);
+        ), app_config, request_id);
         server_state.noteRequestFailed();
         return;
     }
@@ -569,7 +677,9 @@ fn handleConnection(
         }
     }
 
-    if (parsed_req.max_context_tokens) |max_tokens| {
+    const effective_max_context_tokens = parsed_req.max_context_tokens orelse app_config.default_max_context_tokens;
+
+    if (effective_max_context_tokens) |max_tokens| {
         const estimated = session.estimateTokenCount(request_messages);
         if (session.shouldCompressContext(estimated, max_tokens)) {
             const compacted_messages = try session.compactContextToBudgetAlloc(
@@ -619,10 +729,10 @@ fn handleConnection(
         );
         defer stream_request.deinit(allocator);
 
-        if (try tooling.tryExecuteDebugTool(allocator, stream_request, app_config)) |tool_result| {
+        if (try tooling.tryExecuteDebugTool(allocator, stream_request, app_config, request_id)) |tool_result| {
             defer tool_result.deinit(allocator);
 
-            try response.sendEventStreamHeaders(connection.*);
+            try response.sendEventStreamHeaders(connection.*, request_id);
             const completion_id = try std.fmt.allocPrint(
                 allocator,
                 "chatcmpl-{d}",
@@ -657,18 +767,18 @@ fn handleConnection(
                 "stream=true is currently supported only for ollama",
                 "stream",
                 "unsupported_stream_provider",
-            ), app_config);
+            ), app_config, request_id);
             server_state.noteRequestFailed();
             return;
         }
 
-        const stream_auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config) catch |err| switch (err) {
+        const stream_auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, stream_request, app_config, request_id) catch |err| switch (err) {
             error.ToolCallLimitExceeded => {
                 sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
                     "Tool call limit exceeded",
                     "tools",
                     "tool_call_limit_exceeded",
-                ), app_config);
+                ), app_config, request_id);
                 server_state.noteRequestFailed();
                 return;
             },
@@ -678,7 +788,7 @@ fn handleConnection(
 
         if (stream_auto_tool_summary) |summary| {
             if (tooling.shouldShortCircuitAutoTools(stream_request)) {
-                try response.sendEventStreamHeaders(connection.*);
+                try response.sendEventStreamHeaders(connection.*, request_id);
                 const completion_id = try std.fmt.allocPrint(
                     allocator,
                     "chatcmpl-{d}",
@@ -723,6 +833,7 @@ fn handleConnection(
                 app_config,
                 stream_request,
                 app_config.loop_stream_progress_enabled,
+                request_id,
             ) catch |err| {
                 logError("Provider stream loop error: {s}", .{@errorName(err)});
                 server_state.noteRequestFailed();
@@ -750,22 +861,34 @@ fn handleConnection(
                 sendApiErrorSafe(connection.*, allocator, backend.errors.providerError(
                     provider_error_response.output,
                     "provider_error",
-                ), app_config);
+                ), app_config, request_id);
                 server_state.noteRequestFailed();
                 return;
             },
         }
     }
 
-    if (try tooling.tryExecuteDebugTool(allocator, parsed_req, app_config)) |tool_result| {
+    if (try tooling.tryExecuteDebugTool(allocator, parsed_req, app_config, request_id)) |tool_result| {
         defer tool_result.deinit(allocator);
         debugLog(
             app_config,
             "debug tool executed tool_choice={s}",
             .{parsed_req.tool_choice orelse "(none)"},
         );
-        sendChatCompletionSafe(connection.*, allocator, tool_result, app_config);
+        persistSessionState(
+            allocator,
+            app_config,
+            session_store,
+            session_store_guard,
+            parsed_req,
+            loaded_session,
+            request_messages,
+            null,
+            tool_result.output,
+        );
+        sendChatCompletionSafe(connection.*, allocator, tool_result, app_config, request_id);
         server_state.noteRequestSucceeded();
+        request_status = 200;
         return;
     }
 
@@ -780,13 +903,13 @@ fn handleConnection(
     );
     defer provider_request.deinit(allocator);
 
-    const auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config) catch |err| switch (err) {
+    const auto_tool_summary = tooling.maybeExecutePromptToolsAlloc(allocator, provider_request, app_config, request_id) catch |err| switch (err) {
         error.ToolCallLimitExceeded => {
             sendApiErrorSafe(connection.*, allocator, backend.errors.validationError(
                 "Tool call limit exceeded",
                 "tools",
                 "tool_call_limit_exceeded",
-            ), app_config);
+            ), app_config, request_id);
             server_state.noteRequestFailed();
             return;
         },
@@ -798,8 +921,20 @@ fn handleConnection(
         if (tooling.shouldShortCircuitAutoTools(provider_request)) {
             var tool_response = try tooling.makeAutoToolResponse(allocator, summary);
             defer tool_response.deinit(allocator);
-            sendChatCompletionSafe(connection.*, allocator, tool_response, app_config);
+            persistSessionState(
+                allocator,
+                app_config,
+                session_store,
+                session_store_guard,
+                parsed_req,
+                loaded_session,
+                provider_request.messages,
+                null,
+                tool_response.output,
+            );
+            sendChatCompletionSafe(connection.*, allocator, tool_response, app_config, request_id);
             server_state.noteRequestSucceeded();
+            request_status = 200;
             return;
         }
     }
@@ -830,13 +965,14 @@ fn handleConnection(
 
     const provider_started_ms = std.time.milliTimestamp();
     if (loop_enabled) {
-        const loop_execution = executeLoopRequestAlloc(allocator, app_config, provider_request) catch |err| {
+        const loop_execution = executeLoopRequestAlloc(allocator, app_config, provider_request, request_id) catch |err| {
             if (err == error.ToolCallLimitExceeded) {
                 sendApiErrorSafe(
                     connection.*,
                     allocator,
                     backend.errors.validationError("Tool call limit exceeded", "tools", "tool_call_limit_exceeded"),
                     app_config,
+                    request_id,
                 );
                 server_state.noteRequestFailed();
                 return;
@@ -847,6 +983,7 @@ fn handleConnection(
                 allocator,
                 backend.errors.providerTransportError(@errorName(err)),
                 app_config,
+                request_id,
             );
             server_state.noteRequestFailed();
             return;
@@ -863,6 +1000,7 @@ fn handleConnection(
                 allocator,
                 backend.errors.providerTransportError(@errorName(err)),
                 app_config,
+                request_id,
             );
             server_state.noteRequestFailed();
             return;
@@ -895,6 +1033,7 @@ fn handleConnection(
             allocator,
             backend.errors.providerFailureFromDetail(normalized_provider, result.output),
             app_config,
+            request_id,
         );
         server_state.noteRequestFailed();
         return;
@@ -926,6 +1065,7 @@ fn handleConnection(
                     "empty_model_response",
                 ),
                 app_config,
+                request_id,
             );
             server_state.noteRequestFailed();
             return;
@@ -939,52 +1079,24 @@ fn handleConnection(
     );
 
     if (session_store) |store| {
-        if (parsed_req.session_id) |session_id| {
-            const loop_messages = loop_messages_for_persistence;
-            const with_assistant = if (loop_messages) |messages| blk: {
-                break :blk try session.cloneMessagesAlloc(allocator, messages);
-            } else session.appendAssistantMessageAlloc(
+        if (parsed_req.session_id != null) {
+            persistSessionState(
                 allocator,
+                app_config,
+                store,
+                session_store_guard,
+                parsed_req,
+                loaded_session,
                 provider_request.messages,
+                loop_messages_for_persistence,
                 result.output,
-            ) catch |err| blk: {
-                logError("Session append failed for '{s}': {s}", .{ session_id, @errorName(err) });
-                break :blk null;
-            };
-
-            if (with_assistant) |messages| {
-                defer {
-                    for (messages) |message| {
-                        message.deinit(allocator);
-                    }
-                    allocator.free(messages);
-                }
-
-                var state = session.SessionState{
-                    .session_id = try allocator.dupe(u8, session_id),
-                    .tenant_id = if (parsed_req.tenant_id) |value| try allocator.dupe(u8, value) else null,
-                    .summary = if (loaded_session) |loaded| try allocator.dupe(u8, loaded.summary) else try allocator.dupe(u8, ""),
-                    .messages = try session.trimToRetentionAlloc(
-                        allocator,
-                        messages,
-                        app_config.session_retention_messages,
-                    ),
-                    .message_count = 0,
-                };
-                state.message_count = state.messages.len;
-                defer state.deinit(allocator);
-
-                session_store_guard.mutex.lock();
-                store.save(allocator, state) catch |err| {
-                    logError("Session save failed for '{s}': {s}", .{ session_id, @errorName(err) });
-                };
-                session_store_guard.mutex.unlock();
-            }
+            );
         }
     }
 
-    sendChatCompletionSafe(connection.*, allocator, result, app_config);
+    sendChatCompletionSafe(connection.*, allocator, result, app_config, request_id);
     server_state.noteRequestSucceeded();
+    request_status = 200;
 }
 
 fn cloneRequestWithMessagesAlloc(
@@ -1049,6 +1161,7 @@ fn executeReactActionForRequest(
     turn_request: types.Request,
     tool_messages: []const types.Message,
     action: react.ReactAction,
+    request_id: []const u8,
 ) ![]u8 {
     return switch (action) {
         .tool => |tool_action| blk: {
@@ -1065,7 +1178,7 @@ fn executeReactActionForRequest(
             }
             tool_request.tool_choice = try allocator.dupe(u8, tool_action.name);
 
-            if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config)) |tool_result| {
+            if (try tooling.tryExecuteDebugTool(allocator, tool_request, app_config, request_id)) |tool_result| {
                 defer tool_result.deinit(allocator);
                 break :blk try allocator.dupe(u8, tool_result.output);
             }
@@ -1086,12 +1199,13 @@ fn streamLoopRequestToSse(
     app_config: *const config.Config,
     base_request: types.Request,
     emit_progress: bool,
+    request_id: []const u8,
 ) !void {
     const loop_mode = base_request.loop_mode orelse "basic";
     const loop_until = base_request.loop_until orelse "DONE";
     const loop_max_turns = base_request.loop_max_turns orelse 8;
 
-    try response.sendEventStreamHeaders(connection);
+    try response.sendEventStreamHeaders(connection, request_id);
     var headers_sent: bool = true;
     var think_block_open: bool = false;
 
@@ -1261,7 +1375,7 @@ fn streamLoopRequestToSse(
                     },
                     else => {
                         try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
-                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action);
+                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action, request_id);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
                     },
@@ -1342,6 +1456,7 @@ fn executeLoopRequestAlloc(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     base_request: types.Request,
+    request_id: []const u8,
 ) !LoopExecution {
     const loop_mode = base_request.loop_mode orelse "basic";
     const loop_until = base_request.loop_until orelse "DONE";
@@ -1480,7 +1595,7 @@ fn executeLoopRequestAlloc(
                     },
                     else => {
                         try tooling.noteToolCall(app_config.max_tool_calls_per_request, &react_tool_calls);
-                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action);
+                        const obs_raw = try executeReactActionForRequest(allocator, app_config, turn_request, working_messages, action, request_id);
                         defer allocator.free(obs_raw);
                         react_observation = try react.formatObservation(allocator, turn + 1, obs_raw);
                     },
@@ -1662,13 +1777,72 @@ fn isLengthFinishReason(finish_reason: []const u8) bool {
     return std.ascii.eqlIgnoreCase(finish_reason, "length");
 }
 
+fn persistSessionState(
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    session_store: ?*session.SessionStore,
+    session_store_guard: *SessionStoreGuard,
+    parsed_req: types.Request,
+    loaded_session: ?session.SessionState,
+    base_messages: []const types.Message,
+    loop_messages: ?[]types.Message,
+    assistant_output: []const u8,
+) void {
+    const store = session_store orelse return;
+    const session_id = parsed_req.session_id orelse return;
+
+    const with_assistant = if (loop_messages) |messages| blk: {
+        break :blk session.cloneMessagesAlloc(allocator, messages) catch |err| blk2: {
+            logError("Session append failed for '{s}': {s}", .{ session_id, @errorName(err) });
+            break :blk2 null;
+        };
+    } else session.appendAssistantMessageAlloc(
+        allocator,
+        base_messages,
+        assistant_output,
+    ) catch |err| blk: {
+        logError("Session append failed for '{s}': {s}", .{ session_id, @errorName(err) });
+        break :blk null;
+    };
+
+    if (with_assistant) |messages| {
+        defer {
+            for (messages) |message| {
+                message.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        var state = session.SessionState{
+            .session_id = allocator.dupe(u8, session_id) catch return,
+            .tenant_id = if (parsed_req.tenant_id) |value| allocator.dupe(u8, value) catch return else null,
+            .summary = if (loaded_session) |loaded| allocator.dupe(u8, loaded.summary) catch return else allocator.dupe(u8, "") catch return,
+            .messages = session.trimToRetentionAlloc(
+                allocator,
+                messages,
+                app_config.session_retention_messages,
+            ) catch return,
+            .message_count = 0,
+        };
+        state.message_count = state.messages.len;
+        defer state.deinit(allocator);
+
+        session_store_guard.mutex.lock();
+        store.save(allocator, state) catch |err| {
+            logError("Session save failed for '{s}': {s}", .{ session_id, @errorName(err) });
+        };
+        session_store_guard.mutex.unlock();
+    }
+}
+
 fn sendApiErrorSafe(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
     api_error: backend.errors.ApiError,
     app_config: *const config.Config,
+    request_id: ?[]const u8,
 ) void {
-    response.sendApiError(connection, allocator, api_error) catch |err| {
+    response.sendApiError(connection, allocator, api_error, request_id) catch |err| {
         swallowSocketWriteError(app_config, err);
     };
 }
@@ -1678,10 +1852,17 @@ fn sendJsonSafe(
     status_code: u16,
     body: []const u8,
     app_config: *const config.Config,
+    request_id: ?[]const u8,
 ) void {
-    response.sendJsonText(connection, status_code, body) catch |err| {
-        swallowSocketWriteError(app_config, err);
-    };
+    if (request_id) |id| {
+        response.sendJsonTextWithRequestId(connection, status_code, body, id) catch |err| {
+            swallowSocketWriteError(app_config, err);
+        };
+    } else {
+        response.sendJsonText(connection, status_code, body) catch |err| {
+            swallowSocketWriteError(app_config, err);
+        };
+    }
 }
 
 fn sendChatCompletionSafe(
@@ -1689,8 +1870,9 @@ fn sendChatCompletionSafe(
     allocator: std.mem.Allocator,
     result: types.Response,
     app_config: *const config.Config,
+    request_id: ?[]const u8,
 ) void {
-    response.sendChatCompletion(connection, allocator, result) catch |err| {
+    response.sendChatCompletion(connection, allocator, result, request_id) catch |err| {
         swallowSocketWriteError(app_config, err);
     };
 }
