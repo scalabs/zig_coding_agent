@@ -15,6 +15,7 @@ pub const Request = struct {
     repeat_penalty: ?f64 = null,
     session_id: ?[]const u8 = null,
     tenant_id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
     max_context_tokens: ?usize = null,
     tools: []Tool,
     tool_choice: ?[]const u8 = null,
@@ -45,6 +46,9 @@ pub const Request = struct {
         if (self.tenant_id) |tenant_id| {
             allocator.free(tenant_id);
         }
+        if (self.workspace_id) |workspace_id| {
+            allocator.free(workspace_id);
+        }
         for (self.tools) |tool| {
             tool.deinit(allocator);
         }
@@ -57,41 +61,6 @@ pub const Request = struct {
         }
         if (self.loop_until) |loop_until| {
             allocator.free(loop_until);
-        }
-    }
-};
-
-/// Structured tool call emitted by a provider or parsed from model output.
-pub const ToolCall = struct {
-    id: ?[]const u8 = null,
-    name: []const u8,
-    arguments_json: []const u8,
-
-    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
-        if (self.id) |id| {
-            allocator.free(id);
-        }
-        allocator.free(self.name);
-        allocator.free(self.arguments_json);
-    }
-};
-
-/// Result produced after executing a tool call.
-pub const ToolCallResult = struct {
-    call_id: ?[]const u8 = null,
-    name: []const u8,
-    output: []const u8,
-    success: bool = true,
-    error_message: ?[]const u8 = null,
-
-    pub fn deinit(self: ToolCallResult, allocator: std.mem.Allocator) void {
-        if (self.call_id) |call_id| {
-            allocator.free(call_id);
-        }
-        allocator.free(self.name);
-        allocator.free(self.output);
-        if (self.error_message) |message| {
-            allocator.free(message);
         }
     }
 };
@@ -115,14 +84,10 @@ pub const Message = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    input_schema_json: ?[]const u8 = null,
 
     pub fn deinit(self: Tool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
-        if (self.input_schema_json) |input_schema_json| {
-            allocator.free(input_schema_json);
-        }
     }
 };
 

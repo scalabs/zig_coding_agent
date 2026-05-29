@@ -385,6 +385,29 @@ pub fn parseChatRequest(
         null;
     errdefer if (tenant_id) |value| allocator.free(value);
 
+    const workspace_id = if (obj.get("workspace_id")) |workspace_id_value|
+        switch (workspace_id_value) {
+            .string => |value| blk: {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "workspace_id must not be empty",
+                        "workspace_id",
+                        "invalid_workspace_id",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, trimmed);
+            },
+            else => return .{ .err = errors.validationError(
+                "workspace_id must be a string",
+                "workspace_id",
+                "invalid_workspace_id",
+            ) },
+        }
+    else
+        null;
+    errdefer if (workspace_id) |value| allocator.free(value);
+
     const max_context_tokens = if (obj.get("max_context_tokens")) |tokens_value|
         switch (tokens_value) {
             .integer => |value| blk: {
@@ -683,6 +706,7 @@ pub fn parseChatRequest(
         .repeat_penalty = repeat_penalty,
         .session_id = session_id,
         .tenant_id = tenant_id,
+        .workspace_id = workspace_id,
         .max_context_tokens = max_context_tokens,
         .tools = parsed_tools,
         .tool_choice = tool_choice,
