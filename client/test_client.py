@@ -203,11 +203,11 @@ with st.sidebar:
     CODING_TOOLS = [_shell_tool, "file_read", "file_write", "file_search"]
 
     auto_tools_for_react = st.checkbox(
-        "Auto-attach coding tools when loop_mode=react",
-        value=True,
+        "Also send coding tools from client when loop_mode=react",
+        value=False,
         help=(
-            "When enabled and loop_mode is 'react', send the full coding tool set "
-            f"({', '.join(CODING_TOOLS)}) with tool_choice=auto. Overrides the manual selection below."
+            "The server already auto-attaches the coding tool set for react loops. "
+            "Enable this only to duplicate tools in the JSON payload (e.g. for debugging)."
         ),
     )
 
