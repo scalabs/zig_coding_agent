@@ -12,24 +12,29 @@ const command_exec_tool = @import("tools/command_exec.zig");
 /// System prompt injected at the start of every ReAct loop to instruct the
 /// model on the required Thought/Action/Observation format.
 pub const system_prompt =
-    "You are running in ReAct (Reasoning + Acting) mode.\n" ++
-    "You MUST follow this format strictly for every step:\n\n" ++
-    "Thought N: <your reasoning about what to do next>\n" ++
-    "Action N: <one of the available actions>\n\n" ++
-    "After each Action the system will inject:\n" ++
-    "Observation N: <result of the action>\n\n" ++
+    "You are running in ReAct (Reasoning + Acting) mode for multi-step problem solving.\n" ++
+    "Smaller models should solve tasks incrementally: one Thought and one Action per turn, " ++
+    "wait for the Observation, then continue.\n\n" ++
+    "Required format every turn:\n\n" ++
+    "Thought N: <brief reasoning for the next single step only>\n" ++
+    "Action N: <exactly one action from the list below>\n\n" ++
+    "The harness injects after each Action:\n" ++
+    "Observation N: <result>\n\n" ++
+    "Example:\n" ++
+    "Thought 1: I need to inspect the entry file before editing.\n" ++
+    "Action 1: file_read[src/main.zig]\n\n" ++
     "Available actions:\n" ++
-    "  Search[query]   - search for information\n" ++
-    "  Lookup[term]    - look up a term in the current context\n" ++
+    "  Search[query]   - search the repo (maps to file_search when that tool is enabled)\n" ++
+    "  Lookup[path]    - read a file path (maps to file_read when that tool is enabled)\n" ++
     "  Cmd[command]    - execute a shell command (may require confirmation)\n" ++
     "  Finish[answer]  - return the final answer and end the loop\n\n" ++
     "Rules:\n" ++
-    "- Always start with a Thought, then an Action.\n" ++
-    "- Never produce an Observation yourself; the system provides them.\n" ++
-    "- Use Finish[answer] when you have the final answer.\n" ++
-    "- Be concrete: use specific names, values, steps, and short outputs instead of vague summaries.\n" ++
-    "- If you need information, ask for the exact term or command that will resolve it.\n" ++
-    "- If an action fails, adjust your approach in the next Thought.\n";
+    "- Emit exactly ONE Action per turn; do not plan ahead with Action 2+ before the Observation.\n" ++
+    "- Never write Observation lines yourself.\n" ++
+    "- Use Finish[answer] only when the task is done.\n" ++
+    "- Prefer small steps: read/search, then edit, then run tests via Cmd.\n" ++
+    "- If parsing fails, repeat Thought/Action using the exact Action N: Type[argument] format.\n" ++
+    "- If an action fails, change approach in the next Thought instead of repeating the same action.\n";
 
 pub fn buildSystemPromptAlloc(allocator: std.mem.Allocator, tools: []const types.Tool) ![]u8 {
     if (tools.len == 0) return try allocator.dupe(u8, system_prompt);
@@ -51,13 +56,82 @@ pub fn buildSystemPromptAlloc(allocator: std.mem.Allocator, tools: []const types
 
     try out.appendSlice(
         allocator,
-        "\n\nTool rules:\n" ++
-            "- For file_write, include the path and fenced code block inside the brackets, for example:\n" ++
-            "  Action N: file_write[write relative/path\n```lang\n...\n```]\n" ++
-            "- Put the full tool input inside the brackets.\n",
+        "\n\nCoding tool rules:\n" ++
+            "- file_read[path]: read before editing; path is relative to the project root.\n" ++
+            "- file_search[search pattern in directory]: find symbols/files before changing code.\n" ++
+            "- file_write[write relative/path\n```lang\n...\n```]: put the full write payload in brackets.\n" ++
+            "- Read[path] and Write[...] are aliases for file_read and file_write.\n" ++
+            "- Run Cmd[zig build test] (or similar) after edits to verify.\n",
     );
 
     return try out.toOwnedSlice(allocator);
+}
+
+const DefaultCodingTool = struct {
+    name: []const u8,
+    description: []const u8,
+};
+
+/// Ensures ReAct loop requests expose the standard coding tool set server-side so
+/// clients do not need to attach tools manually. Existing client tools are kept;
+/// missing defaults are appended. Sets `tool_choice` to `auto` when unset.
+pub fn ensureReactCodingToolsAlloc(allocator: std.mem.Allocator, request: *types.Request) !void {
+    const loop_mode = request.loop_mode orelse return;
+    if (!std.ascii.eqlIgnoreCase(loop_mode, "react")) return;
+
+    const shell_tool: []const u8 = if (@import("builtin").os.tag == .windows) "cmd" else "bash";
+    const shell_description = if (@import("builtin").os.tag == .windows)
+        "Execute a Windows shell command (requires LLM_ROUTER_TOOL_EXEC_ENABLED=1)."
+    else
+        "Execute a bash shell command (requires LLM_ROUTER_TOOL_EXEC_ENABLED=1).";
+
+    const defaults = [_]DefaultCodingTool{
+        .{ .name = "file_read", .description = "Read a relative file path and return its content." },
+        .{ .name = "file_write", .description = "Write or replace a relative file path." },
+        .{ .name = "file_search", .description = "Search for a substring under a relative directory." },
+        .{ .name = shell_tool, .description = shell_description },
+    };
+
+    var merged = std.ArrayList(types.Tool){};
+    errdefer {
+        for (merged.items) |tool| {
+            tool.deinit(allocator);
+        }
+        merged.deinit(allocator);
+    }
+
+    for (request.tools) |tool| {
+        try merged.append(allocator, .{
+            .name = try allocator.dupe(u8, tool.name),
+            .description = try allocator.dupe(u8, tool.description),
+        });
+    }
+
+    for (defaults) |default_tool| {
+        if (hasToolName(merged.items, default_tool.name)) continue;
+        try merged.append(allocator, .{
+            .name = try allocator.dupe(u8, default_tool.name),
+            .description = try allocator.dupe(u8, default_tool.description),
+        });
+    }
+
+    for (request.tools) |tool| {
+        tool.deinit(allocator);
+    }
+    allocator.free(request.tools);
+
+    request.tools = try merged.toOwnedSlice(allocator);
+
+    if (request.tool_choice == null) {
+        request.tool_choice = try allocator.dupe(u8, "auto");
+    }
+}
+
+fn hasToolName(tools: []const types.Tool, name: []const u8) bool {
+    for (tools) |tool| {
+        if (std.ascii.eqlIgnoreCase(tool.name, name)) return true;
+    }
+    return false;
 }
 
 /// Parsed action extracted from a model response.
@@ -160,6 +234,12 @@ pub fn parseReactAction(output: []const u8) ?ReactAction {
     if (eqlIgnoreCase(action_type, "lookup")) return .{ .lookup = argument };
     if (eqlIgnoreCase(action_type, "cmd")) return .{ .cmd = argument };
     if (eqlIgnoreCase(action_type, "finish")) return .{ .finish = argument };
+    if (eqlIgnoreCase(action_type, "read")) {
+        return .{ .tool = .{ .name = "file_read", .argument = argument } };
+    }
+    if (eqlIgnoreCase(action_type, "write")) {
+        return .{ .tool = .{ .name = "file_write", .argument = argument } };
+    }
     if (isKnownApiToolAction(action_type)) {
         return .{ .tool = .{ .name = action_type, .argument = argument } };
     }
@@ -206,6 +286,10 @@ pub fn executeReactAction(
         ),
     };
 }
+
+pub const parse_error_hint =
+    "Could not parse an Action. Reply with exactly one pair: Thought N: ... then Action N: Type[argument]. " ++
+    "Example: Action 1: file_read[src/main.zig]";
 
 /// Formats an observation message with turn numbering.
 pub fn formatObservation(
@@ -400,6 +484,18 @@ test "parseReactAction returns unknown for unrecognized action type" {
     }
 }
 
+test "parseReactAction maps Read alias to file_read" {
+    const action = parseReactAction("Action 1: Read[src/main.zig]");
+    try std.testing.expect(action != null);
+    switch (action.?) {
+        .tool => |tool| {
+            try std.testing.expectEqualStrings("file_read", tool.name);
+            try std.testing.expectEqualStrings("src/main.zig", tool.argument);
+        },
+        else => return error.UnexpectedActionType,
+    }
+}
+
 test "parseReactAction extracts requested API tool action" {
     const action = parseReactAction("Thought 1: write the file\nAction 1: file_write[write app.cpp\n```cpp\nint main() { return 0; }\n```]");
     try std.testing.expect(action != null);
@@ -411,6 +507,62 @@ test "parseReactAction extracts requested API tool action" {
         },
         else => return error.UnexpectedActionType,
     }
+}
+
+test "ensureReactCodingToolsAlloc merges defaults and sets auto tool_choice" {
+    const allocator = std.testing.allocator;
+
+    var request = types.Request{
+        .prompt = try allocator.dupe(u8, "fix the bug"),
+        .messages = try allocator.alloc(types.Message, 0),
+        .tools = try allocator.alloc(types.Tool, 0),
+        .loop_mode = try allocator.dupe(u8, "react"),
+    };
+    defer request.deinit(allocator);
+
+    try ensureReactCodingToolsAlloc(allocator, &request);
+    try std.testing.expect(request.tools.len >= 4);
+    try std.testing.expect(hasToolName(request.tools, "file_read"));
+    try std.testing.expect(hasToolName(request.tools, "file_write"));
+    try std.testing.expect(hasToolName(request.tools, "file_search"));
+    try std.testing.expect(request.tool_choice != null);
+    try std.testing.expectEqualStrings("auto", request.tool_choice.?);
+}
+
+test "ensureReactCodingToolsAlloc preserves client tools" {
+    const allocator = std.testing.allocator;
+
+    var request = types.Request{
+        .prompt = try allocator.dupe(u8, "echo"),
+        .messages = try allocator.alloc(types.Message, 0),
+        .tools = try allocator.alloc(types.Tool, 1),
+        .loop_mode = try allocator.dupe(u8, "react"),
+    };
+    request.tools[0] = .{
+        .name = try allocator.dupe(u8, "echo"),
+        .description = try allocator.dupe(u8, "echo tool"),
+    };
+    defer request.deinit(allocator);
+
+    try ensureReactCodingToolsAlloc(allocator, &request);
+    try std.testing.expect(hasToolName(request.tools, "echo"));
+    try std.testing.expect(hasToolName(request.tools, "file_read"));
+}
+
+test "ensureReactCodingToolsAlloc no-op outside react mode" {
+    const allocator = std.testing.allocator;
+
+    var request = types.Request{
+        .prompt = try allocator.dupe(u8, "hello"),
+        .messages = try allocator.alloc(types.Message, 0),
+        .tools = try allocator.alloc(types.Tool, 0),
+        .loop_mode = try allocator.dupe(u8, "agent"),
+    };
+    defer request.deinit(allocator);
+
+    try ensureReactCodingToolsAlloc(allocator, &request);
+    try std.testing.expectEqual(@as(usize, 0), request.tools.len);
+    try std.testing.expect(request.tool_choice == null);
 }
 
 test "buildSystemPromptAlloc includes requested tools" {
