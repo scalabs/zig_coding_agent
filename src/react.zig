@@ -40,19 +40,18 @@ pub fn buildSystemPromptAlloc(allocator: std.mem.Allocator, tools: []const types
     try out.appendSlice(allocator, system_prompt);
     try out.appendSlice(
         allocator,
-        "\nRequested API tools are also valid Actions when named exactly:\n",
+        "\nRequested API tools (names only; invoke with exact name in brackets):\n",
     );
 
-    for (tools) |tool| {
-        try out.writer(allocator).print(
-            "  {s}[argument] - {s}\n",
-            .{ tool.name, tool.description },
-        );
+    for (tools, 0..) |tool, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, " ");
+        try out.appendSlice(allocator, tool.name);
     }
 
     try out.appendSlice(
         allocator,
-        "\nTool rules:\n" ++
+        "\n\nTool rules:\n" ++
             "- For file_write, include the path and fenced code block inside the brackets, for example:\n" ++
             "  Action N: file_write[write relative/path\n```lang\n...\n```]\n" ++
             "- Put the full tool input inside the brackets.\n",
@@ -261,7 +260,7 @@ fn executeReactCmd(
     defer req.deinit(allocator);
 
     const shell: command_exec_tool.ShellFlavor = if (@import("builtin").os.tag == .windows) .cmd else .bash;
-    var result = try command_exec_tool.execute(allocator, app_config, req, shell);
+    var result = try command_exec_tool.execute(allocator, app_config, req, shell, "react-local");
     defer result.deinit(allocator);
 
     // Dupe the output to transfer ownership to the caller; result.deinit
@@ -423,7 +422,8 @@ test "buildSystemPromptAlloc includes requested tools" {
     const prompt = try buildSystemPromptAlloc(allocator, tools[0..]);
     defer allocator.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "file_write[argument]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "file_write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "names only") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "file_write[write relative/path") != null);
 }
 

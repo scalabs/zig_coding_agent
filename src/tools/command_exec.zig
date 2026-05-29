@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
+const tool_output = @import("../backend/tool_output.zig");
 
 pub const ShellFlavor = enum {
     cmd,
@@ -69,6 +70,7 @@ pub fn execute(
     app_config: *const config.Config,
     request: types.Request,
     flavor: ShellFlavor,
+    request_id: []const u8,
 ) !types.Response {
     const tool_name = switch (flavor) {
         .cmd => "cmd",
@@ -112,7 +114,7 @@ pub fn execute(
 
     const command = blk: {
         if (looksLikeCommandPrompt(prompt)) {
-            break :blk validateAndNormalizeCommandAlloc(allocator, prompt, flavor) catch |err| switch (err) {
+            break :blk validateAndNormalizeCommandAlloc(allocator, prompt, flavor, app_config.tool_exec_trusted_local) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     return try makeToolResponse(
@@ -128,7 +130,7 @@ pub fn execute(
             };
         }
 
-        const extracted = try extractCommandFromPromptAlloc(allocator, flavor, prompt);
+        const extracted = try extractCommandFromPromptAlloc(allocator, flavor, prompt, app_config.tool_exec_trusted_local);
         if (extracted) |value| {
             break :blk value;
         }
@@ -242,10 +244,10 @@ pub fn execute(
         std.Thread.sleep(2 * std.time.ns_per_ms);
     }
 
-    const terminated_as: std.process.Child.Term = if (timed_out)
-        child.kill() catch .{ .Unknown = 1 }
-    else
-        child.wait() catch .{ .Unknown = 1 };
+    if (timed_out) {
+        _ = child.kill() catch {};
+    }
+    const terminated_as = child.wait() catch std.process.Child.Term{ .Unknown = 1 };
 
     if (stdout_thread) |thread| thread.join();
     if (stderr_thread) |thread| thread.join();
@@ -293,8 +295,17 @@ pub fn execute(
             stderr_text,
         },
     );
+    defer allocator.free(output);
 
-    return try makeToolResponse(allocator, tool_name, output);
+    const final_output = try tool_output.maybeOffloadToolOutputAlloc(
+        allocator,
+        app_config,
+        request_id,
+        tool_name,
+        output,
+    );
+
+    return try makeToolResponse(allocator, tool_name, final_output);
 }
 
 fn capturePipeMain(capture: *PipeCapture, file: std.fs.File, max_bytes: usize) void {
@@ -310,6 +321,7 @@ pub fn extractCommandFromPromptAlloc(
     allocator: std.mem.Allocator,
     flavor: ShellFlavor,
     prompt: []const u8,
+    trusted_local: bool,
 ) !?[]u8 {
     const without_confirm = stripToolConfirmMarkerSuffix(prompt);
     const trimmed = std.mem.trim(u8, without_confirm, " \t\r\n\"'");
@@ -318,26 +330,26 @@ pub fn extractCommandFromPromptAlloc(
     if (extractQuotedCommandSlice(trimmed)) |quoted| {
         const normalized = std.mem.trim(u8, quoted, " \t\r\n");
         if (normalized.len > 0) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (stripCommandInstructionPrefix(trimmed)) |candidate| {
         const normalized = normalizeExtractedCandidate(candidate);
         if (normalized.len > 0) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (extractInlineRunSegment(trimmed)) |candidate| {
         const normalized = normalizeExtractedCandidate(candidate);
         if (normalized.len > 0 and looksLikeCommandPrompt(normalized)) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (looksLikeCommandPrompt(trimmed)) {
-        return try validateAndNormalizeCommandAlloc(allocator, trimmed, flavor);
+        return try validateAndNormalizeCommandAlloc(allocator, trimmed, flavor, trusted_local);
     }
 
     return null;
@@ -347,11 +359,12 @@ fn validateAndNormalizeCommandAlloc(
     allocator: std.mem.Allocator,
     command: []const u8,
     flavor: ShellFlavor,
+    trusted_local: bool,
 ) ![]u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n\"'");
     if (trimmed.len == 0) return error.EmptyCommand;
     if (trimmed.len > max_command_len) return error.CommandTooLong;
-    if (containsUnsafeCommandByte(trimmed)) return error.UnsafeCharacter;
+    if (containsUnsafeCommandByte(trimmed, trusted_local)) return error.UnsafeCharacter;
 
     const command_name = firstToken(trimmed) orelse return error.EmptyCommand;
     if (isDangerousCommandName(flavor, command_name)) return error.DangerousCommand;
@@ -384,10 +397,10 @@ fn looksLikeCommandPrompt(text: []const u8) bool {
     return true;
 }
 
-fn containsUnsafeCommandByte(text: []const u8) bool {
+fn containsUnsafeCommandByte(text: []const u8, trusted_local: bool) bool {
     for (text) |byte| {
         if (byte < 0x20 or byte == 0x7f) return true;
-        if (isUnsafeShellByte(byte)) return true;
+        if (!trusted_local and isUnsafeShellByte(byte)) return true;
     }
     return false;
 }
@@ -668,9 +681,12 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .session_retention_messages = 24,
         .tool_exec_enabled = enable_exec,
         .tool_exec_confirmation_required = false,
+        .tool_exec_trusted_local = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .tool_output_offload_bytes = 8192,
         .max_tool_calls_per_request = 8,
+        .default_max_context_tokens = null,
         .loop_stream_progress_enabled = true,
         .max_concurrent_connections = 64,
         .max_request_bytes = 1024 * 1024,
@@ -704,7 +720,7 @@ test "execute cmd tool returns disabled marker when not enabled" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
@@ -718,6 +734,7 @@ test "extractCommandFromPromptAlloc extracts from run prefix" {
         allocator,
         .cmd,
         "Please run zig build test",
+        false,
     );
     defer if (maybe_cmd) |cmd| allocator.free(cmd);
 
@@ -731,6 +748,7 @@ test "extractCommandFromPromptAlloc ignores natural language requests" {
         allocator,
         .cmd,
         "Please write a small C++ program",
+        false,
     );
     defer if (maybe_cmd) |cmd| allocator.free(cmd);
 
@@ -763,7 +781,7 @@ test "execute cmd tool rejects unsafe chaining" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
@@ -796,7 +814,7 @@ test "execute cmd tool blocks dangerous denylist command" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
@@ -830,7 +848,7 @@ test "execute cmd tool enforces timeout and kills process" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);

@@ -50,6 +50,7 @@ fn sendJson(
     connection: std.net.Server.Connection,
     status_code: u16,
     body: []const u8,
+    request_id: ?[]const u8,
 ) !void {
     const status_text = switch (status_code) {
         200 => "OK",
@@ -65,16 +66,27 @@ fn sendJson(
         else => "Internal Server Error",
     };
 
+    const request_id_header = if (request_id) |id|
+        try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "X-Request-Id: {s}\r\n",
+            .{id},
+        )
+    else
+        try std.heap.page_allocator.dupe(u8, "");
+    defer std.heap.page_allocator.free(request_id_header);
+
     // The server handles one request per connection.
     const response = try std.fmt.allocPrint(
         std.heap.page_allocator,
         "HTTP/1.1 {d} {s}\r\n" ++
             "Content-Type: application/json\r\n" ++
+            "{s}" ++
             "Content-Length: {d}\r\n" ++
             "Connection: close\r\n" ++
             "\r\n" ++
             "{s}",
-        .{ status_code, status_text, body.len, body },
+        .{ status_code, status_text, request_id_header, body.len, body },
     );
     defer std.heap.page_allocator.free(response);
 
@@ -86,7 +98,16 @@ pub fn sendJsonText(
     status_code: u16,
     body: []const u8,
 ) !void {
-    try sendJson(connection, status_code, body);
+    try sendJson(connection, status_code, body, null);
+}
+
+pub fn sendJsonTextWithRequestId(
+    connection: std.net.Server.Connection,
+    status_code: u16,
+    body: []const u8,
+    request_id: []const u8,
+) !void {
+    try sendJson(connection, status_code, body, request_id);
 }
 
 /// Send API error response
@@ -94,6 +115,7 @@ pub fn sendApiError(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
     api_error: errors.ApiError,
+    request_id: ?[]const u8,
 ) !void {
     const escaped_message = try escapeJsonStringAlloc(allocator, api_error.message);
     defer allocator.free(escaped_message);
@@ -114,7 +136,7 @@ pub fn sendApiError(
     });
     defer allocator.free(response_json);
 
-    try sendJson(connection, api_error.status_code, response_json);
+    try sendJson(connection, api_error.status_code, response_json, request_id);
 }
 
 fn makeCompletionIdAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -138,6 +160,7 @@ pub fn sendChatCompletion(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
     result: types.Response,
+    request_id: ?[]const u8,
 ) !void {
     var generated_id: ?[]u8 = null;
     defer if (generated_id) |id| allocator.free(id);
@@ -176,17 +199,32 @@ pub fn sendChatCompletion(
     });
     defer allocator.free(response_json);
 
-    try sendJson(connection, 200, response_json);
+    try sendJson(connection, 200, response_json, request_id);
 }
 
-pub fn sendEventStreamHeaders(connection: std.net.Server.Connection) !void {
-    const response =
+pub fn sendEventStreamHeaders(connection: std.net.Server.Connection, request_id: ?[]const u8) !void {
+    const request_id_header = if (request_id) |id|
+        try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "X-Request-Id: {s}\r\n",
+            .{id},
+        )
+    else
+        try std.heap.page_allocator.dupe(u8, "");
+    defer std.heap.page_allocator.free(request_id_header);
+
+    const response = try std.fmt.allocPrint(
+        std.heap.page_allocator,
         "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "X-Accel-Buffering: no\r\n" ++
-        "\r\n";
+            "Content-Type: text/event-stream\r\n" ++
+            "Cache-Control: no-cache\r\n" ++
+            "{s}" ++
+            "Connection: close\r\n" ++
+            "X-Accel-Buffering: no\r\n" ++
+            "\r\n",
+        .{request_id_header},
+    );
+    defer std.heap.page_allocator.free(response);
 
     try connection.stream.writeAll(response);
 }

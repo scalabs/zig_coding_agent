@@ -5,6 +5,7 @@ const echo_tool = @import("../tools/echo.zig");
 const utc_tool = @import("../tools/utc.zig");
 const command_exec_tool = @import("../tools/command_exec.zig");
 const file_ops_tool = @import("../tools/file_ops.zig");
+const tool_output = @import("tool_output.zig");
 
 pub const ToolRegistry = struct {
     allowed_names: std.StringHashMap(void),
@@ -55,6 +56,7 @@ pub fn tryExecuteDebugTool(
     allocator: std.mem.Allocator,
     request: types.Request,
     app_config: *const config.Config,
+    request_id: []const u8,
 ) !?types.Response {
     const choice = request.tool_choice orelse return null;
 
@@ -70,18 +72,18 @@ pub fn tryExecuteDebugTool(
 
     if (std.ascii.eqlIgnoreCase(choice, "cmd")) {
         if (!hasRequestedTool(request.tools, "cmd")) return null;
-        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, request.prompt);
+        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, request.prompt, app_config.tool_exec_trusted_local);
         defer if (command) |value| allocator.free(value);
         if (command == null) return null;
-        return try command_exec_tool.execute(allocator, app_config, request, .cmd);
+        return try command_exec_tool.execute(allocator, app_config, request, .cmd, request_id);
     }
 
     if (std.ascii.eqlIgnoreCase(choice, "bash")) {
         if (!hasRequestedTool(request.tools, "bash")) return null;
-        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, request.prompt);
+        const command = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, request.prompt, app_config.tool_exec_trusted_local);
         defer if (command) |value| allocator.free(value);
         if (command == null) return null;
-        return try command_exec_tool.execute(allocator, app_config, request, .bash);
+        return try command_exec_tool.execute(allocator, app_config, request, .bash, request_id);
     }
 
     if (std.ascii.eqlIgnoreCase(choice, "file_read")) {
@@ -106,6 +108,7 @@ pub fn maybeExecutePromptToolsAlloc(
     allocator: std.mem.Allocator,
     request: types.Request,
     app_config: *const config.Config,
+    request_id: []const u8,
 ) !?[]u8 {
     if (request.tools.len == 0) return null;
 
@@ -187,7 +190,7 @@ pub fn maybeExecutePromptToolsAlloc(
             defer run_req.deinit(allocator);
 
             try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .cmd);
+            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .cmd, request_id);
             defer run_result.deinit(allocator);
 
             try output.writer(allocator).print("\n[tool=cmd]\n{s}\n", .{run_result.output});
@@ -198,7 +201,7 @@ pub fn maybeExecutePromptToolsAlloc(
             defer run_req.deinit(allocator);
 
             try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .bash);
+            const run_result = try command_exec_tool.execute(allocator, app_config, run_req, .bash, request_id);
             defer run_result.deinit(allocator);
 
             try output.writer(allocator).print("\n[tool=bash]\n{s}\n", .{run_result.output});
@@ -206,7 +209,7 @@ pub fn maybeExecutePromptToolsAlloc(
     }
 
     if (cmd_requested) {
-        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, prompt);
+        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .cmd, prompt, app_config.tool_exec_trusted_local);
         defer if (command_to_run) |command| allocator.free(command);
 
         if (command_to_run) |command| {
@@ -214,7 +217,7 @@ pub fn maybeExecutePromptToolsAlloc(
             defer cmd_request.deinit(allocator);
 
             try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-            const cmd_result = try command_exec_tool.execute(allocator, app_config, cmd_request, .cmd);
+            const cmd_result = try command_exec_tool.execute(allocator, app_config, cmd_request, .cmd, request_id);
             defer cmd_result.deinit(allocator);
 
             try output.writer(allocator).print("\n[tool=cmd]\n{s}\n", .{cmd_result.output});
@@ -223,7 +226,7 @@ pub fn maybeExecutePromptToolsAlloc(
     }
 
     if (!executed_any and bash_requested) {
-        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, prompt);
+        const command_to_run = try command_exec_tool.extractCommandFromPromptAlloc(allocator, .bash, prompt, app_config.tool_exec_trusted_local);
         defer if (command_to_run) |command| allocator.free(command);
 
         if (command_to_run) |command| {
@@ -231,7 +234,7 @@ pub fn maybeExecutePromptToolsAlloc(
             defer bash_request.deinit(allocator);
 
             try noteToolCall(app_config.max_tool_calls_per_request, &tool_calls);
-            const bash_result = try command_exec_tool.execute(allocator, app_config, bash_request, .bash);
+            const bash_result = try command_exec_tool.execute(allocator, app_config, bash_request, .bash, request_id);
             defer bash_result.deinit(allocator);
 
             try output.writer(allocator).print("\n[tool=bash]\n{s}\n", .{bash_result.output});
@@ -382,7 +385,7 @@ test "tryExecuteDebugTool executes echo when explicitly selected" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg);
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
     try std.testing.expect(maybe_result != null);
 
     var result = maybe_result.?;
@@ -424,7 +427,7 @@ test "tryExecuteDebugTool executes utc when explicitly selected" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg);
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
     try std.testing.expect(maybe_result != null);
 
     var result = maybe_result.?;
@@ -466,7 +469,7 @@ test "maybeExecutePromptToolsAlloc runs utc from prompt intent" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, false);
     defer cfg.deinit(allocator);
 
-    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg);
+    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request");
     defer if (summary) |value| allocator.free(value);
 
     try std.testing.expect(summary != null);
@@ -506,7 +509,7 @@ test "maybeExecutePromptToolsAlloc extracts command for cmd" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, true);
     defer cfg.deinit(allocator);
 
-    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg);
+    const summary = try maybeExecutePromptToolsAlloc(allocator, req, &cfg, "test-request");
     defer if (summary) |value| allocator.free(value);
 
     try std.testing.expect(summary != null);
@@ -545,7 +548,7 @@ test "tryExecuteDebugTool ignores natural language cmd selection" {
     var cfg = try command_exec_tool.buildTestConfig(allocator, true);
     defer cfg.deinit(allocator);
 
-    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg);
+    const maybe_result = try tryExecuteDebugTool(allocator, req, &cfg, "test-request");
     try std.testing.expect(maybe_result == null);
 }
 
