@@ -94,7 +94,7 @@ pub fn streamQwenTurnToSse(
     captured_content: *std.ArrayList(u8),
     think_block_open: *bool,
 ) !TurnStreamResult {
-    const requested_model = request.model orelse app_config.ollama_model;
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
     var model_name = requested_model;
     var fallback: ?ModelFallback = null;
     defer if (fallback) |value| value.deinit(allocator);
@@ -167,7 +167,7 @@ pub fn streamQwenToSse(
     app_config: *const config.Config,
     request: types.Request,
 ) !StreamQwenResult {
-    const requested_model = request.model orelse app_config.ollama_model;
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
     var model_name = requested_model;
     var fallback: ?ModelFallback = null;
     defer if (fallback) |value| value.deinit(allocator);
@@ -276,7 +276,7 @@ pub fn callQwen(
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const requested_model = request.model orelse app_config.ollama_model;
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
     var model_name = requested_model;
     var fallback: ?ModelFallback = null;
     defer if (fallback) |value| value.deinit(allocator);

@@ -9,7 +9,7 @@ pub fn callBedrock(
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const model_name = request.model orelse app_config.bedrock_model;
+    const model_name = request.model orelse app_config.modelForProvider("bedrock");
 
     if (app_config.bedrock_access_key_id.len == 0 or app_config.bedrock_secret_access_key.len == 0) {
         return try errorResponse(

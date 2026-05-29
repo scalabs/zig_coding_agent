@@ -11,12 +11,12 @@ pub fn callOpenRouter(
     if (app_config.openrouter_api_key.len == 0) {
         return try errorResponse(
             allocator,
-            request.model orelse app_config.openrouter_model,
+            request.model orelse app_config.modelForProvider("openrouter"),
             "OpenRouter provider selected but OPENROUTER_API_KEY is not set",
         );
     }
 
-    const model_name = request.model orelse app_config.openrouter_model;
+    const model_name = request.model orelse app_config.modelForProvider("openrouter");
     var extra_headers_buffer: [2]std.http.Header = undefined;
     const extra_headers = buildExtraHeaders(
         app_config.openrouter_http_referer,

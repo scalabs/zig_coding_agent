@@ -10,7 +10,7 @@ pub fn callClaude(
     if (app_config.claude_api_key.len == 0) {
         return .{
             .id = null,
-            .model = try allocator.dupe(u8, request.model orelse app_config.claude_model),
+            .model = try allocator.dupe(u8, request.model orelse app_config.modelForProvider("claude")),
             .output = try allocator.dupe(u8, "Claude API key is not configured on the server"),
             .finish_reason = try allocator.dupe(u8, "stop"),
             .success = false,
@@ -18,7 +18,7 @@ pub fn callClaude(
         };
     }
 
-    const model_name = request.model orelse app_config.claude_model;
+    const model_name = request.model orelse app_config.modelForProvider("claude");
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();

@@ -8,7 +8,7 @@ pub fn callLlamaCpp(
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const model_name = request.model orelse app_config.llama_cpp_model;
+    const model_name = request.model orelse app_config.modelForProvider("llama_cpp");
 
     const maybe_key: ?[]const u8 = if (app_config.llama_cpp_api_key.len > 0)
         app_config.llama_cpp_api_key
