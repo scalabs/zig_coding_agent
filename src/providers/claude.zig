@@ -1,18 +1,7 @@
-//! Anthropic Claude provider adapter.
-//!
-//! Sends chat completion requests to the Claude Messages API
-//! (v2023-06-01). System messages are extracted into Claude's
-//! dedicated `system` field; all other roles are mapped to
-//! `user` or `assistant`.
-
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 
-/// Sends a chat completion request to Claude's Messages API.
-/// Returns an error response if the API key is missing or if
-/// the HTTP call fails. System messages are promoted to Claude's
-/// top-level `system` field.
 pub fn callClaude(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -21,7 +10,7 @@ pub fn callClaude(
     if (app_config.claude_api_key.len == 0) {
         return .{
             .id = null,
-            .model = try allocator.dupe(u8, request.model orelse app_config.claude_model),
+            .model = try allocator.dupe(u8, request.model orelse app_config.modelForProvider("claude")),
             .output = try allocator.dupe(u8, "Claude API key is not configured on the server"),
             .finish_reason = try allocator.dupe(u8, "stop"),
             .success = false,
@@ -29,7 +18,7 @@ pub fn callClaude(
         };
     }
 
-    const model_name = request.model orelse app_config.claude_model;
+    const model_name = request.model orelse app_config.modelForProvider("claude");
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();

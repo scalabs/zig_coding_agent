@@ -1,25 +1,15 @@
-//! AWS Bedrock provider adapter.
-//!
-//! Sends requests to the Bedrock Converse API with full AWS SigV4
-//! signing. Handles model ID percent-encoding, system message
-//! extraction, and Bedrock-specific response parsing.
-
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// Sends a chat completion request to AWS Bedrock Converse API.
-/// Returns an error response if credentials are missing or if tools
-/// are requested (not yet supported). Performs full SigV4 request
-/// signing.
 pub fn callBedrock(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const model_name = request.model orelse app_config.bedrock_model;
+    const model_name = request.model orelse app_config.modelForProvider("bedrock");
 
     if (app_config.bedrock_access_key_id.len == 0 or app_config.bedrock_secret_access_key.len == 0) {
         return try errorResponse(
@@ -111,7 +101,6 @@ pub fn callBedrock(
     );
 }
 
-/// Builds a JSON status payload describing the Bedrock provider config.
 pub fn buildStatusJsonAlloc(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
