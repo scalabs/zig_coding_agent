@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
+const workspace = @import("../backend/workspace.zig");
 
 pub const Op = enum { read, write, search };
 
@@ -9,6 +10,7 @@ pub fn execute(
     app_config: *const config.Config,
     request: types.Request,
     op: Op,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !types.Response {
     const tool_name: []const u8 = switch (op) {
         .read => "file_read",
@@ -26,9 +28,9 @@ pub fn execute(
     }
 
     return switch (op) {
-        .read => executeRead(allocator, app_config, tool_name, prompt),
-        .write => executeWrite(allocator, app_config, tool_name, request, prompt),
-        .search => executeSearch(allocator, app_config, tool_name, prompt),
+        .read => executeRead(allocator, app_config, tool_name, prompt, active_workspace),
+        .write => executeWrite(allocator, app_config, tool_name, request, prompt, active_workspace),
+        .search => executeSearch(allocator, app_config, tool_name, prompt, active_workspace),
     };
 }
 
@@ -37,6 +39,7 @@ fn executeRead(
     app_config: *const config.Config,
     tool_name: []const u8,
     prompt: []const u8,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !types.Response {
     const path_raw = parseSingleArgAfterPrefix(prompt, "read ") orelse
         parseSingleArgAfterPrefix(prompt, "file_read ") orelse
@@ -57,15 +60,25 @@ fn executeRead(
         );
     };
 
-    const tmp_rel_path = try prefixTmpPathAlloc(allocator, rel_path);
-    defer allocator.free(tmp_rel_path);
-
-    const start_ms = std.time.milliTimestamp();
-    var file = std.fs.cwd().openFile(tmp_rel_path, .{}) catch |err| {
+    const resolved_path = resolveToolPathAlloc(allocator, app_config, rel_path) catch |err| {
         return try makeToolResponse(
             allocator,
             tool_name,
-            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nopen_error={s}\npath={s}", .{ tool_name, @errorName(err), tmp_rel_path }),
+            try std.fmt.allocPrint(
+                allocator,
+                "DEBUG_TOOL_ERROR\ntool={s}\nvalidation_error={s}\nmessage=invalid path",
+                .{ tool_name, @errorName(err) },
+            ),
+        );
+    };
+    defer allocator.free(resolved_path);
+
+    const start_ms = std.time.milliTimestamp();
+    var file = std.fs.cwd().openFile(resolved_path, .{}) catch |err| {
+        return try makeToolResponse(
+            allocator,
+            tool_name,
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nopen_error={s}\npath={s}", .{ tool_name, @errorName(err), resolved_path }),
         );
     };
     defer file.close();
@@ -74,7 +87,7 @@ fn executeRead(
         return try makeToolResponse(
             allocator,
             tool_name,
-            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nread_error={s}\npath={s}", .{ tool_name, @errorName(err), tmp_rel_path }),
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nread_error={s}\npath={s}", .{ tool_name, @errorName(err), resolved_path }),
         );
     };
     defer allocator.free(bytes);
@@ -82,10 +95,14 @@ fn executeRead(
     const end_ms = std.time.milliTimestamp();
     const duration_ms: u64 = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
 
+    if (active_workspace) |ws| {
+        workspace.recordFileHint(ws, allocator, "read", rel_path) catch {};
+    }
+
     const out = try std.fmt.allocPrint(
         allocator,
         "DEBUG_TOOL_OK\ntool={s}\npath={s}\nduration_ms={d}\nmax_bytes={d}\n--- content ---\n{s}",
-        .{ tool_name, tmp_rel_path, duration_ms, app_config.tool_exec_max_output_bytes, bytes },
+        .{ tool_name, resolved_path, duration_ms, app_config.tool_exec_max_output_bytes, bytes },
     );
     return try makeToolResponse(allocator, tool_name, out);
 }
@@ -96,6 +113,7 @@ fn executeWrite(
     tool_name: []const u8,
     request: types.Request,
     prompt: []const u8,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !types.Response {
     const parsed = parseWritePrompt(allocator, prompt) catch blk: {
         const inferred_path = inferWriteFilenameFromPromptAlloc(allocator, prompt) orelse break :blk null;
@@ -133,8 +151,14 @@ fn executeWrite(
         );
     };
 
-    const tmp_rel_path = try prefixTmpPathAlloc(allocator, rel_path);
-    defer allocator.free(tmp_rel_path);
+    const resolved_path = resolveToolPathAlloc(allocator, app_config, rel_path) catch |err| {
+        return try makeToolResponse(
+            allocator,
+            tool_name,
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nvalidation_error={s}\nmessage=invalid path", .{ tool_name, @errorName(err) }),
+        );
+    };
+    defer allocator.free(resolved_path);
 
     if (parsed.content.len > app_config.tool_exec_max_output_bytes) {
         return try makeToolResponse(
@@ -150,7 +174,7 @@ fn executeWrite(
 
     const start_ms = std.time.milliTimestamp();
 
-    if (std.fs.path.dirname(tmp_rel_path)) |dir_name| {
+    if (std.fs.path.dirname(resolved_path)) |dir_name| {
         std.fs.cwd().makePath(dir_name) catch |err| {
             return try makeToolResponse(
                 allocator,
@@ -160,11 +184,11 @@ fn executeWrite(
         };
     }
 
-    var file = std.fs.cwd().createFile(tmp_rel_path, .{ .truncate = true }) catch |err| {
+    var file = std.fs.cwd().createFile(resolved_path, .{ .truncate = true }) catch |err| {
         return try makeToolResponse(
             allocator,
             tool_name,
-            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\ncreate_error={s}\npath={s}", .{ tool_name, @errorName(err), tmp_rel_path }),
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\ncreate_error={s}\npath={s}", .{ tool_name, @errorName(err), resolved_path }),
         );
     };
     defer file.close();
@@ -173,17 +197,21 @@ fn executeWrite(
         return try makeToolResponse(
             allocator,
             tool_name,
-            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nwrite_error={s}\npath={s}", .{ tool_name, @errorName(err), tmp_rel_path }),
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nwrite_error={s}\npath={s}", .{ tool_name, @errorName(err), resolved_path }),
         );
     };
 
     const end_ms = std.time.milliTimestamp();
     const duration_ms: u64 = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
 
+    if (active_workspace) |ws| {
+        workspace.recordFileHint(ws, allocator, "write", rel_path) catch {};
+    }
+
     const out = try std.fmt.allocPrint(
         allocator,
         "DEBUG_TOOL_OK\ntool={s}\npath={s}\nbytes_written={d}\nduration_ms={d}\n--- content ---\n{s}",
-        .{ tool_name, tmp_rel_path, parsed.content.len, duration_ms, parsed.content },
+        .{ tool_name, resolved_path, parsed.content.len, duration_ms, parsed.content },
     );
     return try makeToolResponse(allocator, tool_name, out);
 }
@@ -193,6 +221,7 @@ fn executeSearch(
     app_config: *const config.Config,
     tool_name: []const u8,
     prompt: []const u8,
+    active_workspace: ?*workspace.WorkspaceState,
 ) !types.Response {
     const parsed = parseSearchPrompt(allocator, prompt) catch |err| {
         return try makeToolResponse(
@@ -216,8 +245,14 @@ fn executeSearch(
         );
     };
 
-    const tmp_rel_dir = try prefixTmpPathAlloc(allocator, rel_dir);
-    defer allocator.free(tmp_rel_dir);
+    const resolved_dir = resolveToolPathAlloc(allocator, app_config, rel_dir) catch |err| {
+        return try makeToolResponse(
+            allocator,
+            tool_name,
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nvalidation_error={s}\nmessage=invalid dir", .{ tool_name, @errorName(err) }),
+        );
+    };
+    defer allocator.free(resolved_dir);
 
     const start_ms = std.time.milliTimestamp();
 
@@ -226,7 +261,7 @@ fn executeSearch(
 
     try out.writer(allocator).print(
         "DEBUG_TOOL_OK\ntool={s}\ndir={s}\npattern={s}\nmax_bytes={d}\n--- matches ---\n",
-        .{ tool_name, tmp_rel_dir, parsed.pattern, app_config.tool_exec_max_output_bytes },
+        .{ tool_name, resolved_dir, parsed.pattern, app_config.tool_exec_max_output_bytes },
     );
 
     var bytes_budget: usize = app_config.tool_exec_max_output_bytes;
@@ -236,11 +271,11 @@ fn executeSearch(
     var files_scanned: usize = 0;
     const max_files: usize = 500;
 
-    var dir = std.fs.cwd().openDir(tmp_rel_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.fs.cwd().openDir(resolved_dir, .{ .iterate = true }) catch |err| {
         return try makeToolResponse(
             allocator,
             tool_name,
-            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nopen_dir_error={s}\ndir={s}", .{ tool_name, @errorName(err), tmp_rel_dir }),
+            try std.fmt.allocPrint(allocator, "DEBUG_TOOL_ERROR\ntool={s}\nopen_dir_error={s}\ndir={s}", .{ tool_name, @errorName(err), resolved_dir }),
         );
     };
     defer dir.close();
@@ -277,6 +312,10 @@ fn executeSearch(
     const end_ms = std.time.milliTimestamp();
     const duration_ms: u64 = if (end_ms >= start_ms) @as(u64, @intCast(end_ms - start_ms)) else 0;
     try out.writer(allocator).print("\nfiles_scanned={d}\nmatches={d}\nduration_ms={d}\n", .{ files_scanned, matches, duration_ms });
+
+    if (active_workspace) |ws| {
+        workspace.recordFileHint(ws, allocator, "search", rel_dir) catch {};
+    }
 
     return try makeToolResponse(allocator, tool_name, try out.toOwnedSlice(allocator));
 }
@@ -405,6 +444,13 @@ fn parseSearchPrompt(allocator: std.mem.Allocator, prompt: []const u8) !ParsedSe
 fn parseSingleArgAfterPrefix(text: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.ascii.startsWithIgnoreCase(text, prefix)) return null;
     return std.mem.trim(u8, text[prefix.len..], " \t\r\n\"'");
+}
+
+fn resolveToolPathAlloc(allocator: std.mem.Allocator, app_config: *const config.Config, rel_path: []const u8) ![]u8 {
+    if (app_config.workspace_mode_enabled) {
+        return std.fs.path.join(allocator, &.{ app_config.workspace_root, rel_path });
+    }
+    return prefixTmpPathAlloc(allocator, rel_path);
 }
 
 fn prefixTmpPathAlloc(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
