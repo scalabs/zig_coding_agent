@@ -58,9 +58,12 @@ flowchart TD
 ## Build, Run, and Test
 
 ```bash
-zig build
+zig build              # ReleaseSafe by default (~2 MB stripped binary)
 zig build run
 zig build check
+zig build windows      # cross-compile zig-coding-agent.exe for x86_64-windows-gnu
+zig build -Doptimize=Debug   # larger binary with safety checks for development
+zig build -Doptimize=ReleaseSmall   # smallest binary (~800 KB)
 ```
 
 ### Test Targets
@@ -82,25 +85,58 @@ zig build test -Dtest-target=file "-Dtest-file=src/types.zig"
 zig build test -Dtest-target=all -Dtest-filter=normalizeProviderName
 ```
 
-### zig_eval harness (optional)
+### zig_eval (optional sibling checkout)
 
-This repo depends on the sibling **zig_eval** checkout at `../zig_eval` (see `build.zig.zon`). It ships a small **eval registry** under `eval/registry/` (same layout as `zig_eval`: `services.json`, `evals/<group>/*.json`, `data/.../*.jsonl`) and a runner binary **`zig-coding-agent-eval`**.
+Evaluations live in the sibling **zig_eval** repo. Check out both repos side by side:
 
-**Prerequisites:** Ollama (or whatever `services.json` targets) reachable, and this router listening (default `http://127.0.0.1:8081`). If `LLM_ROUTER_API_KEY` is set on the server, set the same variable for the eval client (see `eval/registry/services.json` → `api_key_env`).
-
-```bash
-# Terminal A: router
-zig build run
-
-# Terminal B: from repo root — runs all eval definitions under eval/registry/evals/
-zig build eval-run
-
-# Custom registry directory or JSON run log
-zig build eval-run -- path/to/registry
-zig build eval-run -- --json
+```text
+zig/
+├── zig_coding_agent/   # this harness
+└── zig_eval/           # registry-driven eval runner
 ```
 
-There is currently **one** eval definition checked in (`smoke.reply_ok`). Add more by dropping new JSON files under `eval/registry/evals/` and matching datasets under `eval/registry/data/`.
+`zig_eval/registry/services.json` targets this router at `http://127.0.0.1:8081` (`local-openai-compat`).
+
+**Prerequisites:** LLM provider reachable (e.g. Ollama), harness listening, and matching `LLM_ROUTER_API_KEY` if auth is enabled.
+
+```bash
+# Terminal A: start harness — pick provider + model via env (or .env)
+export LLM_ROUTER_PROVIDER=openrouter   # ollama | openai | openrouter | claude | bedrock | llama_cpp
+export LLM_ROUTER_MODEL=openai/gpt-4o-mini
+export OPENROUTER_API_KEY=your-key       # set the key for the active provider
+zig build run -- --use-env
+
+# Switch to local Ollama later (restart server):
+# export LLM_ROUTER_PROVIDER=ollama
+# export LLM_ROUTER_MODEL=qwen3.5:9b
+
+# CLI overrides without editing env:
+# zig build run -- --use-env --provider openai --model gpt-4.1-mini
+
+# Terminal B: run all registry evals against the live harness
+zig build zig_evals
+
+# Wait up to 30s for the server to come up, then run evals
+zig build zig_evals -Deval-wait-seconds=30
+
+# Filter evals (pass-through to zig_eval CLI)
+zig build zig_evals -- --eval smoke.reply_ok --format json
+zig build zig_evals -- --group smoke --parallel 2
+
+# Override registry or service
+zig build zig_evals -Deval-registry=examples/registry -Deval-service=local-product
+```
+
+Readiness checks before evals start:
+
+1. `GET /health` on the harness (default `http://127.0.0.1:8081`)
+2. A minimal `POST /v1/chat/completions` probe to confirm the LLM path works
+
+List evals directly from the sibling checkout:
+
+```bash
+cd ../zig_eval && zig build run -- list --registry registry
+```
 
 ## API Surface
 
@@ -188,6 +224,7 @@ Loop controls:
 
 - --prompt <text> initial prompt and loop entry
 - --provider <name> provider override
+- --model <name> default model override (also available as `LLM_ROUTER_MODEL`)
 - --until <marker> completion marker (default: DONE)
 - --max-turns <n> loop safety cap (default: 8)
 - --loop-mode <basic|agent|react> loop style
@@ -224,9 +261,18 @@ zig build run -- --react --prompt "What is the elevation range of the High Plain
 {
   "messages": [{ "role": "user", "content": "What is the elevation range of the High Plains?" }],
   "loop_mode": "react",
-  "loop_max_turns": 10
+  "loop_max_turns": 24,
+  "tools": [
+    { "name": "file_read", "description": "Read a project file" },
+    { "name": "file_write", "description": "Write a project file" },
+    { "name": "file_search", "description": "Search the repo" }
+  ]
 }
 ```
+
+When `loop_max_turns` is omitted, ReAct defaults to **24 turns** (vs 8 for basic/agent) so smaller models can solve coding tasks step-by-step. Tool-call budget scales with the turn cap. Set `max_context_tokens` (for example `8192`) so long loops compact history between turns.
+
+The server **auto-attaches** the coding tool set for `loop_mode: "react"` (`file_read`, `file_write`, `file_search`, plus `bash` or `cmd` on the host OS). Client-provided tools are preserved; missing defaults are merged in. `tool_choice` defaults to `auto` when omitted. Any HTTP client can use ReAct without sending a `tools` array.
 
 The model will produce output like:
 
@@ -271,6 +317,9 @@ Related limits:
 
 - LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS (default: 15000)
 - LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES (default: 65536)
+- LLM_ROUTER_TOOL_EXEC_CONFIRM_REQUIRED (default: true; re-send with `LLM_ROUTER_TOOL_CONFIRM <token>`)
+- LLM_ROUTER_TOOL_EXEC_TRUSTED_LOCAL (default: false; allows pipes/chaining with denylist kept)
+- LLM_ROUTER_TOOL_OUTPUT_OFFLOAD_BYTES (default: 8192; 0 disables offloading large tool output to disk)
 - LLM_ROUTER_MAX_TOOL_CALLS_PER_REQUEST (default: 8)
 
 ## Configuration Reference
@@ -283,6 +332,7 @@ Related limits:
 | LLM_ROUTER_PORT                         | 8081           |
 | LLM_ROUTER_DEBUG                        | 0              |
 | LLM_ROUTER_PROVIDER                     | ollama         |
+| LLM_ROUTER_MODEL                        | unset (uses per-provider `*_MODEL`) |
 | LLM_ROUTER_INSTANCE_ID                  | local-instance |
 | LLM_ROUTER_API_KEY                      | empty          |
 | LLM_ROUTER_REQUEST_TIMEOUT_MS           | 30000          |
@@ -291,6 +341,7 @@ Related limits:
 | LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS   | 64             |
 | LLM_ROUTER_MAX_REQUEST_BYTES            | 1048576        |
 | LLM_ROUTER_MAX_HEADER_BYTES             | 16384          |
+| LLM_ROUTER_DEFAULT_MAX_CONTEXT_TOKENS   | unset          |
 
 ### Session Storage
 
@@ -299,14 +350,34 @@ Related limits:
 | LLM_ROUTER_SESSION_STORE_PATH         | logs/sessions |
 | LLM_ROUTER_SESSION_RETENTION_MESSAGES | 24            |
 
+### Workspace Mode (optional, in-memory)
+
+Lightweight Cursor-like mode: same `workspace_id` keeps conversation in RAM until the server exits. File tools resolve under the workspace root instead of `tmp/`. Disabled by default.
+
+| Variable                   | Default |
+| -------------------------- | ------- |
+| LLM_ROUTER_WORKSPACE_MODE  | 0       |
+| LLM_ROUTER_WORKSPACE_ROOT  | `.`     |
+
+Send `workspace_id` in the JSON body (separate from disk `session_id`):
+
+```bash
+export LLM_ROUTER_WORKSPACE_MODE=1
+export LLM_ROUTER_WORKSPACE_ROOT=.
+
+curl -s http://127.0.0.1:8081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"workspace_id":"dev-1","messages":[{"role":"user","content":"Read src/main.zig"}],"tools":[{"name":"file_read","description":"read files"}],"tool_choice":"file_read"}'
+```
+
 ### Ollama
 
 | Variable              | Default                  |
 | --------------------- | ------------------------ |
 | OLLAMA_BASE_URL       | <http://127.0.0.1:11434> |
 | OLLAMA_MODEL          | qwen3.5:9b               |
-| OLLAMA_THINK          | 0                        |
-| OLLAMA_NUM_PREDICT    | 128                      |
+| OLLAMA_THINK          | true                     |
+| OLLAMA_NUM_PREDICT    | 2048                     |
 | OLLAMA_TEMPERATURE    | 0.7                      |
 | OLLAMA_REPEAT_PENALTY | 1.05                     |
 
