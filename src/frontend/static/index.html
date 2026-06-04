@@ -277,7 +277,7 @@
   const PROVIDER_MODELS = {
     ollama:     ['', 'llama3:latest', 'llama3.2:3b', 'qwen2.5:7b', 'mistral:latest'],
     openai:     ['', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'],
-    openrouter: ['', 'openrouter/auto', 'anthropic/claude-3.5-sonnet', 'google/gemini-pro-1.5'],
+    openrouter: ['', 'google/gemma-4-31b-it:free', 'liquid/lfm-2.5-1.2b-instruct:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'moonshotai/kimi-k2.6:free', 'openrouter/auto'],
     claude:     ['', 'claude-opus-4-20250514', 'claude-sonnet-4-20250514', 'claude-haiku-4-5'],
     bedrock:    ['', 'amazon.nova-micro-v1:0', 'amazon.nova-lite-v1:0'],
     llama_cpp:  [''],
@@ -398,10 +398,6 @@
     resize(promptEl);
     updatePills();
     history.push({ role: 'user', content: text });
-
-    document.getElementById('chat-meta' + '').textContent;
-    const header = document.getElementById('chat-pills').previousElementSibling;
-    if (header) header.textContent = 'Chat';
 
     busy = true;
     document.getElementById('send-btn').disabled = true;
