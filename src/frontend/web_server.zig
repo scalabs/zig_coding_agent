@@ -48,19 +48,16 @@ fn handleConnection(allocator: std.mem.Allocator, stream: std.net.Stream) !void 
         return;
     };
 
-    // CORS preflight
     if (std.mem.eql(u8, line.method, "OPTIONS")) {
         try sendCorsOk(stream);
         return;
     }
 
-    // GET / → serve UI
     if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/")) {
         try sendResponse(allocator, stream, 200, "text/html; charset=utf-8", index_html);
         return;
     }
 
-    // GET /health → proxy
     if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/health")) {
         const body = proxyGet(allocator, "/health") catch |err| {
             return sendGatewayError(allocator, stream, err);
@@ -70,7 +67,6 @@ fn handleConnection(allocator: std.mem.Allocator, stream: std.net.Stream) !void 
         return;
     }
 
-    // GET /diagnostics/providers → proxy
     if (std.mem.eql(u8, line.method, "GET") and
         std.mem.eql(u8, line.path, "/diagnostics/providers"))
     {
@@ -82,20 +78,86 @@ fn handleConnection(allocator: std.mem.Allocator, stream: std.net.Stream) !void 
         return;
     }
 
-    // POST /v1/chat/completions → proxy
+    // POST /v1/chat/completions — supports both buffered and SSE streaming
     if (std.mem.eql(u8, line.method, "POST") and
         std.mem.eql(u8, line.path, "/v1/chat/completions"))
     {
         const req_body = extractBody(raw);
-        const resp_body = proxyPost(allocator, "/v1/chat/completions", req_body) catch |err| {
-            return sendGatewayError(allocator, stream, err);
-        };
-        defer allocator.free(resp_body);
-        try sendResponse(allocator, stream, 200, "application/json", resp_body);
+        try handleChatProxy(allocator, stream, req_body);
         return;
     }
 
     try sendError(allocator, stream, 404, "Not Found");
+}
+
+// ── Streaming chat proxy ────────────────────────────────────────
+
+fn handleChatProxy(
+    allocator: std.mem.Allocator,
+    browser: std.net.Stream,
+    body: []const u8,
+) !void {
+    const wants_stream =
+        std.mem.indexOf(u8, body, "\"stream\":true") != null or
+        std.mem.indexOf(u8, body, "\"stream\": true") != null;
+
+    const address = try std.net.Address.parseIp(BACKEND_HOST, BACKEND_PORT);
+    const backend = try std.net.tcpConnectToAddress(address);
+    defer backend.close();
+
+    const req = try std.fmt.allocPrint(allocator,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: {d}\r\n" ++
+        "Connection: close\r\n\r\n{s}",
+        .{ BACKEND_HOST, BACKEND_PORT, body.len, body });
+    defer allocator.free(req);
+    try backend.writeAll(req);
+
+    // Read backend response headers byte by byte
+    var hdr = std.ArrayList(u8){};
+    defer hdr.deinit(allocator);
+    var b: [1]u8 = undefined;
+    while (true) {
+        const n = try backend.read(&b);
+        if (n == 0) break;
+        try hdr.appendSlice(allocator, b[0..n]);
+        if (std.mem.endsWith(u8, hdr.items, "\r\n\r\n")) break;
+        if (hdr.items.len > 8192) return error.HeadersTooLarge;
+    }
+
+    const is_sse = std.mem.indexOf(u8, hdr.items, "text/event-stream") != null;
+
+    if (wants_stream and is_sse) {
+        // Forward SSE stream directly to browser
+        try browser.writeAll(
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Cache-Control: no-cache\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
+            "Access-Control-Allow-Headers: Content-Type\r\n" ++
+            "Connection: close\r\n\r\n");
+
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = backend.read(&chunk) catch break;
+            if (n == 0) break;
+            browser.writeAll(chunk[0..n]) catch break;
+        }
+    } else {
+        // Buffered: read full body and return as JSON
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = backend.read(&chunk) catch break;
+            if (n == 0) break;
+            try buf.appendSlice(allocator, chunk[0..n]);
+        }
+        const resp = try buf.toOwnedSlice(allocator);
+        defer allocator.free(resp);
+        try sendResponse(allocator, browser, 200, "application/json", resp);
+    }
 }
 
 // ── HTTP reading ────────────────────────────────────────────────
@@ -155,22 +217,6 @@ fn proxyGet(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const req = try std.fmt.allocPrint(allocator,
         "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
         .{ path, BACKEND_HOST, BACKEND_PORT });
-    defer allocator.free(req);
-
-    try stream.writeAll(req);
-    return readResponseBody(allocator, stream);
-}
-
-fn proxyPost(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
-    const address = try std.net.Address.parseIp(BACKEND_HOST, BACKEND_PORT);
-    const stream  = try std.net.tcpConnectToAddress(address);
-    defer stream.close();
-
-    const req = try std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
-        "Content-Type: application/json\r\nContent-Length: {d}\r\n" ++
-        "Connection: close\r\n\r\n{s}",
-        .{ path, BACKEND_HOST, BACKEND_PORT, body.len, body });
     defer allocator.free(req);
 
     try stream.writeAll(req);
