@@ -182,16 +182,20 @@ pub fn sendChatCompletion(
     const escaped_content = try escapeJsonStringAlloc(allocator, result.output);
     defer allocator.free(escaped_content);
 
+    const tool_calls_json = try renderToolCallsSuffixJsonAlloc(allocator, result.tool_calls);
+    defer allocator.free(tool_calls_json);
+
     const escaped_finish_reason = try escapeJsonStringAlloc(allocator, result.finish_reason);
     defer allocator.free(escaped_finish_reason);
 
     const response_json = try std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"{s}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         escaped_id,
         std.time.timestamp(),
         escaped_model,
         escaped_content,
+        tool_calls_json,
         escaped_finish_reason,
         result.usage.prompt_tokens,
         result.usage.completion_tokens,
@@ -200,6 +204,55 @@ pub fn sendChatCompletion(
     defer allocator.free(response_json);
 
     try sendJson(connection, 200, response_json, request_id);
+}
+
+fn renderToolCallsSuffixJsonAlloc(
+    allocator: std.mem.Allocator,
+    tool_calls: ?[]const types.ToolCall,
+) ![]u8 {
+    const calls = tool_calls orelse return try allocator.dupe(u8, "");
+    if (calls.len == 0) return try allocator.dupe(u8, "");
+
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, ",\"tool_calls\":[");
+    for (calls, 0..) |call, index| {
+        if (index > 0) try out.append(allocator, ',');
+
+        const escaped_id = try escapeJsonStringAlloc(allocator, call.id);
+        defer allocator.free(escaped_id);
+        const escaped_name = try escapeJsonStringAlloc(allocator, call.name);
+        defer allocator.free(escaped_name);
+        const escaped_arguments = try escapeJsonStringAlloc(allocator, call.arguments_json);
+        defer allocator.free(escaped_arguments);
+
+        try out.writer(allocator).print(
+            "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":\"{s}\"}}}}",
+            .{ escaped_id, escaped_name, escaped_arguments },
+        );
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
+}
+
+test "renderToolCallsSuffixJsonAlloc emits OpenAI tool calls" {
+    const allocator = std.testing.allocator;
+    const calls = [_]types.ToolCall{
+        .{
+            .id = try allocator.dupe(u8, "call_1"),
+            .name = try allocator.dupe(u8, "echo"),
+            .arguments_json = try allocator.dupe(u8, "{\"message\":\"demo-green\"}"),
+        },
+    };
+    defer calls[0].deinit(allocator);
+
+    const rendered = try renderToolCallsSuffixJsonAlloc(allocator, calls[0..]);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\\\"message\\\":\\\"demo-green\\\"") != null);
 }
 
 pub fn sendEventStreamHeaders(connection: std.net.Server.Connection, request_id: ?[]const u8) !void {

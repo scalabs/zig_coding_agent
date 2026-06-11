@@ -106,6 +106,97 @@ pub fn tryExecuteDebugTool(
     return null;
 }
 
+pub fn maybeMakeBuiltinToolCallResponseAlloc(
+    allocator: std.mem.Allocator,
+    request: types.Request,
+    request_id: []const u8,
+) !?types.Response {
+    if (!hasRequestedTool(request.tools, "echo")) return null;
+    if (request.tool_choice) |choice| {
+        if (std.ascii.eqlIgnoreCase(choice, "none")) return null;
+        if (!std.ascii.eqlIgnoreCase(choice, "auto") and
+            !std.ascii.eqlIgnoreCase(choice, "required") and
+            !std.ascii.eqlIgnoreCase(choice, "echo"))
+        {
+            return null;
+        }
+    }
+
+    if (std.ascii.indexOfIgnoreCase(request.prompt, "echo tool") == null) return null;
+    const message = extractExactMessageForEcho(request.prompt) orelse return null;
+
+    const escaped_message = try escapeJsonStringAlloc(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const arguments_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"message\":\"{s}\"}}",
+        .{escaped_message},
+    );
+    errdefer allocator.free(arguments_json);
+
+    const call_id = try std.fmt.allocPrint(allocator, "call_{s}_echo", .{request_id});
+    errdefer allocator.free(call_id);
+
+    const calls = try allocator.alloc(types.ToolCall, 1);
+    errdefer allocator.free(calls);
+    calls[0] = .{
+        .id = call_id,
+        .name = try allocator.dupe(u8, "echo"),
+        .arguments_json = arguments_json,
+    };
+    errdefer calls[0].deinit(allocator);
+
+    return .{
+        .id = null,
+        .model = try allocator.dupe(u8, "debug-tools/tool-call"),
+        .output = try allocator.dupe(u8, ""),
+        .finish_reason = try allocator.dupe(u8, "tool_calls"),
+        .success = true,
+        .usage = .{},
+        .tool_calls = calls,
+    };
+}
+
+fn extractExactMessageForEcho(prompt: []const u8) ?[]const u8 {
+    const marker = "exact message ";
+    const start = std.ascii.indexOfIgnoreCase(prompt, marker) orelse return null;
+    const raw = prompt[start + marker.len ..];
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n\"'");
+    if (trimmed.len == 0) return null;
+
+    var end: usize = 0;
+    while (end < trimmed.len) : (end += 1) {
+        switch (trimmed[end]) {
+            '.', ',', ';', ':', '!', '?', '"', '\'', '\r', '\n', '\t', ' ' => break,
+            else => {},
+        }
+    }
+    if (end == 0) return null;
+    return trimmed[0..end];
+}
+
+fn escapeJsonStringAlloc(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn maybeExecutePromptToolsAlloc(
     allocator: std.mem.Allocator,
     request: types.Request,
@@ -398,6 +489,48 @@ test "tryExecuteDebugTool executes echo when explicitly selected" {
     try std.testing.expectEqualStrings("debug-tools/echo", result.model);
     try std.testing.expectEqualStrings("tool", result.finish_reason);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_OK") != null);
+}
+
+test "maybeMakeBuiltinToolCallResponseAlloc synthesizes echo tool call" {
+    const allocator = std.testing.allocator;
+    const prompt = "Use the echo tool to return the exact message demo-green. Do not answer in normal text.";
+
+    const messages = try allocator.alloc(types.Message, 1);
+    messages[0] = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = try allocator.dupe(u8, prompt),
+    };
+
+    const tools = try allocator.alloc(types.Tool, 1);
+    tools[0] = .{
+        .name = try allocator.dupe(u8, "echo"),
+        .description = try allocator.dupe(u8, "debug echo"),
+    };
+
+    const req = types.Request{
+        .prompt = try allocator.dupe(u8, prompt),
+        .messages = messages,
+        .provider = null,
+        .model = null,
+        .session_id = null,
+        .tenant_id = null,
+        .max_context_tokens = null,
+        .tools = tools,
+        .tool_choice = null,
+    };
+    defer req.deinit(allocator);
+
+    const maybe_result = try maybeMakeBuiltinToolCallResponseAlloc(allocator, req, "test-request");
+    try std.testing.expect(maybe_result != null);
+
+    var result = maybe_result.?;
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("tool_calls", result.finish_reason);
+    try std.testing.expect(result.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.?.len);
+    try std.testing.expectEqualStrings("echo", result.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("{\"message\":\"demo-green\"}", result.tool_calls.?[0].arguments_json);
 }
 
 test "tryExecuteDebugTool executes utc when explicitly selected" {

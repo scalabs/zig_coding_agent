@@ -116,6 +116,9 @@ zig build run -- --use-env
 # Terminal B: run all registry evals against the live harness
 zig build zig_evals
 
+# If .env points at a different default provider, probe the live provider explicitly
+zig build zig_evals -Deval-provider=ollama
+
 # Wait up to 30s for the server to come up, then run evals
 zig build zig_evals -Deval-wait-seconds=30
 
