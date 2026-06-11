@@ -1,23 +1,15 @@
-//! Command execution tool (cmd/bash) for the debug tools harness.
-//!
-//! Validates, sanitizes, and executes shell commands with a denylist of
-//! dangerous commands and patterns. Commands are disabled by default;
-//! enable via `LLM_ROUTER_TOOL_EXEC_ENABLED=1`.
-
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
+const tool_output = @import("../backend/tool_output.zig");
 
-/// Shell flavor: Windows `cmd` or Unix `bash`.
 pub const ShellFlavor = enum {
     cmd,
     bash,
 };
 
-/// Maximum allowed command length in bytes.
 const max_command_len: usize = 1024;
 
-/// Validation errors produced by command sanitization.
 const CommandValidationError = error{
     EmptyCommand,
     CommandTooLong,
@@ -26,13 +18,59 @@ const CommandValidationError = error{
     DangerousPattern,
 };
 
-/// Executes a validated shell command and returns the captured
-/// stdout/stderr. Returns a tool response with status and output.
+const PipeCapture = struct {
+    bytes: []u8 = &.{},
+    err_name: ?[]const u8 = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+const tool_confirm_prefix = "LLM_ROUTER_TOOL_CONFIRM ";
+
+fn parseHexU64(input: []const u8) ?u64 {
+    var value: u64 = 0;
+    if (input.len == 0) return null;
+    for (input) |c| {
+        const digit: u8 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => return null,
+        };
+        value = (value << 4) | @as(u64, @intCast(digit));
+    }
+    return value;
+}
+
+fn findToolConfirmToken(prompt: []const u8) ?u64 {
+    const idx = std.mem.indexOf(u8, prompt, tool_confirm_prefix) orelse return null;
+    const after = prompt[idx + tool_confirm_prefix.len ..];
+    const token_end = std.mem.indexOfAny(u8, after, " \t\r\n") orelse after.len;
+    const token_str = after[0..token_end];
+    return parseHexU64(token_str);
+}
+
+fn stripToolConfirmMarkerSuffix(prompt: []const u8) []const u8 {
+    const idx = std.mem.indexOf(u8, prompt, tool_confirm_prefix) orelse return prompt;
+    return prompt[0..idx];
+}
+
+fn computeToolConfirmHash(flavor: ShellFlavor, command: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const flavor_bytes = switch (flavor) {
+        .cmd => "cmd",
+        .bash => "bash",
+    };
+    h.update(flavor_bytes);
+    h.update(command);
+    return h.final();
+}
+
 pub fn execute(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     request: types.Request,
     flavor: ShellFlavor,
+    request_id: []const u8,
 ) !types.Response {
     const tool_name = switch (flavor) {
         .cmd => "cmd",
@@ -51,8 +89,8 @@ pub fn execute(
         );
     }
 
-    const prompt = std.mem.trim(u8, request.prompt, " \t\r\n");
-    if (prompt.len == 0) {
+    const raw_prompt = std.mem.trim(u8, request.prompt, " \t\r\n");
+    if (raw_prompt.len == 0) {
         return try makeToolResponse(
             allocator,
             tool_name,
@@ -64,9 +102,19 @@ pub fn execute(
         );
     }
 
+    const maybe_confirm_token = if (app_config.tool_exec_confirmation_required)
+        findToolConfirmToken(raw_prompt)
+    else
+        null;
+
+    const prompt = if (app_config.tool_exec_confirmation_required)
+        stripToolConfirmMarkerSuffix(raw_prompt)
+    else
+        raw_prompt;
+
     const command = blk: {
         if (looksLikeCommandPrompt(prompt)) {
-            break :blk validateAndNormalizeCommandAlloc(allocator, prompt, flavor) catch |err| switch (err) {
+            break :blk validateAndNormalizeCommandAlloc(allocator, prompt, flavor, app_config.tool_exec_trusted_local) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     return try makeToolResponse(
@@ -82,7 +130,7 @@ pub fn execute(
             };
         }
 
-        const extracted = try extractCommandFromPromptAlloc(allocator, flavor, prompt);
+        const extracted = try extractCommandFromPromptAlloc(allocator, flavor, prompt, app_config.tool_exec_trusted_local);
         if (extracted) |value| {
             break :blk value;
         }
@@ -99,6 +147,41 @@ pub fn execute(
     };
     defer allocator.free(command);
 
+    if (app_config.tool_exec_confirmation_required) {
+        const expected = computeToolConfirmHash(flavor, command);
+        if (maybe_confirm_token == null) {
+            const token_hex = try std.fmt.allocPrint(allocator, "{x}", .{expected});
+            defer allocator.free(token_hex);
+
+            const out = try std.fmt.allocPrint(
+                allocator,
+                "DEBUG_TOOL_CONFIRMATION_REQUIRED\n" ++
+                    "tool={s}\n" ++
+                    "command={s}\n" ++
+                    "confirm_token={s}\n" ++
+                    "message=tool execution requires confirmation. Re-send the same command with a line containing: LLM_ROUTER_TOOL_CONFIRM {s}\n",
+                .{ tool_name, command, token_hex, token_hex },
+            );
+            return try makeToolResponse(allocator, tool_name, out);
+        }
+
+        if (maybe_confirm_token.? != expected) {
+            const token_hex = try std.fmt.allocPrint(allocator, "{x}", .{expected});
+            defer allocator.free(token_hex);
+
+            const out = try std.fmt.allocPrint(
+                allocator,
+                "DEBUG_TOOL_CONFIRMATION_REQUIRED\n" ++
+                    "tool={s}\n" ++
+                    "command={s}\n" ++
+                    "confirm_token={s}\n" ++
+                    "message=tool execution requires confirmation. Re-send the same command with a line containing: LLM_ROUTER_TOOL_CONFIRM {s}\n",
+                .{ tool_name, command, token_hex, token_hex },
+            );
+            return try makeToolResponse(allocator, tool_name, out);
+        }
+    }
+
     const start_ms = std.time.milliTimestamp();
 
     const argv = switch (flavor) {
@@ -106,17 +189,12 @@ pub fn execute(
         .bash => [_][]const u8{ "bash", "-lc", command },
     };
 
-    // TODO(security): `Child.run` blocks until the child exits and provides no
-    // built-in timeout.  A hung command (e.g. `sleep 9999`) will hold the
-    // server's single accept-loop thread open for its entire duration.
-    // Replace this call with `Child.spawn` + async I/O polling + `Child.kill`
-    // once per-connection threading is in place.  Until then, `tool_exec_enabled`
-    // must remain false (the default) in any exposed deployment.
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &argv,
-        .max_output_bytes = app_config.tool_exec_max_output_bytes,
-    }) catch |err| {
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch |err| {
         return try makeToolResponse(
             allocator,
             tool_name,
@@ -127,8 +205,55 @@ pub fn execute(
             ),
         );
     };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
+
+    var stdout_capture = PipeCapture{};
+    var stderr_capture = PipeCapture{};
+
+    var stdout_thread: ?std.Thread = null;
+    var stderr_thread: ?std.Thread = null;
+
+    if (child.stdout) |stdout_file| {
+        stdout_thread = try std.Thread.spawn(.{}, capturePipeMain, .{
+            &stdout_capture,
+            stdout_file,
+            app_config.tool_exec_max_output_bytes,
+        });
+    } else {
+        stdout_capture.done.store(true, .release);
+    }
+    if (child.stderr) |stderr_file| {
+        stderr_thread = try std.Thread.spawn(.{}, capturePipeMain, .{
+            &stderr_capture,
+            stderr_file,
+            app_config.tool_exec_max_output_bytes,
+        });
+    } else {
+        stderr_capture.done.store(true, .release);
+    }
+
+    const timeout_deadline = start_ms + @as(i64, app_config.tool_exec_timeout_ms);
+    var timed_out = false;
+    while (true) {
+        const stdout_done = stdout_capture.done.load(.acquire);
+        const stderr_done = stderr_capture.done.load(.acquire);
+        if (stdout_done and stderr_done) break;
+        if (std.time.milliTimestamp() >= timeout_deadline) {
+            timed_out = true;
+            break;
+        }
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }
+
+    if (timed_out) {
+        _ = child.kill() catch {};
+    }
+    const terminated_as = child.wait() catch std.process.Child.Term{ .Unknown = 1 };
+
+    if (stdout_thread) |thread| thread.join();
+    if (stderr_thread) |thread| thread.join();
+
+    defer if (stdout_capture.bytes.len > 0) std.heap.page_allocator.free(stdout_capture.bytes);
+    defer if (stderr_capture.bytes.len > 0) std.heap.page_allocator.free(stderr_capture.bytes);
 
     const end_ms = std.time.milliTimestamp();
     const duration_ms = if (end_ms >= start_ms)
@@ -136,13 +261,26 @@ pub fn execute(
     else
         @as(u64, 0);
 
-    const term_text = try childTermToTextAlloc(allocator, run_result.term);
+    const term_text = try childTermToTextAlloc(allocator, terminated_as);
     defer allocator.free(term_text);
 
-    const status_tag = if (isSuccessfulTermination(run_result.term)) "DEBUG_TOOL_OK" else "DEBUG_TOOL_ERROR";
+    const status_tag = if (!timed_out and isSuccessfulTermination(terminated_as)) "DEBUG_TOOL_OK" else "DEBUG_TOOL_ERROR";
+    const timeout_exceeded_text = if (timed_out) "true" else "false";
+    const stdout_text = if (stdout_capture.err_name) |err_name|
+        try std.fmt.allocPrint(allocator, "read_error={s}", .{err_name})
+    else
+        try allocator.dupe(u8, stdout_capture.bytes);
+    defer allocator.free(stdout_text);
+
+    const stderr_text = if (stderr_capture.err_name) |err_name|
+        try std.fmt.allocPrint(allocator, "read_error={s}", .{err_name})
+    else
+        try allocator.dupe(u8, stderr_capture.bytes);
+    defer allocator.free(stderr_text);
+
     const output = try std.fmt.allocPrint(
         allocator,
-        "{s}\ntool={s}\nterm={s}\nduration_ms={d}\nmax_output_bytes={d}\ntimeout_policy_ms={d}\ntimeout_enforced=false\ncommand={s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}",
+        "{s}\ntool={s}\nterm={s}\nduration_ms={d}\nmax_output_bytes={d}\ntimeout_policy_ms={d}\ntimeout_enforced=true\ntimeout_exceeded={s}\ncode={s}\ncommand={s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}",
         .{
             status_tag,
             tool_name,
@@ -150,48 +288,68 @@ pub fn execute(
             duration_ms,
             app_config.tool_exec_max_output_bytes,
             app_config.tool_exec_timeout_ms,
+            timeout_exceeded_text,
+            if (timed_out) "command_timeout" else "command_completed",
             command,
-            run_result.stdout,
-            run_result.stderr,
+            stdout_text,
+            stderr_text,
         },
     );
+    defer allocator.free(output);
 
-    return try makeToolResponse(allocator, tool_name, output);
+    const final_output = try tool_output.maybeOffloadToolOutputAlloc(
+        allocator,
+        app_config,
+        request_id,
+        tool_name,
+        output,
+    );
+
+    return try makeToolResponse(allocator, tool_name, final_output);
 }
 
-/// Attempts to extract a command from a natural-language prompt.
-/// Returns null if no command-like content is found.
+fn capturePipeMain(capture: *PipeCapture, file: std.fs.File, max_bytes: usize) void {
+    defer capture.done.store(true, .release);
+    capture.bytes = file.readToEndAlloc(std.heap.page_allocator, max_bytes) catch |err| {
+        capture.err_name = @errorName(err);
+        capture.bytes = &.{};
+        return;
+    };
+}
+
 pub fn extractCommandFromPromptAlloc(
     allocator: std.mem.Allocator,
     flavor: ShellFlavor,
     prompt: []const u8,
+    trusted_local: bool,
 ) !?[]u8 {
-    const trimmed = std.mem.trim(u8, prompt, " \t\r\n\"'");
+    const without_confirm = stripToolConfirmMarkerSuffix(prompt);
+    const trimmed = std.mem.trim(u8, without_confirm, " \t\r\n\"'");
     if (trimmed.len == 0) return null;
 
     if (extractQuotedCommandSlice(trimmed)) |quoted| {
         const normalized = std.mem.trim(u8, quoted, " \t\r\n");
         if (normalized.len > 0) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (stripCommandInstructionPrefix(trimmed)) |candidate| {
         const normalized = normalizeExtractedCandidate(candidate);
         if (normalized.len > 0) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (extractInlineRunSegment(trimmed)) |candidate| {
         const normalized = normalizeExtractedCandidate(candidate);
         if (normalized.len > 0 and looksLikeCommandPrompt(normalized)) {
-            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor);
+            return try validateAndNormalizeCommandAlloc(allocator, normalized, flavor, trusted_local);
         }
     }
 
     if (looksLikeCommandPrompt(trimmed)) {
-        return try validateAndNormalizeCommandAlloc(allocator, trimmed, flavor);
+        return try validateAndNormalizeCommandAlloc(allocator, trimmed, flavor, trusted_local);
     }
 
     return null;
@@ -201,11 +359,12 @@ fn validateAndNormalizeCommandAlloc(
     allocator: std.mem.Allocator,
     command: []const u8,
     flavor: ShellFlavor,
+    trusted_local: bool,
 ) ![]u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n\"'");
     if (trimmed.len == 0) return error.EmptyCommand;
     if (trimmed.len > max_command_len) return error.CommandTooLong;
-    if (containsUnsafeCommandByte(trimmed)) return error.UnsafeCharacter;
+    if (containsUnsafeCommandByte(trimmed, trusted_local)) return error.UnsafeCharacter;
 
     const command_name = firstToken(trimmed) orelse return error.EmptyCommand;
     if (isDangerousCommandName(flavor, command_name)) return error.DangerousCommand;
@@ -238,10 +397,10 @@ fn looksLikeCommandPrompt(text: []const u8) bool {
     return true;
 }
 
-fn containsUnsafeCommandByte(text: []const u8) bool {
+fn containsUnsafeCommandByte(text: []const u8, trusted_local: bool) bool {
     for (text) |byte| {
         if (byte < 0x20 or byte == 0x7f) return true;
-        if (isUnsafeShellByte(byte)) return true;
+        if (!trusted_local and isUnsafeShellByte(byte)) return true;
     }
     return false;
 }
@@ -395,6 +554,8 @@ fn extractQuotedCommandSlice(text: []const u8) ?[]const u8 {
 fn isLikelyNaturalLanguageLeadToken(token: []const u8) bool {
     const words = [_][]const u8{
         "what",
+        "i",
+        "we",
         "why",
         "how",
         "when",
@@ -408,6 +569,10 @@ fn isLikelyNaturalLanguageLeadToken(token: []const u8) bool {
         "tell",
         "show",
         "explain",
+        "write",
+        "create",
+        "build",
+        "make",
         "get",
     };
 
@@ -476,13 +641,13 @@ fn childTermToTextAlloc(
     };
 }
 
-/// Constructs a minimal `Config` for use in unit tests.
 pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.Config {
     return .{
         .listen_host = try allocator.dupe(u8, "127.0.0.1"),
         .listen_port = 8081,
         .debug_logging = false,
         .default_provider = try allocator.dupe(u8, "ollama_qwen"),
+        .default_model = null,
         .request_timeout_ms = 30_000,
         .provider_timeout_ms = 60_000,
         .instance_id = try allocator.dupe(u8, "local-instance"),
@@ -490,7 +655,7 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
         .ollama_model = try allocator.dupe(u8, "qwen:7b"),
         .ollama_think = false,
-        .ollama_num_predict = 128,
+        .ollama_num_predict = 1024,
         .ollama_temperature = 0.7,
         .ollama_repeat_penalty = 1.05,
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
@@ -516,9 +681,19 @@ pub fn buildTestConfig(allocator: std.mem.Allocator, enable_exec: bool) !config.
         .session_store_path = try allocator.dupe(u8, "logs/sessions"),
         .session_retention_messages = 24,
         .tool_exec_enabled = enable_exec,
+        .tool_exec_confirmation_required = false,
+        .tool_exec_trusted_local = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .tool_output_offload_bytes = 8192,
+        .max_tool_calls_per_request = 8,
+        .default_max_context_tokens = null,
+        .workspace_mode_enabled = false,
+        .workspace_root = try allocator.dupe(u8, "."),
         .loop_stream_progress_enabled = true,
+        .max_concurrent_connections = 64,
+        .max_request_bytes = 1024 * 1024,
+        .max_header_bytes = 16 * 1024,
     };
 }
 
@@ -548,7 +723,7 @@ test "execute cmd tool returns disabled marker when not enabled" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
@@ -562,11 +737,25 @@ test "extractCommandFromPromptAlloc extracts from run prefix" {
         allocator,
         .cmd,
         "Please run zig build test",
+        false,
     );
     defer if (maybe_cmd) |cmd| allocator.free(cmd);
 
     try std.testing.expect(maybe_cmd != null);
     try std.testing.expectEqualStrings("zig build test", maybe_cmd.?);
+}
+
+test "extractCommandFromPromptAlloc ignores natural language requests" {
+    const allocator = std.testing.allocator;
+    const maybe_cmd = try extractCommandFromPromptAlloc(
+        allocator,
+        .cmd,
+        "Please write a small C++ program",
+        false,
+    );
+    defer if (maybe_cmd) |cmd| allocator.free(cmd);
+
+    try std.testing.expect(maybe_cmd == null);
 }
 
 test "execute cmd tool rejects unsafe chaining" {
@@ -595,7 +784,7 @@ test "execute cmd tool rejects unsafe chaining" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
@@ -628,9 +817,45 @@ test "execute cmd tool blocks dangerous denylist command" {
     };
     defer req.deinit(allocator);
 
-    var result = try execute(allocator, &cfg, req, .cmd);
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
     defer result.deinit(allocator);
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "denylist") != null);
+}
+
+test "execute cmd tool enforces timeout and kills process" {
+    if (@import("builtin").os.tag != .windows) return;
+
+    const allocator = std.testing.allocator;
+    var cfg = try buildTestConfig(allocator, true);
+    defer cfg.deinit(allocator);
+    cfg.tool_exec_timeout_ms = 200;
+
+    const messages = try allocator.alloc(types.Message, 1);
+    messages[0] = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = try allocator.dupe(u8, "powershell -NoProfile -Command Start-Sleep -Seconds 3"),
+    };
+
+    const req = types.Request{
+        .prompt = try allocator.dupe(u8, "powershell -NoProfile -Command Start-Sleep -Seconds 3"),
+        .messages = messages,
+        .provider = null,
+        .model = null,
+        .session_id = null,
+        .tenant_id = null,
+        .max_context_tokens = null,
+        .tools = try allocator.alloc(types.Tool, 0),
+        .tool_choice = null,
+    };
+    defer req.deinit(allocator);
+
+    var result = try execute(allocator, &cfg, req, .cmd, "test-request");
+    defer result.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "DEBUG_TOOL_ERROR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeout_enforced=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "timeout_exceeded=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "code=command_timeout") != null);
 }

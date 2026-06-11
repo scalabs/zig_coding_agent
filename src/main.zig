@@ -1,5 +1,6 @@
 //! CLI entrypoint for running the router in server mode or prompt-loop mode.
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const react = @import("react.zig");
 
@@ -13,6 +14,7 @@ const LoopMode = enum {
 const CliOptions = struct {
     prompt: ?[]u8 = null, // Enables prompt-loop mode when set.
     provider_override: ?[]u8 = null, // Optional provider alias from CLI.
+    model_override: ?[]u8 = null, // Optional default model override from CLI.
     env_file_path: ?[]u8 = null, // Optional dotenv path loaded before config.
     use_env: bool = false, // Enable dotenv loading.
     loop_mode: LoopMode = .basic, // Iteration style for prompt loop mode.
@@ -27,6 +29,7 @@ const CliOptions = struct {
     pub fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.prompt) |prompt| allocator.free(prompt);
         if (self.provider_override) |provider| allocator.free(provider);
+        if (self.model_override) |model| allocator.free(model);
         if (self.env_file_path) |env_file_path| allocator.free(env_file_path);
         allocator.free(self.until_marker);
     }
@@ -37,10 +40,18 @@ const CliOptions = struct {
 /// Errors:
 /// - allocator, configuration, CLI parsing, and provider/runtime errors.
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    if (comptime builtin.mode == .Debug) {
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer _ = gpa.deinit();
+        try runMain(gpa.allocator());
+    } else {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        defer _ = gpa.deinit();
+        try runMain(gpa.allocator());
+    }
+}
 
+fn runMain(allocator: std.mem.Allocator) !void {
     var cli = try parseCliOptions(allocator);
     defer cli.deinit(allocator);
 
@@ -60,6 +71,10 @@ pub fn main() !void {
 
     if (cli.provider_override) |provider| {
         try app_config.setDefaultProvider(allocator, provider);
+    }
+
+    if (cli.model_override) |model| {
+        try app_config.setDefaultModel(allocator, model);
     }
 
     if (cli.prompt) |prompt| {
@@ -90,12 +105,14 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
 
         if (std.mem.eql(u8, arg, "--react")) {
             cli.loop_mode = .react;
+            applyReactLoopDefaults(&cli);
             continue;
         }
 
         if (std.mem.eql(u8, arg, "--loop-mode")) {
             const value = args.next() orelse return error.MissingLoopModeValue;
             cli.loop_mode = try parseLoopMode(value);
+            applyReactLoopDefaults(&cli);
             continue;
         }
 
@@ -117,6 +134,14 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             const value = args.next() orelse return error.MissingProviderValue;
             if (cli.provider_override) |provider| allocator.free(provider);
             cli.provider_override = try allocator.dupe(u8, value);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--model")) {
+            const value = args.next() orelse return error.MissingModelValue;
+            if (value.len == 0) return error.InvalidModelValue;
+            if (cli.model_override) |model| allocator.free(model);
+            cli.model_override = try allocator.dupe(u8, value);
             continue;
         }
 
@@ -150,6 +175,15 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             if (value.len == 0) return error.MissingProviderValue;
             if (cli.provider_override) |provider| allocator.free(provider);
             cli.provider_override = try allocator.dupe(u8, value);
+            continue;
+        }
+
+        const model_prefix = "--model=";
+        if (std.mem.startsWith(u8, arg, model_prefix)) {
+            const value = arg[model_prefix.len..];
+            if (value.len == 0) return error.InvalidModelValue;
+            if (cli.model_override) |model| allocator.free(model);
+            cli.model_override = try allocator.dupe(u8, value);
             continue;
         }
 
@@ -195,11 +229,18 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
         if (std.mem.startsWith(u8, arg, loop_mode_prefix)) {
             const value = arg[loop_mode_prefix.len..];
             cli.loop_mode = try parseLoopMode(value);
+            applyReactLoopDefaults(&cli);
             continue;
         }
     }
 
     return cli;
+}
+
+fn applyReactLoopDefaults(cli: *CliOptions) void {
+    if (cli.loop_mode == .react and cli.max_turns == 8) {
+        cli.max_turns = 24;
+    }
 }
 
 fn parseLoopMode(value: []const u8) !LoopMode {
@@ -362,7 +403,8 @@ fn runPromptLoop(
         }
         previous_output = try allocator.dupe(u8, normalized_output);
 
-        if ((loop_mode == .agent or loop_mode == .react) and repeated_count >= 1) {
+        const repeated_limit: usize = if (loop_mode == .react) 2 else 1;
+        if ((loop_mode == .agent or loop_mode == .react) and repeated_count >= repeated_limit) {
             std.debug.print("Loop stopped early: model repeated output without progress.\n", .{});
             return;
         }
@@ -386,6 +428,7 @@ fn runPromptLoop(
                         defer allocator.free(observation_raw);
 
                         const observation = try react.formatObservation(allocator, turn + 1, observation_raw);
+                        defer allocator.free(observation);
 
                         std.debug.print("{s}\n\n", .{observation});
 
@@ -399,8 +442,9 @@ fn runPromptLoop(
                 const hint = try react.formatObservation(
                     allocator,
                     turn + 1,
-                    "Could not parse an Action from your response. Please use the format: Action N: Type[argument]",
+                    react.parse_error_hint,
                 );
+                defer allocator.free(hint);
 
                 std.debug.print("{s}\n\n", .{hint});
                 allocator.free(latest_user_prompt);

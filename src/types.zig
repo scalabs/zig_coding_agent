@@ -15,6 +15,7 @@ pub const Request = struct {
     repeat_penalty: ?f64 = null,
     session_id: ?[]const u8 = null,
     tenant_id: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
     max_context_tokens: ?usize = null,
     tools: []Tool,
     tool_choice: ?[]const u8 = null,
@@ -45,6 +46,9 @@ pub const Request = struct {
         if (self.tenant_id) |tenant_id| {
             allocator.free(tenant_id);
         }
+        if (self.workspace_id) |workspace_id| {
+            allocator.free(workspace_id);
+        }
         for (self.tools) |tool| {
             tool.deinit(allocator);
         }
@@ -57,41 +61,6 @@ pub const Request = struct {
         }
         if (self.loop_until) |loop_until| {
             allocator.free(loop_until);
-        }
-    }
-};
-
-/// Structured tool call emitted by a provider or parsed from model output.
-pub const ToolCall = struct {
-    id: ?[]const u8 = null,
-    name: []const u8,
-    arguments_json: []const u8,
-
-    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
-        if (self.id) |id| {
-            allocator.free(id);
-        }
-        allocator.free(self.name);
-        allocator.free(self.arguments_json);
-    }
-};
-
-/// Result produced after executing a tool call.
-pub const ToolCallResult = struct {
-    call_id: ?[]const u8 = null,
-    name: []const u8,
-    output: []const u8,
-    success: bool = true,
-    error_message: ?[]const u8 = null,
-
-    pub fn deinit(self: ToolCallResult, allocator: std.mem.Allocator) void {
-        if (self.call_id) |call_id| {
-            allocator.free(call_id);
-        }
-        allocator.free(self.name);
-        allocator.free(self.output);
-        if (self.error_message) |message| {
-            allocator.free(message);
         }
     }
 };
@@ -115,14 +84,24 @@ pub const Message = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    input_schema_json: ?[]const u8 = null,
+    parameters_json: ?[]const u8 = null,
 
     pub fn deinit(self: Tool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
-        if (self.input_schema_json) |input_schema_json| {
-            allocator.free(input_schema_json);
-        }
+        if (self.parameters_json) |parameters_json| allocator.free(parameters_json);
+    }
+};
+
+pub const ToolCall = struct {
+    id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+
+    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.arguments_json);
     }
 };
 
@@ -140,6 +119,7 @@ pub const Response = struct {
     finish_reason: []const u8, // OpenAI-compatible completion stop reason.
     success: bool, // false means output should be surfaced as provider error.
     usage: Usage = .{}, // Best-effort token accounting.
+    tool_calls: ?[]ToolCall = null, // OpenAI-compatible assistant tool calls, when provided.
 
     /// Releases all owned response fields.
     ///
@@ -153,6 +133,12 @@ pub const Response = struct {
         allocator.free(self.model);
         allocator.free(self.output);
         allocator.free(self.finish_reason);
+        if (self.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                tool_call.deinit(allocator);
+            }
+            allocator.free(tool_calls);
+        }
     }
 };
 

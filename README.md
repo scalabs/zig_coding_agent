@@ -2,7 +2,7 @@
 
 OpenAI-compatible LLM router and prompt-loop runtime written in Zig.
 
-This project exposes a chat-completions API, routes requests across multiple providers, supports optional streaming, and includes built-in loop controls for iterative agent workflows.
+This project exposes a chat-completions API, routes requests across multiple providers, supports optional streaming, and includes built-in loop controls for iterative agent workflows. Scope: **thin, reliable model harness** (see `phase.md` Phase 0 and `plan.md` for the frozen feature set and deferrals).
 
 > [!TIP]
 > Fastest local smoke test:
@@ -19,6 +19,8 @@ This project exposes a chat-completions API, routes requests across multiple pro
 - Optional debug tooling (echo, utc, cmd, bash) with safe defaults.
 - Tool declarations with optional JSON Schema input metadata for compatible providers.
 - Simple deploy surface: single Zig binary, environment-based configuration.
+
+
 
 ## Architecture
 
@@ -56,9 +58,12 @@ flowchart TD
 ## Build, Run, and Test
 
 ```bash
-zig build
+zig build              # ReleaseSafe by default (~2 MB stripped binary)
 zig build run
 zig build check
+zig build windows      # cross-compile zig-coding-agent.exe for x86_64-windows-gnu
+zig build -Doptimize=Debug   # larger binary with safety checks for development
+zig build -Doptimize=ReleaseSmall   # smallest binary (~800 KB)
 ```
 
 ### Test Targets
@@ -80,6 +85,62 @@ zig build test -Dtest-target=file "-Dtest-file=src/types.zig"
 zig build test -Dtest-target=all -Dtest-filter=normalizeProviderName
 ```
 
+### zig_eval (optional sibling checkout)
+
+Evaluations live in the sibling **zig_eval** repo. Check out both repos side by side:
+
+```text
+zig/
+├── zig_coding_agent/   # this harness
+└── zig_eval/           # registry-driven eval runner
+```
+
+`zig_eval/registry/services.json` targets this router at `http://127.0.0.1:8081` (`local-openai-compat`).
+
+**Prerequisites:** LLM provider reachable (e.g. Ollama), harness listening, and matching `LLM_ROUTER_API_KEY` if auth is enabled.
+
+```bash
+# Terminal A: start harness — pick provider + model via env (or .env)
+export LLM_ROUTER_PROVIDER=openrouter   # ollama | openai | openrouter | claude | bedrock | llama_cpp
+export LLM_ROUTER_MODEL=openai/gpt-4o-mini
+export OPENROUTER_API_KEY=your-key       # set the key for the active provider
+zig build run -- --use-env
+
+# Switch to local Ollama later (restart server):
+# export LLM_ROUTER_PROVIDER=ollama
+# export LLM_ROUTER_MODEL=qwen3.5:9b
+
+# CLI overrides without editing env:
+# zig build run -- --use-env --provider openai --model gpt-4.1-mini
+
+# Terminal B: run all registry evals against the live harness
+zig build zig_evals
+
+# If .env points at a different default provider, probe the live provider explicitly
+zig build zig_evals -Deval-provider=ollama
+
+# Wait up to 30s for the server to come up, then run evals
+zig build zig_evals -Deval-wait-seconds=30
+
+# Filter evals (pass-through to zig_eval CLI)
+zig build zig_evals -- --eval smoke.reply_ok --format json
+zig build zig_evals -- --group smoke --parallel 2
+
+# Override registry or service
+zig build zig_evals -Deval-registry=examples/registry -Deval-service=local-product
+```
+
+Readiness checks before evals start:
+
+1. `GET /health` on the harness (default `http://127.0.0.1:8081`)
+2. A minimal `POST /v1/chat/completions` probe to confirm the LLM path works
+
+List evals directly from the sibling checkout:
+
+```bash
+cd ../zig_eval && zig build run -- list --registry registry
+```
+
 ## API Surface
 
 ### Endpoints
@@ -90,11 +151,11 @@ zig build test -Dtest-target=all -Dtest-filter=normalizeProviderName
 | GET    | /metrics               | Yes (if API key configured) | Request and connection counters       |
 | GET    | /diagnostics/clients   | Yes (if API key configured) | Connected client diagnostics          |
 | GET    | /diagnostics/requests  | Yes (if API key configured) | Request success/failure diagnostics   |
-| GET    | /diagnostics/providers | No                          | Provider status snapshot              |
+| GET    | /diagnostics/providers | Yes (if API key configured) | Provider status snapshot              |
 | POST   | /v1/chat/completions   | Yes (if API key configured) | OpenAI-compatible chat-completions    |
 
 > [!NOTE]
-> Authentication is enabled when LLM_ROUTER_API_KEY is non-empty. When enabled, all routes require auth except /health and /diagnostics/providers.
+> Authentication is enabled when LLM_ROUTER_API_KEY is non-empty. When enabled, all routes require auth except /health.
 
 ### Chat Request Shape
 
@@ -166,6 +227,7 @@ Loop controls:
 
 - --prompt <text> initial prompt and loop entry
 - --provider <name> provider override
+- --model <name> default model override (also available as `LLM_ROUTER_MODEL`)
 - --until <marker> completion marker (default: DONE)
 - --max-turns <n> loop safety cap (default: 8)
 - --loop-mode <basic|agent|react> loop style
@@ -176,16 +238,16 @@ Loop controls:
 
 ## ReAct Mode
 
-ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn. Both CLI prompt loops and request-level loops support loop_mode=react.
+ReAct (Reasoning + Acting) mode implements the paradigm from [Yao et al., 2022](https://arxiv.org/abs/2210.03629). The model produces structured **Thought → Action** pairs, and the system executes each action and injects the result as an **Observation** before the next turn.
 
 ### Available Actions
 
-| Action    | Description                       | Requirements                             |
-| --------- | --------------------------------- | ---------------------------------------- |
-| Search[q] | Search for information (stub)     | None (future: wire to search tool/API)   |
-| Lookup[t] | Look up a term in context (stub)  | None (future: wire to retrieval backend) |
-| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`         |
-| Finish[a] | Return final answer and stop loop | None                                     |
+| Action | Description | Requirements |
+| --------- | -------------------------------- | --------------------------------------- |
+| Search[q] | Search for information (stub) | None (future: wire to search tool/API) |
+| Lookup[t] | Look up a term in context (stub) | None (future: wire to retrieval backend) |
+| Cmd[c]    | Execute a shell command           | `LLM_ROUTER_TOOL_EXEC_ENABLED=1`       |
+| Finish[a] | Return final answer and stop loop | None                                    |
 
 > [!NOTE]
 > Search and Lookup return stub responses. They are designed as extension points for future tool/API integration.
@@ -200,16 +262,20 @@ zig build run -- --react --prompt "What is the elevation range of the High Plain
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": "What is the elevation range of the High Plains?"
-    }
-  ],
+  "messages": [{ "role": "user", "content": "What is the elevation range of the High Plains?" }],
   "loop_mode": "react",
-  "loop_max_turns": 10
+  "loop_max_turns": 24,
+  "tools": [
+    { "name": "file_read", "description": "Read a project file" },
+    { "name": "file_write", "description": "Write a project file" },
+    { "name": "file_search", "description": "Search the repo" }
+  ]
 }
 ```
+
+When `loop_max_turns` is omitted, ReAct defaults to **24 turns** (vs 8 for basic/agent) so smaller models can solve coding tasks step-by-step. Tool-call budget scales with the turn cap. Set `max_context_tokens` (for example `8192`) so long loops compact history between turns.
+
+The server **auto-attaches** the coding tool set for `loop_mode: "react"` (`file_read`, `file_write`, `file_search`, plus `bash` or `cmd` on the host OS). Client-provided tools are preserved; missing defaults are merged in. `tool_choice` defaults to `auto` when omitted. Any HTTP client can use ReAct without sending a `tools` array.
 
 The model will produce output like:
 
@@ -226,8 +292,6 @@ Observation 1: <result from action execution>
 
 This continues until the model emits `Action N: Finish[answer]` or the turn budget is exhausted.
 
-ReAct parsing scans the last Action line in the model output. The turn number is optional, action names are case-insensitive, and arguments must be wrapped in brackets. Finish must contain only the final answer text, for example `Finish[The High Plains elevation ranges from 3,000 to 8,000 feet]`.
-
 ## Tools
 
 Registered tool names:
@@ -236,11 +300,15 @@ Registered tool names:
 - utc
 - cmd
 - bash
+- file_read
+- file_write
+- file_search
 
 Tool behavior summary:
 
 - echo and utc are deterministic debug helpers.
 - cmd and bash are guarded command-execution tools.
+- file_read, file_write, and file_search are lightweight filesystem helpers for trusted local workflows.
 - Command execution is disabled by default and must be explicitly enabled.
 
 ```bash
@@ -252,6 +320,10 @@ Related limits:
 
 - LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS (default: 15000)
 - LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES (default: 65536)
+- LLM_ROUTER_TOOL_EXEC_CONFIRM_REQUIRED (default: true; re-send with `LLM_ROUTER_TOOL_CONFIRM <token>`)
+- LLM_ROUTER_TOOL_EXEC_TRUSTED_LOCAL (default: false; allows pipes/chaining with denylist kept)
+- LLM_ROUTER_TOOL_OUTPUT_OFFLOAD_BYTES (default: 8192; 0 disables offloading large tool output to disk)
+- LLM_ROUTER_MAX_TOOL_CALLS_PER_REQUEST (default: 8)
 
 ## Configuration Reference
 
@@ -263,11 +335,16 @@ Related limits:
 | LLM_ROUTER_PORT                         | 8081           |
 | LLM_ROUTER_DEBUG                        | 0              |
 | LLM_ROUTER_PROVIDER                     | ollama         |
+| LLM_ROUTER_MODEL                        | unset (uses per-provider `*_MODEL`) |
 | LLM_ROUTER_INSTANCE_ID                  | local-instance |
 | LLM_ROUTER_API_KEY                      | empty          |
 | LLM_ROUTER_REQUEST_TIMEOUT_MS           | 30000          |
 | LLM_ROUTER_PROVIDER_TIMEOUT_MS          | 60000          |
 | LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED | true           |
+| LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS   | 64             |
+| LLM_ROUTER_MAX_REQUEST_BYTES            | 1048576        |
+| LLM_ROUTER_MAX_HEADER_BYTES             | 16384          |
+| LLM_ROUTER_DEFAULT_MAX_CONTEXT_TOKENS   | unset          |
 
 ### Session Storage
 
@@ -276,14 +353,34 @@ Related limits:
 | LLM_ROUTER_SESSION_STORE_PATH         | logs/sessions |
 | LLM_ROUTER_SESSION_RETENTION_MESSAGES | 24            |
 
+### Workspace Mode (optional, in-memory)
+
+Lightweight Cursor-like mode: same `workspace_id` keeps conversation in RAM until the server exits. File tools resolve under the workspace root instead of `tmp/`. Disabled by default.
+
+| Variable                   | Default |
+| -------------------------- | ------- |
+| LLM_ROUTER_WORKSPACE_MODE  | 0       |
+| LLM_ROUTER_WORKSPACE_ROOT  | `.`     |
+
+Send `workspace_id` in the JSON body (separate from disk `session_id`):
+
+```bash
+export LLM_ROUTER_WORKSPACE_MODE=1
+export LLM_ROUTER_WORKSPACE_ROOT=.
+
+curl -s http://127.0.0.1:8081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"workspace_id":"dev-1","messages":[{"role":"user","content":"Read src/main.zig"}],"tools":[{"name":"file_read","description":"read files"}],"tool_choice":"file_read"}'
+```
+
 ### Ollama
 
 | Variable              | Default                  |
 | --------------------- | ------------------------ |
 | OLLAMA_BASE_URL       | <http://127.0.0.1:11434> |
 | OLLAMA_MODEL          | qwen3.5:9b               |
-| OLLAMA_THINK          | 0                        |
-| OLLAMA_NUM_PREDICT    | 128                      |
+| OLLAMA_THINK          | true                     |
+| OLLAMA_NUM_PREDICT    | 2048                     |
 | OLLAMA_TEMPERATURE    | 0.7                      |
 | OLLAMA_REPEAT_PENALTY | 1.05                     |
 
@@ -354,11 +451,35 @@ Related limits:
    -d '{"messages":[{"role":"user","content":"Say hello from zig-coding-agent"}]}'
    ```
 
-4. Provider Diagnostics
+4. Stateful Session Check
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+   -H "Content-Type: application/json" \
+   -d '{"session_id":"demo-session","messages":[{"role":"user","content":"Remember that my test color is blue."}]}'
+   ```
+
+5. Tool Check
+
+   ```bash
+   curl -s http://127.0.0.1:8081/v1/chat/completions \
+   -H "Content-Type: application/json" \
+   -d '{"messages":[{"role":"user","content":"What time is it in UTC?"}],"tools":[{"name":"utc","description":"Current UTC time"}],"tool_choice":"auto"}'
+   ```
+
+6. Provider Diagnostics
 
    ```bash
    curl -s http://127.0.0.1:8081/diagnostics/providers
    ```
+
+## Short Runbook
+
+- 401 Unauthorized: set `LLM_ROUTER_API_KEY` on the server and send either `X-Api-Key: <key>` or `Authorization: Bearer <key>`.
+- 413 request_too_large: lower the prompt size or raise `LLM_ROUTER_MAX_REQUEST_BYTES` for trusted deployments.
+- 504 provider_timeout: check provider reachability and `LLM_ROUTER_PROVIDER_TIMEOUT_MS`.
+- unknown_tool: request only registered tools listed above.
+- provider_not_configured: set the provider API key or switch to a local provider.
 
 ## Project Layout
 
@@ -373,6 +494,7 @@ zig_coding_agent
     │   ├── api.zig
     │   ├── auth.zig
     │   ├── errors.zig
+    │   ├── mcp.zig
     │   ├── session.zig
     │   └── tools.zig
     ├── config.zig
@@ -395,6 +517,7 @@ zig_coding_agent
     ├── tools
     │   ├── command_exec.zig
     │   ├── echo.zig
+    │   ├── file_ops.zig
     │   └── utc.zig
     └── types.zig
 ```

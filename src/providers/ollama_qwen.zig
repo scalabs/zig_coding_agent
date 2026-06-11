@@ -13,8 +13,6 @@ const ChatAttempt = struct {
     }
 };
 
-/// Tracks a model fallback suggestion when the requested model
-/// is not installed locally.
 const ModelFallback = struct {
     selected_model: []u8,
     suggested_model: ?[]u8,
@@ -25,7 +23,6 @@ const ModelFallback = struct {
     }
 };
 
-/// Ollama-specific tuning parameters extracted from config and request.
 const OllamaTuning = struct {
     think: bool,
     temperature: f64,
@@ -33,23 +30,144 @@ const OllamaTuning = struct {
     num_predict: u32,
 };
 
-/// Result of a streaming request: either successfully streamed
-/// to the client or a failure response to return directly.
+const max_stream_continuations: usize = 4;
+
+const stream_continue_prompt =
+    "The previous assistant message was cut off by the generation limit. " ++
+    "Continue the same answer from the exact next token. Output only the continuation text; " ++
+    "do not mention truncation, continuation, the previous message, or these instructions.";
+
+const OllamaStreamState = struct {
+    saw_done: bool = false,
+    stopped_by_length: bool = false,
+    think_block_open: *bool,
+};
+
+const StreamAttempt = struct {
+    saw_done: bool,
+    stopped_by_length: bool,
+};
+
+const StreamAttemptResult = union(enum) {
+    streamed: StreamAttempt,
+    failed: types.Response,
+};
+
 pub const StreamQwenResult = union(enum) {
     streamed,
     failed: types.Response,
 };
 
-/// Streams a chat completion from Ollama as SSE chunks directly to
-/// the client connection. Handles model fallback if the requested
-/// model is not installed.
+/// Per-turn streaming variant for use inside multi-turn loops (ReAct, agent).
+///
+/// Differences from `streamQwenToSse`:
+/// - The caller owns SSE headers, the completion id, and the streaming buffers
+///   (`captured_content`, `think_block_open`). Headers and `[DONE]` are NOT
+///   emitted here.
+/// - On success, returns the finish_reason and resolved model name in
+///   `TurnStreamSuccess` so the loop can decide whether to continue, parse
+///   actions, or stop.
+/// - `captured_content` accumulates only the assistant `content` tokens (no
+///   reasoning), giving the loop a clean buffer to feed back into the next
+///   turn or hand to `react.parseReactAction`.
+pub const TurnStreamSuccess = struct {
+    finish_reason: []u8,
+    model: []u8,
+
+    pub fn deinit(self: TurnStreamSuccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.finish_reason);
+        allocator.free(self.model);
+    }
+};
+
+pub const TurnStreamResult = union(enum) {
+    streamed: TurnStreamSuccess,
+    failed: types.Response,
+};
+
+pub fn streamQwenTurnToSse(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    request: types.Request,
+    completion_id: []const u8,
+    captured_content: *std.ArrayList(u8),
+    think_block_open: *bool,
+) !TurnStreamResult {
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
+    var model_name = requested_model;
+    var fallback: ?ModelFallback = null;
+    defer if (fallback) |value| value.deinit(allocator);
+
+    if (try pickFallbackModelAlloc(allocator, app_config, requested_model)) |selected| {
+        fallback = selected;
+        model_name = fallback.?.selected_model;
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri_text = try buildChatUrl(allocator, app_config.ollama_base_url);
+    defer allocator.free(uri_text);
+
+    const uri = try std.Uri.parse(uri_text);
+
+    var headers_sent_already = true; // caller already sent headers
+    var final_finish_reason: []const u8 = "stop";
+
+    var turn: usize = 0;
+    while (true) : (turn += 1) {
+        const messages_json = if (turn == 0)
+            try renderMessagesJsonAlloc(allocator, request.messages)
+        else
+            try renderContinuationMessagesJsonAlloc(
+                allocator,
+                request.messages,
+                captured_content.items,
+                stream_continue_prompt,
+            );
+        defer allocator.free(messages_json);
+
+        const attempt_result = try streamChatMessagesToSse(
+            connection,
+            allocator,
+            &client,
+            app_config,
+            request,
+            uri,
+            completion_id,
+            model_name,
+            messages_json,
+            &headers_sent_already,
+            captured_content,
+            think_block_open,
+        );
+
+        switch (attempt_result) {
+            .failed => |failed_response| return .{ .failed = failed_response },
+            .streamed => |attempt| {
+                if (!attempt.stopped_by_length) break;
+                if (turn + 1 >= max_stream_continuations) {
+                    final_finish_reason = "length";
+                    break;
+                }
+            },
+        }
+    }
+
+    return .{ .streamed = .{
+        .finish_reason = try allocator.dupe(u8, final_finish_reason),
+        .model = try allocator.dupe(u8, model_name),
+    } };
+}
+
 pub fn streamQwenToSse(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     request: types.Request,
 ) !StreamQwenResult {
-    const requested_model = request.model orelse app_config.ollama_model;
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
     var model_name = requested_model;
     var fallback: ?ModelFallback = null;
     defer if (fallback) |value| value.deinit(allocator);
@@ -73,51 +191,6 @@ pub fn streamQwenToSse(
 
     const uri = try std.Uri.parse(uri_text);
 
-    const messages_json = try renderMessagesJsonAlloc(allocator, request.messages);
-    defer allocator.free(messages_json);
-
-    const body = try buildChatPayloadAlloc(
-        allocator,
-        app_config,
-        request,
-        model_name,
-        messages_json,
-        true,
-    );
-    defer allocator.free(body);
-
-    const headers = &[_]std.http.Header{
-        .{ .name = "content-type", .value = "application/json" },
-    };
-
-    var req = try client.request(.POST, uri, .{
-        .extra_headers = headers,
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    req.transfer_encoding = .{ .content_length = body.len };
-
-    var req_body = try req.sendBodyUnflushed(&.{});
-    try req_body.writer.writeAll(body);
-    try req_body.end();
-    try req.connection.?.flush();
-
-    var upstream = try req.receiveHead(&.{});
-
-    if (upstream.head.status != .ok) {
-        const error_message = try std.fmt.allocPrint(
-            allocator,
-            "Ollama HTTP {s} for model '{s}' during stream request",
-            .{ @tagName(upstream.head.status), model_name },
-        );
-        defer allocator.free(error_message);
-
-        return .{ .failed = try makeResponse(allocator, model_name, error_message, false) };
-    }
-
-    try response.sendEventStreamHeaders(connection);
-
     const completion_id = try std.fmt.allocPrint(
         allocator,
         "chatcmpl-{d}",
@@ -125,73 +198,85 @@ pub fn streamQwenToSse(
     );
     defer allocator.free(completion_id);
 
-    var transfer_buffer: [2048]u8 = undefined;
-    const body_reader = upstream.reader(transfer_buffer[0..]);
+    var headers_sent = false;
+    var streamed_text = std.ArrayList(u8){};
+    defer streamed_text.deinit(allocator);
+    var final_finish_reason: []const u8 = "stop";
+    var think_block_open: bool = false;
 
-    var pending = std.ArrayList(u8){};
-    defer pending.deinit(allocator);
+    var turn: usize = 0;
+    while (true) : (turn += 1) {
+        const messages_json = if (turn == 0)
+            try renderMessagesJsonAlloc(allocator, request.messages)
+        else
+            try renderContinuationMessagesJsonAlloc(
+                allocator,
+                request.messages,
+                streamed_text.items,
+                stream_continue_prompt,
+            );
+        defer allocator.free(messages_json);
 
-    var read_buf: [1024]u8 = undefined;
-    var saw_done = false;
-
-    while (true) {
-        const n = body_reader.readSliceShort(read_buf[0..]) catch |err| switch (err) {
-            error.ReadFailed => return upstream.bodyErr() orelse err,
-        };
-        if (n == 0) break;
-
-        try pending.appendSlice(allocator, read_buf[0..n]);
-        try processPendingStreamLines(
+        const attempt_result = try streamChatMessagesToSse(
             connection,
             allocator,
+            &client,
+            app_config,
+            request,
+            uri,
             completion_id,
             model_name,
-            pending.items,
-            &pending,
-            &saw_done,
+            messages_json,
+            &headers_sent,
+            &streamed_text,
+            &think_block_open,
         );
 
-        if (n < read_buf.len) break;
-    }
-
-    if (pending.items.len > 0) {
-        const trailing = std.mem.trim(u8, pending.items, "\r\n \t");
-        if (trailing.len > 0) {
-            try handleOllamaStreamLine(
-                connection,
-                allocator,
-                completion_id,
-                model_name,
-                trailing,
-                &saw_done,
-            );
+        switch (attempt_result) {
+            .failed => |failed_response| {
+                if (!headers_sent) return .{ .failed = failed_response };
+                defer failed_response.deinit(allocator);
+                break;
+            },
+            .streamed => |attempt| {
+                if (!attempt.stopped_by_length) break;
+                if (turn + 1 >= max_stream_continuations) {
+                    final_finish_reason = "length";
+                    break;
+                }
+            },
         }
     }
 
-    if (!saw_done) {
+    if (headers_sent) {
+        if (think_block_open) {
+            try response.sendChatCompletionChunkSse(
+                connection, allocator, completion_id, model_name, "</think>", null,
+            );
+            think_block_open = false;
+        }
         try response.sendChatCompletionChunkSse(
             connection,
             allocator,
             completion_id,
             model_name,
             null,
-            "stop",
+            final_finish_reason,
         );
         try response.sendSseDone(connection);
+    } else {
+        return .{ .failed = try makeResponse(allocator, model_name, "Ollama stream ended before headers were sent", false) };
     }
 
     return .streamed;
 }
 
-/// Sends a non-streaming chat completion request to Ollama.
-/// Automatically falls back to an alternative local model if the
-/// requested model is not found.
 pub fn callQwen(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
     request: types.Request,
 ) !types.Response {
-    const requested_model = request.model orelse app_config.ollama_model;
+    const requested_model = request.model orelse app_config.modelForProvider("ollama_qwen");
     var model_name = requested_model;
     var fallback: ?ModelFallback = null;
     defer if (fallback) |value| value.deinit(allocator);
@@ -269,22 +354,44 @@ pub fn callQwen(
         ),
     };
 
-    const content_value = switch (message_object.get("content") orelse {
+    const tool_calls = try parseToolCallsAlloc(allocator, message_object);
+    errdefer if (tool_calls) |calls| {
+        for (calls) |call| call.deinit(allocator);
+        allocator.free(calls);
+    };
+
+    const content_value = if (message_object.get("content")) |content|
+        switch (content) {
+            .string => |value| value,
+            .null => "",
+            else => return try makeResponse(
+                allocator,
+                model_name,
+                "Invalid content field from Ollama message",
+                false,
+            ),
+        }
+    else if (tool_calls != null)
+        ""
+    else
         return try makeResponse(
             allocator,
             model_name,
             "Missing content field from Ollama message",
             false,
         );
-    }) {
-        .string => |value| value,
-        else => return try makeResponse(
-            allocator,
-            model_name,
-            "Invalid content field from Ollama message",
-            false,
-        ),
-    };
+
+    const thinking_value = if (message_object.get("thinking")) |thinking|
+        switch (thinking) {
+            .string => |value| value,
+            else => "",
+        }
+    else
+        "";
+
+    const tuning = resolveTuning(app_config, request);
+    const output = try formatAssistantOutputAlloc(allocator, content_value, thinking_value, tuning.think);
+    errdefer allocator.free(output);
 
     // Ollama may omit done_reason; default to `stop` for OpenAI compatibility.
     const finish_reason = if (root.get("done_reason")) |done_reason|
@@ -298,7 +405,7 @@ pub fn callQwen(
     return .{
         .id = null,
         .model = try allocator.dupe(u8, model_name),
-        .output = try allocator.dupe(u8, content_value),
+        .output = output,
         .finish_reason = try allocator.dupe(u8, finish_reason),
         .success = true,
         .usage = .{
@@ -307,11 +414,126 @@ pub fn callQwen(
             .total_tokens = parseUsageField(root.get("prompt_eval_count")) +
                 parseUsageField(root.get("eval_count")),
         },
+        .tool_calls = tool_calls,
     };
 }
 
-/// Queries Ollama's `/api/tags` endpoint and returns a JSON status
-/// payload describing provider reachability and model availability.
+fn parseToolCallsAlloc(
+    allocator: std.mem.Allocator,
+    message_object: std.json.ObjectMap,
+) !?[]types.ToolCall {
+    const tool_calls_value = message_object.get("tool_calls") orelse return null;
+    const tool_calls_array = switch (tool_calls_value) {
+        .array => |value| value,
+        else => return null,
+    };
+    if (tool_calls_array.items.len == 0) return null;
+
+    var calls = std.ArrayList(types.ToolCall){};
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    for (tool_calls_array.items, 0..) |call_value, index| {
+        const call_object = switch (call_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        const function_object = switch (call_object.get("function") orelse continue) {
+            .object => |value| value,
+            else => continue,
+        };
+        const name = switch (function_object.get("name") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const arguments_json = try parseToolArgumentsJsonAlloc(allocator, function_object);
+        errdefer allocator.free(arguments_json);
+
+        const id = if (call_object.get("id")) |id_value|
+            switch (id_value) {
+                .string => |value| try allocator.dupe(u8, value),
+                else => try std.fmt.allocPrint(allocator, "call_{d}", .{index}),
+            }
+        else
+            try std.fmt.allocPrint(allocator, "call_{d}", .{index});
+        errdefer allocator.free(id);
+
+        try calls.append(allocator, .{
+            .id = id,
+            .name = try allocator.dupe(u8, name),
+            .arguments_json = arguments_json,
+        });
+    }
+
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
+    return try calls.toOwnedSlice(allocator);
+}
+
+fn parseToolArgumentsJsonAlloc(
+    allocator: std.mem.Allocator,
+    function_object: std.json.ObjectMap,
+) ![]u8 {
+    const arguments_value = function_object.get("arguments") orelse return try allocator.dupe(u8, "{}");
+    return switch (arguments_value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .object => try jsonValueStringifyAlloc(allocator, arguments_value),
+        else => try allocator.dupe(u8, "{}"),
+    };
+}
+
+fn formatAssistantOutputAlloc(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    thinking: []const u8,
+    include_thinking: bool,
+) ![]u8 {
+    if (!include_thinking or std.mem.trim(u8, thinking, " \t\r\n").len == 0) {
+        return try allocator.dupe(u8, content);
+    }
+
+    if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
+        return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{thinking});
+    }
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "<think>{s}</think>\n{s}",
+        .{ thinking, content },
+    );
+}
+
+test "formatAssistantOutputAlloc includes thinking when requested" {
+    const allocator = std.testing.allocator;
+    const output = try formatAssistantOutputAlloc(
+        allocator,
+        "final answer",
+        "reasoning trace",
+        true,
+    );
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "<think>reasoning trace</think>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "final answer") != null);
+}
+
+test "formatAssistantOutputAlloc omits thinking when disabled" {
+    const allocator = std.testing.allocator;
+    const output = try formatAssistantOutputAlloc(
+        allocator,
+        "final answer",
+        "reasoning trace",
+        false,
+    );
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings("final answer", output);
+}
+
 pub fn buildStatusJsonAlloc(
     allocator: std.mem.Allocator,
     app_config: *const config.Config,
@@ -494,17 +716,124 @@ fn buildTagsUrl(
     return try std.fmt.allocPrint(allocator, "{s}/api/tags", .{base_url});
 }
 
+fn streamChatMessagesToSse(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    app_config: *const config.Config,
+    request: types.Request,
+    uri: std.Uri,
+    completion_id: []const u8,
+    model_name: []const u8,
+    messages_json: []const u8,
+    headers_sent: *bool,
+    streamed_text: *std.ArrayList(u8),
+    think_block_open: *bool,
+) !StreamAttemptResult {
+    const body = try buildChatPayloadAlloc(
+        allocator,
+        app_config,
+        request,
+        model_name,
+        messages_json,
+        true,
+    );
+    defer allocator.free(body);
+
+    const headers = &[_]std.http.Header{
+        .{ .name = "content-type", .value = "application/json" },
+    };
+
+    var req = try client.request(.POST, uri, .{
+        .extra_headers = headers,
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = body.len };
+
+    var req_body = try req.sendBodyUnflushed(&.{});
+    try req_body.writer.writeAll(body);
+    try req_body.end();
+    try req.connection.?.flush();
+
+    var upstream = try req.receiveHead(&.{});
+
+    if (upstream.head.status != .ok) {
+        const error_message = try std.fmt.allocPrint(
+            allocator,
+            "Ollama HTTP {s} for model '{s}' during stream request",
+            .{ @tagName(upstream.head.status), model_name },
+        );
+        defer allocator.free(error_message);
+
+        return .{ .failed = try makeResponse(allocator, model_name, error_message, false) };
+    }
+
+    if (!headers_sent.*) {
+        try response.sendEventStreamHeaders(connection, null);
+        headers_sent.* = true;
+    }
+
+    var transfer_buffer: [2048]u8 = undefined;
+    const body_reader = upstream.reader(transfer_buffer[0..]);
+
+    var pending = std.ArrayList(u8){};
+    defer pending.deinit(allocator);
+
+    var read_buf: [1024]u8 = undefined;
+    var state = OllamaStreamState{ .think_block_open = think_block_open };
+
+    while (!state.saw_done) {
+        const n = body_reader.readSliceShort(read_buf[0..]) catch |err| switch (err) {
+            error.ReadFailed => return upstream.bodyErr() orelse err,
+        };
+        if (n == 0) break;
+
+        try pending.appendSlice(allocator, read_buf[0..n]);
+        try processPendingStreamLines(
+            connection,
+            allocator,
+            completion_id,
+            model_name,
+            &pending,
+            &state,
+            streamed_text,
+        );
+    }
+
+    if (pending.items.len > 0 and !state.saw_done) {
+        const trailing = std.mem.trim(u8, pending.items, "\r\n \t");
+        if (trailing.len > 0) {
+            try handleOllamaStreamLine(
+                connection,
+                allocator,
+                completion_id,
+                model_name,
+                trailing,
+                &state,
+                streamed_text,
+            );
+        }
+    }
+
+    return .{
+        .streamed = .{
+            .saw_done = state.saw_done,
+            .stopped_by_length = state.stopped_by_length,
+        },
+    };
+}
+
 fn processPendingStreamLines(
     connection: std.net.Server.Connection,
     allocator: std.mem.Allocator,
     completion_id: []const u8,
     fallback_model: []const u8,
-    lines: []const u8,
     pending: *std.ArrayList(u8),
-    saw_done: *bool,
+    state: *OllamaStreamState,
+    streamed_text: *std.ArrayList(u8),
 ) !void {
-    _ = lines;
-
     while (std.mem.indexOfScalar(u8, pending.items, '\n')) |line_end| {
         const raw_line = pending.items[0..line_end];
         const line = std.mem.trimRight(u8, raw_line, "\r");
@@ -515,7 +844,8 @@ fn processPendingStreamLines(
                 completion_id,
                 fallback_model,
                 line,
-                saw_done,
+                state,
+                streamed_text,
             );
         }
 
@@ -532,7 +862,8 @@ fn handleOllamaStreamLine(
     completion_id: []const u8,
     fallback_model: []const u8,
     line: []const u8,
-    saw_done: *bool,
+    state: *OllamaStreamState,
+    streamed_text: *std.ArrayList(u8),
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
         return;
@@ -559,36 +890,49 @@ fn handleOllamaStreamLine(
         };
 
         if (message_object) |obj| {
-            var token: ?[]const u8 = null;
-
-            if (obj.get("content")) |content_value| {
-                const content = switch (content_value) {
+            const thinking_text = if (obj.get("thinking")) |thinking_value|
+                switch (thinking_value) {
                     .string => |value| value,
                     else => "",
-                };
-
-                if (content.len > 0) token = content;
-            }
-
-            if (token == null) {
-                if (obj.get("thinking")) |thinking_value| {
-                    const thinking = switch (thinking_value) {
-                        .string => |value| value,
-                        else => "",
-                    };
-
-                    if (thinking.len > 0) token = thinking;
                 }
+            else
+                "";
+
+            const content_text = if (obj.get("content")) |content_value|
+                switch (content_value) {
+                    .string => |value| value,
+                    else => "",
+                }
+            else
+                "";
+
+            // Stream thinking wrapped in <think>...</think> tags so the client
+            // can render it distinctly. Thinking is intentionally NOT appended
+            // to streamed_text: that buffer feeds the "continue from cutoff"
+            // prompt on length-stops, and including reasoning there causes the
+            // model to restart its think block on every continuation.
+            if (thinking_text.len > 0) {
+                if (!state.think_block_open.*) {
+                    try response.sendChatCompletionChunkSse(
+                        connection, allocator, completion_id, model, "<think>", null,
+                    );
+                    state.think_block_open.* = true;
+                }
+                try response.sendChatCompletionChunkSse(
+                    connection, allocator, completion_id, model, thinking_text, null,
+                );
             }
 
-            if (token) |text| {
+            if (content_text.len > 0) {
+                if (state.think_block_open.*) {
+                    try response.sendChatCompletionChunkSse(
+                        connection, allocator, completion_id, model, "</think>", null,
+                    );
+                    state.think_block_open.* = false;
+                }
+                try streamed_text.appendSlice(allocator, content_text);
                 try response.sendChatCompletionChunkSse(
-                    connection,
-                    allocator,
-                    completion_id,
-                    model,
-                    text,
-                    null,
+                    connection, allocator, completion_id, model, content_text, null,
                 );
             }
         }
@@ -601,6 +945,7 @@ fn handleOllamaStreamLine(
         };
 
         if (response_text.len > 0) {
+            try streamed_text.appendSlice(allocator, response_text);
             try response.sendChatCompletionChunkSse(
                 connection,
                 allocator,
@@ -620,7 +965,7 @@ fn handleOllamaStreamLine(
     else
         false;
 
-    if (done and !saw_done.*) {
+    if (done and !state.saw_done) {
         const finish_reason = if (root.get("done_reason")) |reason_value|
             switch (reason_value) {
                 .string => |value| value,
@@ -629,16 +974,8 @@ fn handleOllamaStreamLine(
         else
             "stop";
 
-        try response.sendChatCompletionChunkSse(
-            connection,
-            allocator,
-            completion_id,
-            model,
-            null,
-            finish_reason,
-        );
-        try response.sendSseDone(connection);
-        saw_done.* = true;
+        state.saw_done = true;
+        state.stopped_by_length = std.ascii.eqlIgnoreCase(finish_reason, "length");
     }
 }
 
@@ -729,24 +1066,29 @@ fn renderToolsJsonAlloc(
         const escaped_description = try escapeJsonStringAlloc(allocator, tool.description);
         defer allocator.free(escaped_description);
 
-        if (tool.input_schema_json) |schema| {
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return error.InvalidToolSchema;
-            parsed.deinit();
-        }
-
-        var parameters_json: []const u8 = "";
-        if (tool.input_schema_json) |schema| {
-            parameters_json = try std.fmt.allocPrint(allocator, ",\"parameters\":{s}", .{schema});
-        }
-        defer if (tool.input_schema_json != null) allocator.free(parameters_json);
-
         try out.writer(allocator).print(
-            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"{s}}}}}",
-            .{ escaped_name, escaped_description, parameters_json },
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"",
+            .{ escaped_name, escaped_description },
         );
+        if (tool.parameters_json) |parameters_json| {
+            try out.writer(allocator).print(",\"parameters\":{s}", .{parameters_json});
+        }
+        try out.appendSlice(allocator, "}}}");
     }
     try out.append(allocator, ']');
     return try out.toOwnedSlice(allocator);
+}
+
+fn jsonValueStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try json_writer.write(value);
+    return try out.toOwnedSlice();
 }
 
 fn resolveTuning(app_config: *const config.Config, request: types.Request) OllamaTuning {
@@ -921,6 +1263,31 @@ fn renderMessagesJsonAlloc(
 
     try out.append(allocator, ']');
     return try out.toOwnedSlice(allocator);
+}
+
+fn renderContinuationMessagesJsonAlloc(
+    allocator: std.mem.Allocator,
+    base_messages: []const types.Message,
+    assistant_content: []const u8,
+    continue_prompt: []const u8,
+) ![]u8 {
+    const messages = try allocator.alloc(types.Message, base_messages.len + 2);
+    defer allocator.free(messages);
+
+    for (base_messages, 0..) |message, index| {
+        messages[index] = message;
+    }
+
+    messages[base_messages.len] = .{
+        .role = "assistant",
+        .content = assistant_content,
+    };
+    messages[base_messages.len + 1] = .{
+        .role = "user",
+        .content = continue_prompt,
+    };
+
+    return try renderMessagesJsonAlloc(allocator, messages);
 }
 
 fn parseUsageField(value: ?std.json.Value) usize {

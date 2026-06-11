@@ -1,8 +1,3 @@
-//! HTTP request parsing and validation for the chat completions endpoint.
-//!
-//! Deserializes incoming JSON into typed request structs, validates required
-//! fields, and normalizes provider aliases to canonical IDs.
-
 const std = @import("std");
 const config = @import("../config.zig");
 const types = @import("../types.zig");
@@ -390,6 +385,29 @@ pub fn parseChatRequest(
         null;
     errdefer if (tenant_id) |value| allocator.free(value);
 
+    const workspace_id = if (obj.get("workspace_id")) |workspace_id_value|
+        switch (workspace_id_value) {
+            .string => |value| blk: {
+                const trimmed = std.mem.trim(u8, value, " \t\r\n");
+                if (trimmed.len == 0) {
+                    return .{ .err = errors.validationError(
+                        "workspace_id must not be empty",
+                        "workspace_id",
+                        "invalid_workspace_id",
+                    ) };
+                }
+                break :blk try allocator.dupe(u8, trimmed);
+            },
+            else => return .{ .err = errors.validationError(
+                "workspace_id must be a string",
+                "workspace_id",
+                "invalid_workspace_id",
+            ) },
+        }
+    else
+        null;
+    errdefer if (workspace_id) |value| allocator.free(value);
+
     const max_context_tokens = if (obj.get("max_context_tokens")) |tokens_value|
         switch (tokens_value) {
             .integer => |value| blk: {
@@ -440,7 +458,37 @@ pub fn parseChatRequest(
                         ) },
                     };
 
-                    const name = switch (tool_obj.get("name") orelse {
+                    if (tool_obj.get("type")) |type_value| {
+                        const tool_type = switch (type_value) {
+                            .string => |value| value,
+                            else => return .{ .err = errors.validationError(
+                                "tool.type must be a string",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        };
+                        if (!std.ascii.eqlIgnoreCase(tool_type, "function")) {
+                            return .{ .err = errors.validationError(
+                                "tool.type must be function",
+                                "tools",
+                                "invalid_tools",
+                            ) };
+                        }
+                    }
+
+                    const function_obj = if (tool_obj.get("function")) |function_value|
+                        switch (function_value) {
+                            .object => |value| value,
+                            else => return .{ .err = errors.validationError(
+                                "tool.function must be a JSON object",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        }
+                    else
+                        tool_obj;
+
+                    const name = switch (function_obj.get("name") orelse {
                         return .{ .err = errors.validationError(
                             "Each tool must include a name",
                             "tools",
@@ -483,7 +531,7 @@ pub fn parseChatRequest(
                         }
                     }
 
-                    const description = if (tool_obj.get("description")) |description_value|
+                    const description = if (function_obj.get("description")) |description_value|
                         switch (description_value) {
                             .string => |value| value,
                             else => return .{ .err = errors.validationError(
@@ -495,61 +543,23 @@ pub fn parseChatRequest(
                     else
                         "";
 
-                    const input_schema_json = if (tool_obj.get("input_schema")) |input_schema_value|
-                        switch (input_schema_value) {
-                            .string => |value| input_schema_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :input_schema_blk null;
-                                break :input_schema_blk try allocator.dupe(u8, trimmed);
-                            },
-                            else => return .{ .err = errors.validationError(
-                                "tool.input_schema must be a string when provided",
-                                "tools",
-                                "invalid_tools",
-                            ) },
-                        }
-                    else if (tool_obj.get("parameters")) |parameters_value|
+                    const parameters_json = if (function_obj.get("parameters")) |parameters_value| params_blk: {
                         switch (parameters_value) {
-                            .string => |value| parameters_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :parameters_blk null;
-                                break :parameters_blk try allocator.dupe(u8, trimmed);
-                            },
+                            .object => {},
                             else => return .{ .err = errors.validationError(
-                                "tool.parameters must be a string when provided",
+                                "tool.function.parameters must be a JSON object",
                                 "tools",
                                 "invalid_tools",
                             ) },
                         }
-                    else if (tool_obj.get("schema")) |schema_value|
-                        switch (schema_value) {
-                            .string => |value| schema_blk: {
-                                const trimmed = std.mem.trim(u8, value, " \t\r\n");
-                                if (trimmed.len == 0) break :schema_blk null;
-                                break :schema_blk try allocator.dupe(u8, trimmed);
-                            },
-                            else => return .{ .err = errors.validationError(
-                                "tool.schema must be a string when provided",
-                                "tools",
-                                "invalid_tools",
-                            ) },
-                        }
-                    else
-                        null;
-
-                    if (input_schema_json) |schema| {
-                        const schema_parsed = std.json.parseFromSlice(std.json.Value, allocator, schema, .{}) catch return .{ .err = errors.validationError(
-                            "tool input_schema must be valid JSON",
-                            "tools",
-                            "invalid_tools",
-                        ) };
-                        schema_parsed.deinit();
-                    }
+                        break :params_blk try jsonValueStringifyAlloc(allocator, parameters_value);
+                    } else null;
+                    errdefer if (parameters_json) |value| allocator.free(value);
 
                     try tools.append(allocator, .{
                         .name = try allocator.dupe(u8, trimmed_name),
                         .description = try allocator.dupe(u8, description),
-                        .input_schema_json = input_schema_json,
+                        .parameters_json = parameters_json,
                     });
                 }
 
@@ -740,6 +750,7 @@ pub fn parseChatRequest(
         .repeat_penalty = repeat_penalty,
         .session_id = session_id,
         .tenant_id = tenant_id,
+        .workspace_id = workspace_id,
         .max_context_tokens = max_context_tokens,
         .tools = parsed_tools,
         .tool_choice = tool_choice,
@@ -803,6 +814,124 @@ pub fn callProvider(
     }
 
     return error.UnknownProvider;
+}
+
+/// Outcome of a single ReAct/agent loop turn driven through the streaming
+/// pipeline. `streamed` means tokens were emitted live to the SSE client and
+/// `captured_content` holds the assistant's content text (no reasoning) for
+/// action parsing or context replay.
+pub const TurnStreamOutcome = struct {
+    success: bool,
+    finish_reason: []u8,
+    model: []u8,
+    captured_content: []u8,
+
+    pub fn deinit(self: TurnStreamOutcome, allocator: std.mem.Allocator) void {
+        allocator.free(self.finish_reason);
+        allocator.free(self.model);
+        allocator.free(self.captured_content);
+    }
+};
+
+/// Streams a single loop turn directly to the SSE client.
+///
+/// For providers with a dedicated SSE adapter (Ollama today) this forwards
+/// tokens as they arrive. For all other providers, falls back to the buffered
+/// `callProvider` path and emits the whole response as one SSE chunk so the
+/// loop semantics remain identical.
+///
+/// `headers_sent` and `think_block_open` are caller-owned across turns so a
+/// single SSE response can carry many turns without re-emitting headers or
+/// leaving an unclosed `<think>` block.
+pub fn streamProviderTurn(
+    connection: std.net.Server.Connection,
+    allocator: std.mem.Allocator,
+    app_config: *const config.Config,
+    request: types.Request,
+    completion_id: []const u8,
+    headers_sent: *bool,
+    think_block_open: *bool,
+) !TurnStreamOutcome {
+    const response_mod = @import("../core/response.zig");
+
+    if (!headers_sent.*) {
+        try response_mod.sendEventStreamHeaders(connection, null);
+        headers_sent.* = true;
+    }
+
+    const requested_provider = request.provider orelse app_config.default_provider;
+    const provider = types.normalizeProviderName(requested_provider) orelse {
+        return error.UnknownProvider;
+    };
+
+    if (std.mem.eql(u8, provider, "ollama_qwen")) {
+        const ollama_qwen = @import("../providers/ollama_qwen.zig");
+
+        var captured = std.ArrayList(u8){};
+        errdefer captured.deinit(allocator);
+
+        const turn_result = try ollama_qwen.streamQwenTurnToSse(
+            connection,
+            allocator,
+            app_config,
+            request,
+            completion_id,
+            &captured,
+            think_block_open,
+        );
+
+        switch (turn_result) {
+            .streamed => |success| {
+                defer success.deinit(allocator);
+                return .{
+                    .success = true,
+                    .finish_reason = try allocator.dupe(u8, success.finish_reason),
+                    .model = try allocator.dupe(u8, success.model),
+                    .captured_content = try captured.toOwnedSlice(allocator),
+                };
+            },
+            .failed => |provider_response| {
+                defer provider_response.deinit(allocator);
+                captured.deinit(allocator);
+                return .{
+                    .success = false,
+                    .finish_reason = try allocator.dupe(u8, provider_response.finish_reason),
+                    .model = try allocator.dupe(u8, provider_response.model),
+                    .captured_content = try allocator.dupe(u8, provider_response.output),
+                };
+            },
+        }
+    }
+
+    // Fallback path for providers without per-token streaming: buffer via
+    // callProvider, then emit the whole response as a single SSE chunk.
+    if (think_block_open.*) {
+        try response_mod.sendChatCompletionChunkSse(
+            connection, allocator, completion_id, "fallback", "</think>", null,
+        );
+        think_block_open.* = false;
+    }
+
+    var buffered = try callProvider(allocator, app_config, request);
+    defer buffered.deinit(allocator);
+
+    if (buffered.output.len > 0) {
+        try response_mod.sendChatCompletionChunkSse(
+            connection,
+            allocator,
+            completion_id,
+            buffered.model,
+            buffered.output,
+            null,
+        );
+    }
+
+    return .{
+        .success = buffered.success,
+        .finish_reason = try allocator.dupe(u8, buffered.finish_reason),
+        .model = try allocator.dupe(u8, buffered.model),
+        .captured_content = try allocator.dupe(u8, buffered.output),
+    };
 }
 
 pub fn buildProviderStatusJson(
@@ -904,6 +1033,18 @@ fn hasToolNamed(tools: []const types.Tool, name: []const u8) bool {
         if (std.mem.eql(u8, tool.name, name)) return true;
     }
     return false;
+}
+
+fn jsonValueStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try json_writer.write(value);
+    return try out.toOwnedSlice();
 }
 
 fn extractLastUserPrompt(
@@ -1131,4 +1272,46 @@ test "parseChatRequest validates tool_choice against requested tools" {
             try std.testing.expectEqualStrings("tool_choice", api_error.param.?);
         },
     }
+}
+
+test "parseChatRequest accepts OpenAI function tool schema" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "messages": [
+        \\    {"role": "user", "content": "Use echo"}
+        \\  ],
+        \\  "tools": [
+        \\    {
+        \\      "type": "function",
+        \\      "function": {
+        \\        "name": "echo",
+        \\        "description": "Return a message unchanged.",
+        \\        "parameters": {
+        \\          "type": "object",
+        \\          "properties": {
+        \\            "message": {"type": "string"}
+        \\          },
+        \\          "required": ["message"]
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "tool_choice": "echo"
+        \\}
+    ;
+
+    const parsed = try parseChatRequest(allocator, body);
+    const request = switch (parsed) {
+        .ok => |request| request,
+        .err => return error.UnexpectedApiError,
+    };
+    defer request.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.tools.len);
+    try std.testing.expectEqualStrings("echo", request.tools[0].name);
+    try std.testing.expectEqualStrings("Return a message unchanged.", request.tools[0].description);
+    try std.testing.expect(request.tools[0].parameters_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.tools[0].parameters_json.?, "\"message\"") != null);
+    try std.testing.expectEqualStrings("echo", request.tool_choice.?);
 }

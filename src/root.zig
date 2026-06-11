@@ -9,6 +9,7 @@ pub const backend = @import("backend/api.zig");
 pub const auth = @import("backend/auth.zig");
 pub const session = @import("backend/session.zig");
 pub const tools = @import("backend/tools.zig");
+pub const mcp = @import("backend/mcp.zig");
 pub const core = @import("core/server.zig");
 pub const config = @import("config.zig");
 pub const types = @import("types.zig");
@@ -25,6 +26,9 @@ test "backend: auth and tool scaffolding" {
     _ = @import("backend/auth.zig");
     _ = @import("backend/tools.zig");
     _ = @import("backend/session.zig");
+    _ = @import("backend/mcp.zig");
+    _ = @import("backend/tool_output.zig");
+    _ = @import("backend/workspace.zig");
 }
 
 test "core: HTTP request parsing" {

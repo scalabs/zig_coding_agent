@@ -13,6 +13,7 @@ pub const Config = struct {
     listen_port: u16,
     debug_logging: bool,
     default_provider: []const u8,
+    default_model: ?[]const u8,
     request_timeout_ms: u32,
     provider_timeout_ms: u32,
     instance_id: []const u8,
@@ -46,9 +47,19 @@ pub const Config = struct {
     session_store_path: []const u8,
     session_retention_messages: usize,
     tool_exec_enabled: bool,
+    tool_exec_confirmation_required: bool,
+    tool_exec_trusted_local: bool,
     tool_exec_timeout_ms: u32,
     tool_exec_max_output_bytes: usize,
+    tool_output_offload_bytes: usize,
+    max_tool_calls_per_request: usize,
+    default_max_context_tokens: ?usize,
+    workspace_mode_enabled: bool,
+    workspace_root: []const u8,
     loop_stream_progress_enabled: bool,
+    max_concurrent_connections: usize,
+    max_request_bytes: usize,
+    max_header_bytes: usize,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         return try loadWithOverrides(allocator, null);
@@ -64,15 +75,27 @@ pub const Config = struct {
             "ollama",
             env_overrides,
         );
-        errdefer allocator.free(requested_default_provider);
 
         const normalized_default_provider = types.normalizeProviderName(requested_default_provider) orelse {
+            allocator.free(requested_default_provider);
             return error.InvalidProvider;
         };
 
         const default_provider = try allocator.dupe(u8, normalized_default_provider);
         allocator.free(requested_default_provider);
         errdefer allocator.free(default_provider);
+
+        const default_model_raw = try getEnvOrDefault(
+            allocator,
+            "LLM_ROUTER_MODEL",
+            "",
+            env_overrides,
+        );
+        const default_model: ?[]const u8 = if (default_model_raw.len == 0) blk: {
+            allocator.free(default_model_raw);
+            break :blk null;
+        } else default_model_raw;
+        errdefer if (default_model) |model| allocator.free(model);
 
         return Config{
             .listen_host = try getEnvOrDefault(
@@ -84,6 +107,7 @@ pub const Config = struct {
             .listen_port = try getEnvPortOrDefault("LLM_ROUTER_PORT", 8081, env_overrides),
             .debug_logging = try getEnvFlag(allocator, "LLM_ROUTER_DEBUG", env_overrides),
             .default_provider = default_provider,
+            .default_model = default_model,
             .request_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_REQUEST_TIMEOUT_MS", 30_000, env_overrides),
             .provider_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_PROVIDER_TIMEOUT_MS", 60_000, env_overrides),
             .instance_id = try getEnvOrDefault(
@@ -110,13 +134,13 @@ pub const Config = struct {
                 "qwen3.5:9b",
                 env_overrides,
             ),
-            .ollama_think = try getEnvFlag(allocator, "OLLAMA_THINK", env_overrides),
-            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 128, env_overrides),
+            .ollama_think = try getEnvFlagOrDefault(allocator, "OLLAMA_THINK", true, env_overrides),
+            .ollama_num_predict = try getEnvU32OrDefault("OLLAMA_NUM_PREDICT", 2048, env_overrides),
             .ollama_temperature = try getEnvF64OrDefault(allocator, "OLLAMA_TEMPERATURE", 0.7, env_overrides),
             .ollama_repeat_penalty = try getEnvF64OrDefault(allocator, "OLLAMA_REPEAT_PENALTY", 1.05, env_overrides),
-            .openai_base_url = try getEnvOrDefault(
+            .openai_base_url = try getFirstEnvOrDefault(
                 allocator,
-                "OPENAI_BASE_URL",
+                &.{ "OPENAI_BASE_URL", "OPENAI_API_BASE" },
                 "https://api.openai.com/v1",
                 env_overrides,
             ),
@@ -132,9 +156,9 @@ pub const Config = struct {
                 "gpt-4.1-mini",
                 env_overrides,
             ),
-            .openrouter_base_url = try getEnvOrDefault(
+            .openrouter_base_url = try getFirstEnvOrDefault(
                 allocator,
-                "OPENROUTER_BASE_URL",
+                &.{ "OPENROUTER_BASE_URL", "OPENROUTER_API_BASE" },
                 "https://openrouter.ai/api/v1",
                 env_overrides,
             ),
@@ -246,9 +270,36 @@ pub const Config = struct {
                 env_overrides,
             ),
             .tool_exec_enabled = try getEnvFlag(allocator, "LLM_ROUTER_TOOL_EXEC_ENABLED", env_overrides),
+            .tool_exec_confirmation_required = try getEnvFlagOrDefault(
+                allocator,
+                "LLM_ROUTER_TOOL_EXEC_CONFIRM_REQUIRED",
+                true,
+                env_overrides,
+            ),
+            .tool_exec_trusted_local = try getEnvFlag(allocator, "LLM_ROUTER_TOOL_EXEC_TRUSTED_LOCAL", env_overrides),
             .tool_exec_timeout_ms = try getEnvPositiveU32OrDefault("LLM_ROUTER_TOOL_EXEC_TIMEOUT_MS", 15_000, env_overrides),
             .tool_exec_max_output_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_EXEC_MAX_OUTPUT_BYTES", 65_536, env_overrides),
+            .tool_output_offload_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_TOOL_OUTPUT_OFFLOAD_BYTES", 8192, env_overrides),
+            .max_tool_calls_per_request = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_TOOL_CALLS_PER_REQUEST", 8, env_overrides),
+            .default_max_context_tokens = blk: {
+                const raw = try getEnvUsizeOrDefault(
+                    "LLM_ROUTER_DEFAULT_MAX_CONTEXT_TOKENS",
+                    0,
+                    env_overrides,
+                );
+                break :blk if (raw == 0) null else raw;
+            },
+            .workspace_mode_enabled = try getEnvFlag(allocator, "LLM_ROUTER_WORKSPACE_MODE", env_overrides),
+            .workspace_root = try getEnvOrDefault(
+                allocator,
+                "LLM_ROUTER_WORKSPACE_ROOT",
+                ".",
+                env_overrides,
+            ),
             .loop_stream_progress_enabled = try getEnvFlagOrDefault(allocator, "LLM_ROUTER_LOOP_STREAM_PROGRESS_ENABLED", true, env_overrides),
+            .max_concurrent_connections = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_CONCURRENT_CONNECTIONS", 64, env_overrides),
+            .max_request_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_REQUEST_BYTES", 1024 * 1024, env_overrides),
+            .max_header_bytes = try getEnvPositiveUsizeOrDefault("LLM_ROUTER_MAX_HEADER_BYTES", 16 * 1024, env_overrides),
         };
     }
 
@@ -260,6 +311,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
         allocator.free(self.default_provider);
+        if (self.default_model) |model| allocator.free(model);
         allocator.free(self.instance_id);
         allocator.free(self.auth_api_key);
         allocator.free(self.ollama_base_url);
@@ -285,6 +337,7 @@ pub const Config = struct {
         allocator.free(self.llama_cpp_api_key);
         allocator.free(self.llama_cpp_model);
         allocator.free(self.session_store_path);
+        allocator.free(self.workspace_root);
     }
 
     pub fn setDefaultProvider(
@@ -299,6 +352,40 @@ pub const Config = struct {
         const next_provider = try allocator.dupe(u8, normalized);
         allocator.free(self.default_provider);
         self.default_provider = next_provider;
+    }
+
+    pub fn setDefaultModel(
+        self: *Config,
+        allocator: std.mem.Allocator,
+        model: []const u8,
+    ) !void {
+        if (self.default_model) |existing| allocator.free(existing);
+        self.default_model = if (model.len == 0) null else try allocator.dupe(u8, model);
+    }
+
+    /// Model used when a request omits `model` (or sends `"auto"`).
+    pub fn defaultModel(self: *const Config) []const u8 {
+        return self.modelForProvider(self.default_provider);
+    }
+
+    /// Resolves the configured model for a provider. `LLM_ROUTER_MODEL` overrides
+    /// per-provider defaults when the provider matches `LLM_ROUTER_PROVIDER`.
+    pub fn modelForProvider(self: *const Config, provider: []const u8) []const u8 {
+        const normalized = types.normalizeProviderName(provider) orelse provider;
+        if (self.default_model) |unified| {
+            if (std.mem.eql(u8, normalized, self.default_provider)) {
+                return unified;
+            }
+        }
+
+        if (std.mem.eql(u8, normalized, "ollama_qwen")) return self.ollama_model;
+        if (std.mem.eql(u8, normalized, "openai")) return self.openai_model;
+        if (std.mem.eql(u8, normalized, "openrouter")) return self.openrouter_model;
+        if (std.mem.eql(u8, normalized, "claude")) return self.claude_model;
+        if (std.mem.eql(u8, normalized, "bedrock")) return self.bedrock_model;
+        if (std.mem.eql(u8, normalized, "llama_cpp")) return self.llama_cpp_model;
+
+        return self.openai_model;
     }
 };
 
@@ -375,6 +462,23 @@ fn getEnvU32OrDefault(
     }
 
     return std.process.parseEnvVarInt(key, u32, 10) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => default_value,
+        else => err,
+    };
+}
+
+fn getEnvUsizeOrDefault(
+    comptime key: []const u8,
+    default_value: usize,
+    env_overrides: ?*const EnvOverrides,
+) !usize {
+    if (env_overrides) |overrides| {
+        if (overrides.get(key)) |value| {
+            return try std.fmt.parseInt(usize, value, 10);
+        }
+    }
+
+    return std.process.parseEnvVarInt(key, usize, 10) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => default_value,
         else => err,
     };
@@ -490,6 +594,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .listen_port = 8081,
         .debug_logging = false,
         .default_provider = try allocator.dupe(u8, "ollama_qwen"),
+        .default_model = null,
         .request_timeout_ms = 30_000,
         .provider_timeout_ms = 60_000,
         .instance_id = try allocator.dupe(u8, "local-instance"),
@@ -497,7 +602,7 @@ test "setDefaultProvider stores canonical provider alias" {
         .ollama_base_url = try allocator.dupe(u8, "http://127.0.0.1:11434"),
         .ollama_model = try allocator.dupe(u8, "qwen:7b"),
         .ollama_think = false,
-        .ollama_num_predict = 512,
+        .ollama_num_predict = 1024,
         .ollama_temperature = 0.7,
         .ollama_repeat_penalty = 1.05,
         .openai_base_url = try allocator.dupe(u8, "https://api.openai.com/v1"),
@@ -523,9 +628,19 @@ test "setDefaultProvider stores canonical provider alias" {
         .session_store_path = try allocator.dupe(u8, "logs/sessions"),
         .session_retention_messages = 24,
         .tool_exec_enabled = false,
+        .tool_exec_confirmation_required = false,
+        .tool_exec_trusted_local = false,
         .tool_exec_timeout_ms = 15_000,
         .tool_exec_max_output_bytes = 65_536,
+        .tool_output_offload_bytes = 8192,
+        .max_tool_calls_per_request = 8,
+        .default_max_context_tokens = null,
+        .workspace_mode_enabled = false,
+        .workspace_root = try allocator.dupe(u8, "."),
         .loop_stream_progress_enabled = true,
+        .max_concurrent_connections = 64,
+        .max_request_bytes = 1024 * 1024,
+        .max_header_bytes = 16 * 1024,
     };
     defer cfg.deinit(allocator);
 
@@ -537,4 +652,29 @@ test "setDefaultProvider stores canonical provider alias" {
 
     try cfg.setDefaultProvider(allocator, "bedrock");
     try std.testing.expectEqualStrings("bedrock", cfg.default_provider);
+}
+
+test "modelForProvider honors LLM_ROUTER_MODEL for active provider only" {
+    const allocator = std.testing.allocator;
+
+    var overrides = EnvOverrides.init(allocator);
+    try overrides.put(try allocator.dupe(u8, "LLM_ROUTER_PROVIDER"), try allocator.dupe(u8, "openrouter"));
+    try overrides.put(try allocator.dupe(u8, "LLM_ROUTER_MODEL"), try allocator.dupe(u8, "openai/gpt-4o-mini"));
+    try overrides.put(try allocator.dupe(u8, "OPENROUTER_MODEL"), try allocator.dupe(u8, "openrouter/auto"));
+    try overrides.put(try allocator.dupe(u8, "OLLAMA_MODEL"), try allocator.dupe(u8, "qwen3.5:9b"));
+    defer {
+        var it = overrides.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        overrides.deinit();
+    }
+
+    var cfg = try Config.loadWithOverrides(allocator, &overrides);
+    defer cfg.deinit(allocator);
+
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini", cfg.defaultModel());
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini", cfg.modelForProvider("openrouter"));
+    try std.testing.expectEqualStrings("qwen3.5:9b", cfg.modelForProvider("ollama"));
 }

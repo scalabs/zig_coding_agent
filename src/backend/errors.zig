@@ -273,3 +273,15 @@ test "providerFailureFromDetail maps missing key configuration" {
     try std.testing.expectEqual(@as(u16, 500), mapped.status_code);
     try std.testing.expectEqualStrings("provider_not_configured", mapped.code.?);
 }
+
+test "providerFailureFromDetail maps provider auth failures" {
+    const mapped = providerFailureFromDetail("openrouter", "OpenRouter returned HTTP 401");
+    try std.testing.expectEqual(@as(u16, 502), mapped.status_code);
+    try std.testing.expectEqualStrings("provider_auth_failed", mapped.code.?);
+}
+
+test "providerFailureFromDetail maps invalid provider payloads" {
+    const mapped = providerFailureFromDetail("bedrock", "Bedrock returned invalid JSON");
+    try std.testing.expectEqual(@as(u16, 502), mapped.status_code);
+    try std.testing.expectEqualStrings("provider_invalid_response", mapped.code.?);
+}
