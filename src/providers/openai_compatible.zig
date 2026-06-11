@@ -196,12 +196,22 @@ fn parseChatResponse(
         else => return try makeFailureResponse(allocator, fallback_model, "Provider message was not an object"),
     };
 
-    const output = switch (message_obj.get("content") orelse {
-        return try makeFailureResponse(allocator, fallback_model, "Provider message missing content");
-    }) {
-        .string => |value| value,
-        else => return try makeFailureResponse(allocator, fallback_model, "Provider content was not a string"),
+    const tool_calls = try parseToolCallsAlloc(allocator, message_obj);
+    errdefer if (tool_calls) |calls| {
+        for (calls) |call| call.deinit(allocator);
+        allocator.free(calls);
     };
+
+    const output = if (message_obj.get("content")) |content_value|
+        switch (content_value) {
+            .string => |value| value,
+            .null => "",
+            else => return try makeFailureResponse(allocator, fallback_model, "Provider content was not a string"),
+        }
+    else if (tool_calls != null)
+        ""
+    else
+        return try makeFailureResponse(allocator, fallback_model, "Provider message missing content");
 
     const finish_reason = if (first_choice.get("finish_reason")) |finish_reason_value|
         switch (finish_reason_value) {
@@ -230,6 +240,75 @@ fn parseChatResponse(
         .finish_reason = try allocator.dupe(u8, finish_reason),
         .success = true,
         .usage = usage,
+        .tool_calls = tool_calls,
+    };
+}
+
+fn parseToolCallsAlloc(
+    allocator: std.mem.Allocator,
+    message_obj: std.json.ObjectMap,
+) !?[]types.ToolCall {
+    const tool_calls_value = message_obj.get("tool_calls") orelse return null;
+    const tool_calls_array = switch (tool_calls_value) {
+        .array => |value| value,
+        else => return null,
+    };
+    if (tool_calls_array.items.len == 0) return null;
+
+    var calls = std.ArrayList(types.ToolCall){};
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    for (tool_calls_array.items, 0..) |call_value, index| {
+        const call_obj = switch (call_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        const function_obj = switch (call_obj.get("function") orelse continue) {
+            .object => |value| value,
+            else => continue,
+        };
+        const name = switch (function_obj.get("name") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const arguments_json = try parseToolArgumentsJsonAlloc(allocator, function_obj);
+        errdefer allocator.free(arguments_json);
+
+        const id = if (call_obj.get("id")) |id_value|
+            switch (id_value) {
+                .string => |value| try allocator.dupe(u8, value),
+                else => try std.fmt.allocPrint(allocator, "call_{d}", .{index}),
+            }
+        else
+            try std.fmt.allocPrint(allocator, "call_{d}", .{index});
+        errdefer allocator.free(id);
+
+        try calls.append(allocator, .{
+            .id = id,
+            .name = try allocator.dupe(u8, name),
+            .arguments_json = arguments_json,
+        });
+    }
+
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
+    return try calls.toOwnedSlice(allocator);
+}
+
+fn parseToolArgumentsJsonAlloc(
+    allocator: std.mem.Allocator,
+    function_obj: std.json.ObjectMap,
+) ![]u8 {
+    const arguments_value = function_obj.get("arguments") orelse return try allocator.dupe(u8, "{}");
+    return switch (arguments_value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .object => try jsonValueStringifyAlloc(allocator, arguments_value),
+        else => try allocator.dupe(u8, "{}"),
     };
 }
 
@@ -342,13 +421,29 @@ fn renderToolsJsonAlloc(
         defer allocator.free(escaped_description);
 
         try out.writer(allocator).print(
-            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"}}}}",
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"",
             .{ escaped_name, escaped_description },
         );
+        if (tool.parameters_json) |parameters_json| {
+            try out.writer(allocator).print(",\"parameters\":{s}", .{parameters_json});
+        }
+        try out.appendSlice(allocator, "}}}");
     }
 
     try out.append(allocator, ']');
     return try out.toOwnedSlice(allocator);
+}
+
+fn jsonValueStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try json_writer.write(value);
+    return try out.toOwnedSlice();
 }
 
 fn makeFailureResponse(
@@ -430,4 +525,29 @@ test "parseChatResponse keeps ids and usage for successful responses" {
     try std.testing.expectEqualStrings("openrouter/my-model", response.model);
     try std.testing.expectEqualStrings("hello", response.output);
     try std.testing.expectEqual(@as(usize, 5), response.usage.total_tokens);
+}
+
+test "parseChatResponse preserves OpenAI tool calls" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"id":"chatcmpl-tools","model":"gpt-test","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{\"message\":\"demo-green\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}
+    ;
+
+    const response = try parseChatResponse(
+        allocator,
+        "gpt-test",
+        "OpenAI",
+        .ok,
+        raw,
+    );
+    defer response.deinit(allocator);
+
+    try std.testing.expect(response.success);
+    try std.testing.expectEqualStrings("", response.output);
+    try std.testing.expectEqualStrings("tool_calls", response.finish_reason);
+    try std.testing.expect(response.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), response.tool_calls.?.len);
+    try std.testing.expectEqualStrings("call_1", response.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("echo", response.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("{\"message\":\"demo-green\"}", response.tool_calls.?[0].arguments_json);
 }

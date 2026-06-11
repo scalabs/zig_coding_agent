@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     });
     // Linux native build avoids linkLibC (glibc/GCC 16 .sframe linker issues on Zig 0.15.2).
     // Windows needs libc for socket APIs (recvfrom, etc.).
-    if (app.root_module.resolved_target.?.query.os_tag == .windows) {
+    if (target.result.os.tag == .windows) {
         app.linkLibC();
     }
 
@@ -81,10 +81,11 @@ pub fn build(b: *std.Build) void {
     const eval_service = b.option([]const u8, "eval-service", "Service name from registry/services.json") orelse "local-openai-compat";
     const harness_base = b.option([]const u8, "eval-harness-url", "Harness base URL for readiness checks") orelse "http://127.0.0.1:8081";
     const eval_wait_seconds = b.option(u32, "eval-wait-seconds", "Seconds to wait for harness readiness before failing") orelse 0;
+    const eval_provider = b.option([]const u8, "eval-provider", "Provider to use for the eval readiness chat probe");
 
     const preflight_script = b.fmt(
         \\if [ -f ".env" ]; then set -a; . ./.env; set +a; fi
-        \\PROVIDER="${{LLM_ROUTER_PROVIDER:-ollama}}"
+        \\if [ -n "${{ZIG_EVAL_PROVIDER:-}}" ]; then PROVIDER="$ZIG_EVAL_PROVIDER"; else PROVIDER="${{LLM_ROUTER_PROVIDER:-ollama}}"; fi
         \\for i in $(seq 0 {d}); do
         \\  if curl -sf "{s}/health" >/dev/null; then
         \\    PAYLOAD=$(printf '{{"messages":[{{"role":"user","content":"Reply OK"}}],"provider":"%s","model":"auto"}}' "$PROVIDER")
@@ -107,6 +108,9 @@ pub fn build(b: *std.Build) void {
     );
 
     const eval_preflight = b.addSystemCommand(&.{ "sh", "-c", preflight_script });
+    if (eval_provider) |provider| {
+        eval_preflight.setEnvironmentVariable("ZIG_EVAL_PROVIDER", provider);
+    }
 
     const build_zig_eval = b.addSystemCommand(&.{ "zig", "build", "-Doptimize=ReleaseSafe" });
     build_zig_eval.setCwd(b.path(zig_eval_root));

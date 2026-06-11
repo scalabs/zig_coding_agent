@@ -958,6 +958,29 @@ fn handleConnection(
         return;
     }
 
+    if (try tooling.maybeMakeBuiltinToolCallResponseAlloc(allocator, parsed_req, request_id)) |tool_call_result| {
+        defer tool_call_result.deinit(allocator);
+        debugLog(app_config, "debug tool call synthesized", .{});
+        persistConversationState(
+            allocator,
+            app_config,
+            use_workspace,
+            workspace_store,
+            active_workspace,
+            session_store,
+            session_store_guard,
+            parsed_req,
+            loaded_session,
+            request_messages,
+            null,
+            tool_call_result.output,
+        );
+        sendChatCompletionSafe(connection.*, allocator, tool_call_result, app_config, request_id);
+        server_state.noteRequestSucceeded();
+        request_status = 200;
+        return;
+    }
+
     const requested_provider = parsed_req.provider orelse app_config.default_provider;
     const normalized_provider = types.normalizeProviderName(requested_provider) orelse requested_provider;
 
@@ -1215,6 +1238,7 @@ fn cloneRequestWithMessagesAlloc(
         copied_tools[idx] = .{
             .name = try allocator.dupe(u8, tool.name),
             .description = try allocator.dupe(u8, tool.description),
+            .parameters_json = if (tool.parameters_json) |parameters_json| try allocator.dupe(u8, parameters_json) else null,
         };
         initialized_tools += 1;
     }

@@ -26,7 +26,8 @@ pub fn maybeOffloadToolOutputAlloc(
 
     std.fs.cwd().makePath(offload_dir) catch {};
 
-    const safe_tool_name = sanitizePathComponent(tool_name);
+    var safe_tool_name_buf: [64]u8 = undefined;
+    const safe_tool_name = sanitizePathComponent(tool_name, &safe_tool_name_buf);
     const offload_path = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}_{s}.txt",
@@ -58,14 +59,13 @@ pub fn maybeOffloadToolOutputAlloc(
     );
 }
 
-fn sanitizePathComponent(name: []const u8) []const u8 {
-    var out: [64]u8 = undefined;
+fn sanitizePathComponent(name: []const u8, out: *[64]u8) []const u8 {
     var len: usize = 0;
     for (name) |c| {
         if (len >= out.len) break;
         switch (c) {
             'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {
-                out[len] = c;
+                out.*[len] = c;
                 len += 1;
             },
             else => {},

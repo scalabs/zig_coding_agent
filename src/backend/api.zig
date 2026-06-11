@@ -458,7 +458,37 @@ pub fn parseChatRequest(
                         ) },
                     };
 
-                    const name = switch (tool_obj.get("name") orelse {
+                    if (tool_obj.get("type")) |type_value| {
+                        const tool_type = switch (type_value) {
+                            .string => |value| value,
+                            else => return .{ .err = errors.validationError(
+                                "tool.type must be a string",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        };
+                        if (!std.ascii.eqlIgnoreCase(tool_type, "function")) {
+                            return .{ .err = errors.validationError(
+                                "tool.type must be function",
+                                "tools",
+                                "invalid_tools",
+                            ) };
+                        }
+                    }
+
+                    const function_obj = if (tool_obj.get("function")) |function_value|
+                        switch (function_value) {
+                            .object => |value| value,
+                            else => return .{ .err = errors.validationError(
+                                "tool.function must be a JSON object",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        }
+                    else
+                        tool_obj;
+
+                    const name = switch (function_obj.get("name") orelse {
                         return .{ .err = errors.validationError(
                             "Each tool must include a name",
                             "tools",
@@ -501,7 +531,7 @@ pub fn parseChatRequest(
                         }
                     }
 
-                    const description = if (tool_obj.get("description")) |description_value|
+                    const description = if (function_obj.get("description")) |description_value|
                         switch (description_value) {
                             .string => |value| value,
                             else => return .{ .err = errors.validationError(
@@ -513,9 +543,23 @@ pub fn parseChatRequest(
                     else
                         "";
 
+                    const parameters_json = if (function_obj.get("parameters")) |parameters_value| params_blk: {
+                        switch (parameters_value) {
+                            .object => {},
+                            else => return .{ .err = errors.validationError(
+                                "tool.function.parameters must be a JSON object",
+                                "tools",
+                                "invalid_tools",
+                            ) },
+                        }
+                        break :params_blk try jsonValueStringifyAlloc(allocator, parameters_value);
+                    } else null;
+                    errdefer if (parameters_json) |value| allocator.free(value);
+
                     try tools.append(allocator, .{
                         .name = try allocator.dupe(u8, trimmed_name),
                         .description = try allocator.dupe(u8, description),
+                        .parameters_json = parameters_json,
                     });
                 }
 
@@ -991,6 +1035,18 @@ fn hasToolNamed(tools: []const types.Tool, name: []const u8) bool {
     return false;
 }
 
+fn jsonValueStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try json_writer.write(value);
+    return try out.toOwnedSlice();
+}
+
 fn extractLastUserPrompt(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
@@ -1216,4 +1272,46 @@ test "parseChatRequest validates tool_choice against requested tools" {
             try std.testing.expectEqualStrings("tool_choice", api_error.param.?);
         },
     }
+}
+
+test "parseChatRequest accepts OpenAI function tool schema" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "messages": [
+        \\    {"role": "user", "content": "Use echo"}
+        \\  ],
+        \\  "tools": [
+        \\    {
+        \\      "type": "function",
+        \\      "function": {
+        \\        "name": "echo",
+        \\        "description": "Return a message unchanged.",
+        \\        "parameters": {
+        \\          "type": "object",
+        \\          "properties": {
+        \\            "message": {"type": "string"}
+        \\          },
+        \\          "required": ["message"]
+        \\        }
+        \\      }
+        \\    }
+        \\  ],
+        \\  "tool_choice": "echo"
+        \\}
+    ;
+
+    const parsed = try parseChatRequest(allocator, body);
+    const request = switch (parsed) {
+        .ok => |request| request,
+        .err => return error.UnexpectedApiError,
+    };
+    defer request.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), request.tools.len);
+    try std.testing.expectEqualStrings("echo", request.tools[0].name);
+    try std.testing.expectEqualStrings("Return a message unchanged.", request.tools[0].description);
+    try std.testing.expect(request.tools[0].parameters_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.tools[0].parameters_json.?, "\"message\"") != null);
+    try std.testing.expectEqualStrings("echo", request.tool_choice.?);
 }

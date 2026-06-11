@@ -354,22 +354,32 @@ pub fn callQwen(
         ),
     };
 
-    const content_value = switch (message_object.get("content") orelse {
+    const tool_calls = try parseToolCallsAlloc(allocator, message_object);
+    errdefer if (tool_calls) |calls| {
+        for (calls) |call| call.deinit(allocator);
+        allocator.free(calls);
+    };
+
+    const content_value = if (message_object.get("content")) |content|
+        switch (content) {
+            .string => |value| value,
+            .null => "",
+            else => return try makeResponse(
+                allocator,
+                model_name,
+                "Invalid content field from Ollama message",
+                false,
+            ),
+        }
+    else if (tool_calls != null)
+        ""
+    else
         return try makeResponse(
             allocator,
             model_name,
             "Missing content field from Ollama message",
             false,
         );
-    }) {
-        .string => |value| value,
-        else => return try makeResponse(
-            allocator,
-            model_name,
-            "Invalid content field from Ollama message",
-            false,
-        ),
-    };
 
     const thinking_value = if (message_object.get("thinking")) |thinking|
         switch (thinking) {
@@ -404,6 +414,75 @@ pub fn callQwen(
             .total_tokens = parseUsageField(root.get("prompt_eval_count")) +
                 parseUsageField(root.get("eval_count")),
         },
+        .tool_calls = tool_calls,
+    };
+}
+
+fn parseToolCallsAlloc(
+    allocator: std.mem.Allocator,
+    message_object: std.json.ObjectMap,
+) !?[]types.ToolCall {
+    const tool_calls_value = message_object.get("tool_calls") orelse return null;
+    const tool_calls_array = switch (tool_calls_value) {
+        .array => |value| value,
+        else => return null,
+    };
+    if (tool_calls_array.items.len == 0) return null;
+
+    var calls = std.ArrayList(types.ToolCall){};
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    for (tool_calls_array.items, 0..) |call_value, index| {
+        const call_object = switch (call_value) {
+            .object => |value| value,
+            else => continue,
+        };
+        const function_object = switch (call_object.get("function") orelse continue) {
+            .object => |value| value,
+            else => continue,
+        };
+        const name = switch (function_object.get("name") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const arguments_json = try parseToolArgumentsJsonAlloc(allocator, function_object);
+        errdefer allocator.free(arguments_json);
+
+        const id = if (call_object.get("id")) |id_value|
+            switch (id_value) {
+                .string => |value| try allocator.dupe(u8, value),
+                else => try std.fmt.allocPrint(allocator, "call_{d}", .{index}),
+            }
+        else
+            try std.fmt.allocPrint(allocator, "call_{d}", .{index});
+        errdefer allocator.free(id);
+
+        try calls.append(allocator, .{
+            .id = id,
+            .name = try allocator.dupe(u8, name),
+            .arguments_json = arguments_json,
+        });
+    }
+
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
+    return try calls.toOwnedSlice(allocator);
+}
+
+fn parseToolArgumentsJsonAlloc(
+    allocator: std.mem.Allocator,
+    function_object: std.json.ObjectMap,
+) ![]u8 {
+    const arguments_value = function_object.get("arguments") orelse return try allocator.dupe(u8, "{}");
+    return switch (arguments_value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .object => try jsonValueStringifyAlloc(allocator, arguments_value),
+        else => try allocator.dupe(u8, "{}"),
     };
 }
 
@@ -988,12 +1067,28 @@ fn renderToolsJsonAlloc(
         defer allocator.free(escaped_description);
 
         try out.writer(allocator).print(
-            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"}}}}",
+            "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\"",
             .{ escaped_name, escaped_description },
         );
+        if (tool.parameters_json) |parameters_json| {
+            try out.writer(allocator).print(",\"parameters\":{s}", .{parameters_json});
+        }
+        try out.appendSlice(allocator, "}}}");
     }
     try out.append(allocator, ']');
     return try out.toOwnedSlice(allocator);
+}
+
+fn jsonValueStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+    try json_writer.write(value);
+    return try out.toOwnedSlice();
 }
 
 fn resolveTuning(app_config: *const config.Config, request: types.Request) OllamaTuning {

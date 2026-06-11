@@ -84,10 +84,24 @@ pub const Message = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
+    parameters_json: ?[]const u8 = null,
 
     pub fn deinit(self: Tool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
+        if (self.parameters_json) |parameters_json| allocator.free(parameters_json);
+    }
+};
+
+pub const ToolCall = struct {
+    id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+
+    pub fn deinit(self: ToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.arguments_json);
     }
 };
 
@@ -105,6 +119,7 @@ pub const Response = struct {
     finish_reason: []const u8, // OpenAI-compatible completion stop reason.
     success: bool, // false means output should be surfaced as provider error.
     usage: Usage = .{}, // Best-effort token accounting.
+    tool_calls: ?[]ToolCall = null, // OpenAI-compatible assistant tool calls, when provided.
 
     /// Releases all owned response fields.
     ///
@@ -118,6 +133,12 @@ pub const Response = struct {
         allocator.free(self.model);
         allocator.free(self.output);
         allocator.free(self.finish_reason);
+        if (self.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                tool_call.deinit(allocator);
+            }
+            allocator.free(tool_calls);
+        }
     }
 };
 
